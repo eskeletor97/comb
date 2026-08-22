@@ -62,6 +62,7 @@ static int rows = 24, cols = 80;
 
 static char msg[160];
 static struct termios saved_tio;
+static int tio_saved;
 static volatile sig_atomic_t got_winch;
 static size_t nmarked;
 static int mdir = -1;	/* space/x sweep direction: -1 up, 1 down */
@@ -152,9 +153,12 @@ static void on_winch(int sig)
 	got_winch = 1;
 }
 
+static void restore_terminal(void);
+
 static void die(const char *fmt, ...)
 {
 	va_list ap;
+	restore_terminal();
 	va_start(ap, fmt);
 	fprintf(stderr, "comb: ");
 	vfprintf(stderr, fmt, ap);
@@ -186,10 +190,16 @@ static void raw_on(void)
 	t.c_cc[VTIME] = 0;
 	if (tcsetattr(kfd, TCSANOW, &t) < 0)
 		die("tcsetattr");
+	tio_saved = 1;
 }
 
-static void raw_off(void)
+/* undo raw mode + alternate screen; safe from die() at any point */
+static void restore_terminal(void)
 {
+	if (!tio_saved)
+		return;
+	fputs("\x1b[0m\x1b[?25h\x1b[?1049l", stdout);
+	fflush(stdout);
 	tcsetattr(kfd, TCSANOW, &saved_tio);
 }
 
@@ -433,9 +443,13 @@ static void load_all(void)
 /* returns 1 if new data arrived (or the file was rotated) */
 static int append_new(void)
 {
-	struct stat st;
-	if (fstat(fd, &st) == 0 && (off_t)st.st_size < fsize) {
-		/* truncated or rotated: start over */
+	struct stat st, fst;
+	/* rotation by rename+recreate keeps our fd on the old inode whose
+	 * size never changes, so also compare the path's inode; the size
+	 * check alone covers copytruncate-style truncation */
+	if (fstat(fd, &fst) == 0 && stat(path, &st) == 0 &&
+	    (st.st_ino != fst.st_ino || st.st_dev != fst.st_dev ||
+	     (off_t)st.st_size < fsize)) {
 		close(fd);
 		reset_lines();
 		fd = open(path, O_RDONLY);
@@ -917,11 +931,11 @@ static int has_prog(const char *prog)
 
 static void clip_helper(const char *s, size_t len)
 {
-	struct { const char *name; const char *argv[4]; } cands[] = {
-		{ "xclip",  { "xclip", "-selection", "clipboard", "-in" } },
-		{ "wl-copy", { "wl-copy", NULL, NULL, NULL } },
-		{ "pbcopy", { "pbcopy", NULL, NULL, NULL } },
-		{ "termux-clipboard-set", { "termux-clipboard-set", NULL, NULL, NULL } },
+	struct { const char *name; const char *argv[5]; } cands[] = {
+		{ "xclip",  { "xclip", "-selection", "clipboard", "-in", NULL } },
+		{ "wl-copy", { "wl-copy", NULL } },
+		{ "pbcopy", { "pbcopy", NULL } },
+		{ "termux-clipboard-set", { "termux-clipboard-set", NULL } },
 	};
 	for (size_t i = 0; i < sizeof cands / sizeof cands[0]; i++) {
 		if (!has_prog(cands[i].name))
@@ -1313,8 +1327,6 @@ int main(int argc, char **argv)
 		dirty = 1;
 	}
 
-	fputs("\x1b[0m\x1b[?25h\x1b[?1049l", stdout);
-	fflush(stdout);
-	raw_off();
+	restore_terminal();
 	return 0;
 }
