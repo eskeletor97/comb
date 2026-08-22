@@ -1,0 +1,55 @@
+--- comb torture log: one line per heuristic, markers are tag-less lines ---
+
+--- severity keywords: each next line should be tinted ---
+2026-08-22T23:50:01 localhost reactor[1]: FATAL: core temperature runaway
+2026-08-22T23:50:02 localhost reactor[1]: PANIC: operator fled the building
+2026-08-22T23:50:03 localhost reactor[1]: EMERG: sirens engaged, alert level max
+2026-08-22T23:50:04 localhost reactor[1]: CRIT: critical mass approximated
+2026-08-22T23:50:05 localhost app[2]: ERROR: database connection refused
+2026-08-22T23:50:06 localhost app[2]: err, that lowercase variant also counts
+2026-08-22T23:50:07 localhost app[2]: WARN temperature rising, warning issued
+2026-08-22T23:50:08 localhost app[2]: DEBUG: peeking at internals here
+2026-08-22T23:50:09 localhost app[2]: trace route: hop 1 hop 2 hop 3
+2026-08-22T23:50:10 localhost app[2]: level=debug structured style counts too
+
+--- false-positive guards: these lines must stay normal-colored ---
+2026-08-22T23:51:01.912769+02:00 localhost nm-openvpn[30712]: /usr/libexec/nm-openvpn-service-openvpn-helper --debug 0 30707 --bus-name org.freedesktop.NetworkManager.openvpn.Connection_4 --tun -- tun0 1500 0 10.239.191.165 10.239.191.166 init
+2026-08-22T23:51:02 localhost watcher[3]: wrote coredump to /var/debug/core.4096 then carried on
+2026-08-22T23:51:03 localhost poet[4]: the terrain was hilly but no errors were found on it
+
+--- verbosity tokens and epoch stamps ---
+2026-08-22T23:53:27.772757+02:00 localhost NetworkManager[508]: <info>  [1787435607.7727] audit: op="statistics" interface="enp5s0" ifindex=2 args="500" pid=1099 uid=1000 result="success"
+2026-08-22T23:53:28.102331+02:00 localhost NetworkManager[508]: <notice> [1787435608.1019] dhcp4 (enp5s0): lease "expired" early (retry 1 of 3)
+2026-08-22T23:53:29 localhost auditd[9]: <audit> type=SYSCALL msg=audit(1787435609.001): success=yes
+2026-08-22T23:53:30 localhost wpa_supplicant[512]: short [512] pid groups stay untouched, long epochs dim
+
+--- syslog three-word timestamps and tag shapes ---
+Aug 22 23:54:01 myhost sshd[902]: Accepted publickey for root from 192.168.1.10 port 51022 ssh2: ED25519 SHA256:abcdef123456
+Aug 22 23:54:02 myhost chronyd[553]: chronyd[553]: canot synchronise, wait that typo is on purpose below
+Aug 22 23:54:03 myhost chronyd[553]: chronyd[553]: cannot synchronise: no reachable sources (dont mind this line, see next)
+Aug 22 23:54:04 myhost chronyd[553]: can't synchronise: don't panic, cats' whiskers and 'mode ro' quoted flag
+2026-08-22T23:54:05 localhost bare-tag: no brackets here but a tag colon exists
+2026-08-22T23:54:06 localhost app[2]: <info> token first without any tag colon
+: leading colon weirdness should not crash anything
+
+--- quoting and parentheses ---
+2026-08-22T23:55:01 localhost job[7]: something happened (here)
+2026-08-22T23:55:02 localhost job[7]: nested (outer (inner) tail) done
+2026-08-22T23:55:03 localhost job[7]: unbalanced (oops no close and counting forever
+2026-08-22T23:55:04 localhost job[7]: single 'mode ro' set while don't and cats' stay plain
+2026-08-22T23:55:05 localhost job[7]: mixed "double" values and (paren context) together
+
+--- ANSI sanitization: embedded, unclosed CSI, unclosed OSC, lone ESC ---
+[2m2026-08-22T19:33:28.786329Z[0m [32m INFO[0m [2mlact_daemon::server::handler[0m[2m:[0m GPU list reloaded with 1 devices
+2026-08-22T23:56:02 localhost foo[8]: before [31 after-no-final-byte tail survives mostly
+2026-08-22T23:56:03 localhost foo[8]: osc ]0;window title never closed blah blah
+2026-08-22T23:56:04 localhost foo[8]: lone [31mESC sequence complete actually
+
+--- whitespace and unicode ---
+2026-08-22T23:57:01 localhost tab[9]: col1	col2	value with	gaps
+2026-08-22T23:57:02 localhost cr[10]: fake progress 99%done: carriage return swallowed mid-line
+2026-08-22T23:57:03 localhost utf[11]: café naïve 日本語 🎉 multi-byte widths
+2026-08-22T23:57:04 localhost long[12]: pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad end of a very long line
+
+--- last section: blank line above, trailing spaces below ---
+2026-08-22T23:58:01 localhost end[13]: the end   
