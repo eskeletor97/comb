@@ -94,7 +94,7 @@ enum {
 	A_LEFT, A_RIGHT, A_HSTART, A_HEND,
 	A_FILTER, A_CLEAR_FILTER, A_CANCEL,
 	A_MARK, A_UNMARK, A_COPY,
-	A_FOLLOW, A_RELOAD, A_WRAP,
+	A_FOLLOW, A_RELOAD, A_WRAP, A_STOP,
 };
 
 static const struct { int key; int act; } keymap[] = {
@@ -140,6 +140,8 @@ static const struct { int key; int act; } keymap[] = {
 	{ 'x',	      A_UNMARK },
 	{ 'c',	      A_COPY },
 	{ 'y',	      A_COPY },
+
+	{ CTL('z'),   A_STOP },
 
 	/* toggles */
 	{ 'f',	      A_FOLLOW },
@@ -1453,6 +1455,7 @@ static void print_keys(FILE *out)
 		{ A_FOLLOW,	"toggle follow" },
 		{ A_RELOAD,	"reload file" },
 		{ A_WRAP,	"toggle line wrap" },
+		{ A_STOP,	"suspend comb (fg to resume)" },
 		{ A_QUIT,	"quit" },
 	};
 	for (size_t i = 0; i < sizeof acts / sizeof acts[0]; i++) {
@@ -1765,6 +1768,18 @@ int main(int argc, char **argv)
 				ensure_visible();
 				snprintf(msg, sizeof msg, "reloaded");
 			}
+			break;
+		case A_STOP:
+			/* hand the tty back for the shell's job control; on
+			 * continue, pick up exactly where we left off */
+			restore_terminal();
+			signal(SIGTSTP, SIG_DFL);	/* may be inherited as SIG_IGN */
+			raise(SIGTSTP);
+			raw_on();
+			get_winsize();
+			fputs("\x1b[?1049h\x1b[?25l\x1b[2J", stdout);
+			fflush(stdout);
+			dirty = 1;
 			break;
 		case A_REPAINT:
 		default:
