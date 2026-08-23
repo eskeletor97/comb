@@ -1,2 +1,4 @@
 comb
 *.o
+__pycache__/
+*.pyc
