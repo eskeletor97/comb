@@ -81,12 +81,11 @@ enum {
 };
 
 /*
- * Key bindings -- edit to taste. Each row maps one key to one action;
- * many keys may share an action. Keys are whatever read_key() returns:
- * plain characters, control codes via CTL(), or the K_* specials.
- * The filter prompt deliberately keeps fixed editing keys
- * (type / Backspace / Ctrl-u / Enter / Esc), vim-prompt style.
- * usage()'s keys section is generated from this table.
+ * Key bindings -- edit to taste; usage()'s keys section is generated
+ * from this table. Keys are whatever read_key() returns: plain
+ * characters, CTL() control codes, or the K_* specials. The filter
+ * prompt keeps its own fixed editing keys (type, Backspace, Ctrl-u,
+ * Enter, Esc).
  */
 #define CTL(x)	((x) & 0x1f)
 enum {
@@ -315,9 +314,8 @@ static void feed(const char *data, size_t n)
 	plen -= start;
 }
 
-/* push any trailing partial line (no trailing newline) as a real line.
- * Used at load/reload and when follow turns off, so a file whose last
- * record lacks a newline still shows it. */
+/* push a trailing partial line (no '\n') as a real line, so a last
+ * record lacking a newline still shows */
 static void flush_pending(void)
 {
 	if (plen == 0)
@@ -329,8 +327,8 @@ static void flush_pending(void)
 	flushed_partial = 1;
 }
 
-/* per-service color: pastel foreground assigned by rotation in order of
- * first appearance so adjacent services never share a color. */
+/* per-service pastels, assigned by rotation in order of first appearance
+ * so neighboring services never share a color */
 static const char *const svc_palette[] = {
 	"\x1b[38;5;215m",	/* peach */
 	"\x1b[38;5;79m",	/* seafoam */
@@ -355,20 +353,17 @@ static struct {
 static size_t nsvc_seen;
 
 /* Byte span of the syslog service tag; returns 1 and fills *so / *eo, or 0
- * if no tag. The tag is the first field ending in ':' after the first
- * field (timestamp), with a trailing "[pid]" stripped:
+ * if none. Heuristic: the first field ending in ':' after a timestamp-ish
+ * preamble, with a trailing "[pid]" stripped:
  *
  *   2026-08-22T23:53:27.7 localhost NetworkManager[508]: <info> ...
- *   \---- field 1 ----/   ^field 2 ^field 3
- *                                    \*so ... *eo/
+ *   \--- field 1 ---/   ^field 2  ^field 3
+ *                                  \*so .. *eo/
  *
- * Field 1 is always skipped (++field < 2): it is the timestamp, whether
- * ISO 8601 or syslog's three-word "Aug 22 23:53:27" (the day/time words
- * are then candidates but never end in ':'). Guards: empty field,
- * no ':' at the end, longer than 64 bytes, or starting with '<' (that's
- * a verbosity token like <info>, not a tag).
- *
- * "chronyd[553]:" -> "chronyd"; bare "foo:" also matches. */
+ * Field 1 is the timestamp, ISO 8601 or syslog's "Aug 22 23:53:27"
+ * (the time words never end in ':'). Guards: empty field, no trailing
+ * ':', longer than 64 bytes, or a leading '<' -- a verbosity token
+ * like <info>, not a tag. "chronyd[553]:" and bare "foo:" match. */
 static int tag_span(const char *s, size_t n, int *so, int *eo)
 {
 	size_t i = 0;
@@ -411,10 +406,9 @@ static int tag_span(const char *s, size_t n, int *so, int *eo)
 	return 0;
 }
 
-/* Assign the palette slot for this line's service tag. Runs at push time
- * so slots depend only on order of appearance in the file; assigning at
- * render time instead made reloads reshuffle colors (draw order differs
- * from file order). */
+/* Assign the palette slot for this line's tag. Runs at push time: slots
+ * follow order of appearance in the file, and render-time assignment
+ * reshuffles colors on reload (draw order differs from file order). */
 static void assign_service(Line *L)
 {
 	int fs, e;
@@ -487,9 +481,9 @@ static int append_new(void)
 {
 	struct stat st, fst;
 	int rotated = 0;
-	/* rotation by rename+recreate keeps our fd on the old inode whose
-	 * size never changes, so also compare the path's inode; the size
-	 * check alone covers copytruncate-style truncation */
+	/* rename+recreate rotation keeps our fd on the old inode, whose
+	 * size never changes -- compare the path's inode too; the size
+	 * check alone covers copytruncate truncation */
 	if (fstat(fd, &fst) == 0 && stat(path, &st) == 0 &&
 	    (st.st_ino != fst.st_ino || st.st_dev != fst.st_dev ||
 	     (off_t)st.st_size < fsize)) {
@@ -663,10 +657,10 @@ static size_t u8len(unsigned char c)
 	return 1;
 }
 
-/* display width in terminal cells for a codepoint: East Asian
- * Wide/Fullwidth = 2, common combining marks = 0, else 1. Compact
- * locale-independent stand-in for wcwidth(); covers the ranges that
- * actually show up in logs (CJK, Hangul, Kana, fullwidth, emoji). */
+/* display width of a codepoint in terminal cells: East Asian
+ * Wide/Fullwidth = 2, common combining marks = 0, else 1. A compact,
+ * locale-independent wcwidth() stand-in covering what shows up in
+ * logs (CJK, Hangul, Kana, fullwidth, emoji). */
 static int glyph_width(unsigned cp)
 {
 	static const struct { unsigned lo, hi; } wide[] = {
@@ -689,7 +683,7 @@ static int glyph_width(unsigned cp)
 	return 1;
 }
 
-/* decode one UTF-8 codepoint; on malformed input fall back to the raw
+/* decode one UTF-8 codepoint; malformed input falls back to the raw
  * lead byte so nothing is ever skipped or lost */
 static unsigned u8_decode(const char *s, size_t rem, size_t *cl)
 {
@@ -718,8 +712,7 @@ static unsigned u8_decode(const char *s, size_t rem, size_t *cl)
 	return cp;
 }
 
-/* display width in terminal cells, for cursor placement and
- * $-style end alignment */
+/* display width in terminal cells */
 static size_t str_cols(const char *s, size_t n)
 {
 	size_t w = 0;
@@ -759,9 +752,9 @@ static const char *severity(const char *s)
 		{ "debug", "\x1b[2m" },    { "trace", "\x1b[2m" },
 		{ NULL, NULL }
 	};
-	/* a keyword counts only when its left neighbor isn't part of a word,
-	 * flag or path: "--debug", "/var/debug" and "terrain" (for "err")
-	 * must not dim the line; "level=debug", "<warn>", "errors" must */
+	/* a keyword counts only when the preceding byte isn't alnum, '-'
+	 * or '/': "--debug", "/var/debug", "terrain" stay plain;
+	 * "level=debug", "<warn>", "errors" still match */
 	if (nocolor)
 		return "";
 	for (int i = 0; sev[i][0]; i++) {
@@ -821,13 +814,14 @@ static const char *token_attr(const char *s, size_t n)
 
 /* structural tinting for whatever shape the log has: dim the preamble
  * (timestamp/host) and epoch stamps, hue the verbosity token, accent
- * "quoted values". Purely cosmetic guesses; no format is required. */
+ * "quoted values" and (parenthesized) context. All guesses; no format
+ * is required. */
 static int collect_spans(const Line *L, Span *sp)
 {
 	int n = 0;
 	const char *s = L->s;
 
-	if (nocolor)		/* tinting is purely cosmetic */
+	if (nocolor)
 		return 0;
 	if (L->tag_so > 0)
 		add_span(sp, &n, 0, L->tag_so, DIM);
@@ -891,7 +885,7 @@ static int collect_spans(const Line *L, Span *sp)
 		k = j;
 	}
 	/* parenthesis groups, nesting included; unbalanced ones stay plain.
-	 * Deliberately shares the quotes' budget of 12 spans per line */
+	 * Shares the quotes' budget of 12 spans per line */
 	for (size_t k = 0; k < L->len && q < 12; k++) {
 		if (s[k] != '(')
 			continue;
@@ -1015,8 +1009,8 @@ static void draw_status(void)
 	char left[512];
 
 	if (editing) {
-		/* keep the tail of the query visible: a prompt wider than the
-		 * pane would autowrap and scroll the whole screen per keystroke */
+		/* show the tail: a prompt wider than the pane would autowrap
+		 * and scroll the screen on every keystroke */
 		size_t elen = strlen(edit);
 		int ew = (int)str_cols(edit, elen);
 		int maxw = cols - 4 > 1 ? cols - 4 : 1;	/* " /" + cursor + " " */
@@ -1032,8 +1026,8 @@ static void draw_status(void)
 		fputs(edit + off, stdout);
 		fputs(" \x1b[0m", stdout);
 		int pw = (tw > 0 ? tw : 0) + 3;
-		/* surface notices like "bad regex" -- they must not hide behind
-		 * the prompt, or typing an invalid pattern gives zero feedback */
+		/* show update_filter() notices (e.g. "bad regex") instead of
+		 * hiding them behind the prompt */
 		int nw = (int)strlen(msg);
 		int room = cols - (pw - 1);
 		if (*msg && nw < room) {
@@ -1066,9 +1060,9 @@ static void draw_status(void)
 		hint[hw] = 0;
 	}
 
-	/* Fit left of the hint: shrink the path first, then the query,
-	 * then drop decorations. A wrapped status line would scroll the
-	 * pane up and swallow a content row. */
+	/* fit left of the hint: shrink the path, then the query, then drop
+	 * decorations; a wrapped status line would scroll the pane up and
+	 * swallow a content row */
 	const char *flw = follow && !use_stdin ? "  follow" : "";
 	int budget = cols - hw - 2;
 	char mk[32];
@@ -1229,7 +1223,7 @@ static void copy_text(const char *s, size_t len)
 	size_t need = 4 * ((len + 2) / 3) + 1;
 	char *b = xrealloc(NULL, need);
 	b64enc(s, len, b);
-	/* OSC 52: works in most terminals, including over ssh */
+	/* OSC 52, so copy works over ssh too */
 	printf("\x1b]52;c;%s\a", b);
 	fflush(stdout);
 	free(b);
@@ -1489,7 +1483,7 @@ int main(int argc, char **argv)
 
 	load_all();
 	if (init_re)
-		update_filter(init_re);	/* rebuilds the view itself */
+		update_filter(init_re);
 	else
 		rebuild_view();
 	cur = nv ? nv - 1 : 0;
