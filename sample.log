@@ -50,6 +50,8 @@ Aug 22 23:54:04 myhost chronyd[553]: can't synchronise: don't panic, cats' whisk
 2026-08-22T23:57:02 localhost cr[10]: fake progress 99%done: carriage return swallowed mid-line
 2026-08-22T23:57:03 localhost utf[11]: café naïve 日本語 🎉 multi-byte widths
 2026-08-22T23:57:04 localhost long[12]: pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad end of a very long line
+2026-08-22T23:57:05 localhost jp[13]: 日本語の長い行です。ターミナルの幅を超えると描画が崩れます。この行はワイド文字だけで構成されているので、コードポイント数はセル数の半分になります。端までスクロールしてみてください。
+2026-08-22T23:57:06 localhost zh[14]: 这是一行很长的中文日志。当宽度超过终端列数时显示会错位，因为绘制循环按码点计数而不是按单元格计数。试着按 l 键横向滚动，再按 $ 跳到行尾，观察偏移是否正确。
 
 --- last section: blank line above, trailing spaces below ---
-2026-08-22T23:58:01 localhost end[13]: the end   
+2026-08-22T23:58:01 localhost end[15]: the end   

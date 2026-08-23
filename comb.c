@@ -340,7 +340,7 @@ static size_t nsvc_seen;
 static int tag_span(const char *s, size_t n, int *so, int *eo)
 {
 	size_t i = 0;
-	int field = 0;
+	int field = 0, saw_digit = 0;
 	while (i < n) {
 		while (i < n && s[i] == ' ')
 			i++;
@@ -350,8 +350,16 @@ static int tag_span(const char *s, size_t n, int *so, int *eo)
 		while (i < n && s[i] != ' ')
 			i++;
 		size_t fe = i;
-		if (++field < 2)
-			continue;
+		int digit = 0;
+		for (size_t k = fs; k < fe; k++)
+			if (s[k] >= '0' && s[k] <= '9') {
+				digit = 1;
+				break;
+			}
+		saw_digit |= digit;
+		if (++field < 2 || !saw_digit)
+			continue;	/* tag needs a timestamp-ish preamble,
+					 * else prose reads as "tag: text" */
 		if (fe == fs || s[fe - 1] != ':' || fe - fs > 64 || s[fs] == '<')
 			continue;
 		size_t e = fe - 1;
@@ -518,6 +526,14 @@ static void update_filter(const char *q)
 	rebuild_view();
 }
 
+static void extend_view(size_t from)
+{
+	for (size_t i = from; i < nlines; i++) {
+		if (!filtered || regexec(&re, lines[i].s, 0, NULL, 0) == 0)
+			push_view(i);
+	}
+}
+
 static void rebuild_view(void)
 {
 	nv = 0;
@@ -541,6 +557,73 @@ static size_t u8len(unsigned char c)
 	if ((c & 0xF8) == 0xF0)
 		return 4;
 	return 1;
+}
+
+/* display width in terminal cells for a codepoint: East Asian
+ * Wide/Fullwidth = 2, common combining marks = 0, else 1. Compact
+ * locale-independent stand-in for wcwidth(); covers the ranges that
+ * actually show up in logs (CJK, Hangul, Kana, fullwidth, emoji). */
+static int glyph_width(unsigned cp)
+{
+	static const struct { unsigned lo, hi; } wide[] = {
+		{0x1100, 0x115F}, {0x2E80, 0x303E}, {0x3041, 0x33FF},
+		{0x3400, 0x4DBF}, {0x4E00, 0x9FFF}, {0xA000, 0xA4CF},
+		{0xAC00, 0xD7A3}, {0xF900, 0xFAFF}, {0xFE10, 0xFE19},
+		{0xFE30, 0xFE6F}, {0xFF00, 0xFF60}, {0xFFE0, 0xFFE6},
+		{0x1F300, 0x1FAFF}, {0x20000, 0x3FFFD},
+	};
+	static const struct { unsigned lo, hi; } zero[] = {
+		{0x0300, 0x036F}, {0x0483, 0x0489}, {0x1AB0, 0x1AFF},
+		{0x200B, 0x200F}, {0x20D0, 0x20FF}, {0xFE00, 0xFE0F},
+	};
+	for (size_t i = 0; i < sizeof wide / sizeof wide[0]; i++)
+		if (cp >= wide[i].lo && cp <= wide[i].hi)
+			return 2;
+	for (size_t i = 0; i < sizeof zero / sizeof zero[0]; i++)
+		if (cp >= zero[i].lo && cp <= zero[i].hi)
+			return 0;
+	return 1;
+}
+
+/* decode one UTF-8 codepoint; on malformed input fall back to the raw
+ * lead byte so nothing is ever skipped or lost */
+static unsigned u8_decode(const char *s, size_t rem, size_t *cl)
+{
+	unsigned char c = (unsigned char)s[0];
+	size_t n = u8len(c);
+	unsigned cp;
+	if (n > rem) {
+		*cl = 1;
+		return c;
+	}
+	switch (n) {
+	case 2: cp = c & 0x1f; break;
+	case 3: cp = c & 0x0f; break;
+	case 4: cp = c & 0x07; break;
+	default: *cl = 1; return c;
+	}
+	for (size_t i = 1; i < n; i++) {
+		unsigned char cc = (unsigned char)s[i];
+		if ((cc & 0xC0) != 0x80) {
+			*cl = 1;
+			return c;
+		}
+		cp = cp << 6 | (cc & 0x3f);
+	}
+	*cl = n;
+	return cp;
+}
+
+/* cell width of a whole line, for $-style end alignment */
+static size_t line_cols(const Line *L)
+{
+	size_t w = 0;
+	for (size_t i = 0; i < L->len; ) {
+		size_t cl;
+		w += glyph_width(u8_decode(L->s + i, L->len - i, &cl));
+		i += cl;
+	}
+	return w;
 }
 
 
@@ -684,7 +767,8 @@ static int collect_spans(const Line *L, Span *sp)
 		q++;
 		k = j;
 	}
-	/* parenthesis groups, nesting included; unbalanced ones stay plain */
+	/* parenthesis groups, nesting included; unbalanced ones stay plain.
+	 * Deliberately shares the quotes' budget of 12 spans per line */
 	for (size_t k = 0; k < L->len && q < 12; k++) {
 		if (s[k] != '(')
 			continue;
@@ -739,8 +823,11 @@ static void draw_line(size_t idx, int iscur)
 	BASE();
 
 	while (b < L->len) {
-		size_t cl = u8len((unsigned char)L->s[b]);
-		if (dc >= (size_t)hscroll + (size_t)cols)
+		size_t cl;
+		int gw = glyph_width(u8_decode(L->s + b, L->len - b, &cl));
+		/* stop before a glyph that would straddle the right edge and
+		 * wrap onto the next row */
+		if (dc + (size_t)gw > (size_t)hscroll + (size_t)cols)
 			break;
 		if (act && (size_t)act->se <= b) {
 			act = NULL;
@@ -754,12 +841,12 @@ static void draw_line(size_t idx, int iscur)
 			fputs("\x1b[7m", stdout);
 		if (dc >= (size_t)hscroll) {
 			fwrite(L->s + b, 1, cl, stdout);
-			emitted++;
+			emitted += (size_t)gw;
 		}
 		if (me >= 0 && b + cl == (size_t)me)
 			fputs("\x1b[27m", stdout);
 		b += cl;
-		dc++;
+		dc += (size_t)gw;
 	}
 	BASE();
 #undef BASE
@@ -780,10 +867,11 @@ static void draw_status(void)
 		fputs("\x1b[1;7m ", stdout);
 		fputs(left, stdout);
 		fputs(" \x1b[0m", stdout);
-		int cc = 0;	/* columns = codepoints here, not bytes */
+		int cc = 0;	/* cursor column: cells, not bytes */
 		for (size_t i = 0; i < strlen(left); ) {
-			i += u8len((unsigned char)left[i]);
-			cc++;
+			size_t cl;
+			cc += glyph_width(u8_decode(left + i, strlen(left) - i, &cl));
+			i += cl;
 		}
 		printf("\x1b[%d;%dH\x1b[?25h", rows, cc + 3);
 		return;
@@ -1032,31 +1120,54 @@ static int wait_byte(void)
 	return read_byte();
 }
 
+/* map a fully-drained CSI/SS3 sequence; seq[n-1] is the final byte */
+static int decode_csi(const char *seq, size_t n)
+{
+	switch (seq[n - 1]) {
+	case 'A': return K_UP;
+	case 'B': return K_DOWN;
+	case 'C': return K_RIGHT;
+	case 'D': return K_LEFT;
+	case 'H': return K_HOME;
+	case 'F': return K_END;
+	case '~':	/* single-digit param picks the key; 15..24~ are F-keys */
+		if (seq[0] >= '1' && seq[0] <= '8' &&
+		    (seq[1] == '~' || seq[1] == ';')) {
+			switch (seq[0]) {
+			case '1': case '7': return K_HOME;
+			case '4': case '8': return K_END;
+			case '5': return K_PGUP;
+			case '6': return K_PGDN;
+			case '3': return K_DEL;
+			}
+		}
+		return K_NONE;	/* 2 ins, 15+ F-keys, 200/201 paste ... */
+	default:
+		return K_NONE;	/* modified keys, mouse, unknown: drained */
+	}
+}
+
 static int read_key(void)
 {
 	int c = read_byte();
-	if (c == 0x1b) {
-		if (wait_byte() != '[')
+	if (c != 0x1b)
+		return c;
+	int c2 = wait_byte();
+	if (c2 != '[' && c2 != 'O')
+		return K_ESC;
+	/* swallow the whole sequence up to its final byte (@..~) so no
+	 * leftover bytes ever replay as keystrokes */
+	char seq[16];
+	size_t n = 0;
+	int f;
+	do {
+		f = wait_byte();
+		if (f == K_ESC)
 			return K_ESC;
-		int c2 = wait_byte();
-		if (c2 == K_ESC)
-			return K_ESC;
-		switch (c2) {
-		case 'A': return K_UP;
-		case 'B': return K_DOWN;
-		case 'C': return K_RIGHT;
-		case 'D': return K_LEFT;
-		case 'H': return K_HOME;
-		case 'F': return K_END;
-		case '5': return (wait_byte() == '~') ? K_PGUP : K_NONE;
-		case '6': return (wait_byte() == '~') ? K_PGDN : K_NONE;
-		case '1': case '7': return (wait_byte() == '~') ? K_HOME : K_NONE;
-		case '4': case '8': return (wait_byte() == '~') ? K_END : K_NONE;
-		case '3': return (wait_byte() == '~') ? K_DEL : K_NONE;
-		default: return K_NONE;
-		}
-	}
-	return c;
+		if (n < sizeof seq - 1)
+			seq[n++] = (char)f;
+	} while (f < 0x40 || f > 0x7e);
+	return decode_csi(seq, n);
 }
 
 static void apply_edit(void)
@@ -1148,8 +1259,12 @@ int main(int argc, char **argv)
 		}
 		if (follow && fd >= 0) {
 			int stick = nv > 0 && cur >= nv - 1;
+			size_t old = nlines;
 			if (append_new()) {
-				rebuild_view();
+				if (nlines >= old)	/* rotation resets lines[] */
+					extend_view(old);
+				else
+					rebuild_view();
 				if (stick)
 					cur = nv ? nv - 1 : 0;
 				ensure_visible();
@@ -1251,8 +1366,10 @@ int main(int argc, char **argv)
 		case A_HEND:
 			if (nv) {
 				Line *L = &lines[view[cur]];
-				int len = (int)L->len;
-				hscroll = len > cols ? len - cols : 0;
+				size_t cw = line_cols(L);
+				hscroll = cw > (size_t)cols
+						  ? (int)(cw - (size_t)cols)
+						  : 0;
 			}
 			break;
 		case A_FILTER:
