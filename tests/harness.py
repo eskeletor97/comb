@@ -28,6 +28,7 @@ import select
 import signal
 import struct
 import sys
+import tempfile
 import termios
 import time
 
@@ -68,7 +69,8 @@ def _child_setup(slave, stdin_pipe_r, env_color=True):
 
 
 def run(argv, keys=b'', stdin_text=None, rows=24, cols=80, env_color=True,
-        settle=0.35, key_delay=0.02, idle=0.25, timeout=5.0):
+        settle=0.35, key_delay=0.02, idle=0.25, timeout=5.0, midrun=None,
+        resizes=None):
     """Spawn comb, send keys, return RunResult. argv excludes keys."""
     stdin_r = None
     # os.pipe() fds are non-inheritable (PEP 446): at execvp the child's
@@ -109,6 +111,16 @@ def run(argv, keys=b'', stdin_text=None, rows=24, cols=80, env_color=True,
         return True
 
     alive = pump(settle)
+    if alive and midrun:
+        midrun(master)             # mutate the world (append/truncate files)
+        alive = pump(settle)       # give follow mode a poll cycle to notice
+    if alive:
+        for r, c in (resizes or []):
+            fcntl.ioctl(master, termios.TIOCSWINSZ,
+                        struct.pack('HHHH', r, c, 0, 0))
+            rows, cols = r, c
+            if not pump(settle):
+                break
     for k in (keys if isinstance(keys, bytes) else keys.encode()):
         if not alive:
             break
@@ -210,6 +222,8 @@ SCENARIOS = [
     ('filter nomatch',    '/zzznomatch\x1bG?gq', {}),
     ('marks sweep up',    'GGkk xkx q',          {}),
     ('esc clears marks',  'GGxkx\x1bg/err\x1bq',  {}),
+    # SIGWINCH storm: shrink then grow, pane must re-window without dying
+    ('resize storm',      'jjjwwggjkq',          {'resizes': ((24, 80), (10, 40), (30, 120))}),
 ]
 
 # Absolute assertions against a single build (no reference binary needed):
@@ -286,6 +300,85 @@ def _check_wrap_long_line(binary):
         return 'unwrapped long line spilled over multiple rows'
 
 
+def _check_prompt_never_overflows(binary):
+    # the editing frame must never emit more visible cells than the pane
+    # is wide, or terminals autowrap and scroll the screen per keystroke
+    for cols in (40, 80):
+        out = run([binary, 'sample.log'], keys='/' + 'a' * 200 + 'q',
+                  cols=cols).output
+        for frame in out.split(b'\x1b[1;7m /')[1:]:
+            seg = frame.split(b'\x1b[0m')[0]
+            if len(seg.rstrip(b' ')) > cols - 3:
+                return f'{cols}-col pane got {len(seg)}-cell prompt'
+
+
+def _check_prompt_clips_multibyte(binary):
+    # clipping must respect UTF-8 boundaries and glyph widths
+    out = run([binary, 'sample.log'], keys='/' + '\u3042' * 60 + 'q', cols=40).output
+    frame = out.split(b'\x1b[1;7m /')[1]
+    seg = frame.split(b'\x1b[0m')[0].rstrip(b' ')
+    if len(seg) % 3 != 0 or len(seg) > 36 * 3:
+        return f'multibyte prompt clipped mid-glyph or too wide: {len(seg)} bytes'
+
+
+def _tmplog(lines):
+    tf = tempfile.NamedTemporaryFile(delete=False, suffix='.log')
+    tf.write((''.join(lines)).encode())
+    tf.close()
+    return tf.name
+
+
+def _check_follow_append(binary):
+    name = _tmplog(['one\n', 'two\n'])
+
+    def grow(fd):
+        with open(name, 'a') as f:
+            for i in range(50):
+                f.write(f'appended {i}\n')
+
+    scr = run([binary, name], keys='q', midrun=grow).screen()
+    # no movement keys: comb starts at the bottom, follow must keep it there
+    os.unlink(name)
+    if not any('appended 49' in r for r in scr):
+        return 'appended lines never appeared'
+    if not any('/52' in r for r in scr):
+        return 'cursor did not stick to bottom while following'
+
+
+def _check_copytruncate(binary):
+    name = _tmplog([f'stale line {i}\n' for i in range(100)])
+
+    def cut(fd):
+        with open(name, 'w') as f:
+            f.write('fresh start\n')
+
+    scr = run([binary, name], keys='gq', midrun=cut).screen()
+    os.unlink(name)
+    if not any('fresh start' in r for r in scr):
+        return 'truncated-in fresh line not shown'
+    if any('stale line' in r for r in scr):
+        return 'stale lines survived truncation'
+
+
+def _check_mark_empty_lines(binary):
+    res = run([binary, '-'], keys='Gxkxcq', stdin_text='\n\n\ncontent\n')
+    if b'\x1b]52;c;' not in res.output:
+        return 'copying marked empty lines produced no OSC 52'
+    if not any('copied' in r for r in res.screen()):
+        return 'no copy confirmation in status bar'
+
+
+def _check_metachar_query(binary):
+    # invalid intermediate regexes must keep the old view and raise a
+    # notice; completing a valid one must filter; Esc must clear cleanly
+    keys = '/[a+b(c)|\x1bG/a.*b\\d\x1bq'
+    out = run([binary, 'sample.log'], keys=keys)
+    if b'bad regex' not in out.output:
+        return 'no bad-regex notice while typing invalid intermediates'
+    if not any(re.search(r'\d+/\d+', r) for r in out.screen()):
+        return 'status counter lost after metachar queries'
+
+
 CHECKS = [
     ('empty stdin shows placeholder', _check_empty_stdin),
     ('final line without newline kept', _check_no_trailing_newline),
@@ -296,6 +389,12 @@ CHECKS = [
     ('--no-color strips highlighting', _check_no_color_flag),
     ('NO_COLOR env strips highlighting', _check_no_color_env),
     ('wrap splits long lines only in wrap mode', _check_wrap_long_line),
+    ('filter prompt never overflows pane',       _check_prompt_never_overflows),
+    ('filter prompt clips on UTF-8 boundary',    _check_prompt_clips_multibyte),
+    ('follow picks up appended lines',           _check_follow_append),
+    ('copytruncate clears stale lines',          _check_copytruncate),
+    ('marked empty lines copy cleanly',          _check_mark_empty_lines),
+    ('regex metachar queries stay sane',         _check_metachar_query),
 ]
 
 
