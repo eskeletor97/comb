@@ -43,7 +43,7 @@ static size_t nv, vcap;
 static char path[4096];
 static int use_stdin;
 static int fd = -1;      /* log file */
-static int kfd = 0;      /* keyboard: stdin, or /dev/tty when stdin is data */
+static int kfd = 0;      /* keyboard: stdin, or /dev/tty when stdin isn't a tty */
 static off_t fsize;
 
 static regex_t re;
@@ -53,10 +53,15 @@ static char edit[MAX_QUERY];
 static int editing;
 
 static int follow = 1;
+static int wrap;
+static int nocolor;
+static const char *mark_bg = MARK_BG;
 static int running = 1;
 static int dirty = 1;
 
 static size_t cur, top;
+static size_t filter_anchor;	/* line selected when filtering began */
+static size_t filter_row;	/* its screen row, restored on clear */
 static int hscroll;
 static int rows = 24, cols = 80;
 
@@ -70,8 +75,8 @@ static int mdir = -1;	/* space/x sweep direction: -1 up, 1 down */
 static void assign_service(Line *L);
 
 enum {
-	K_NONE = 0x100, K_EOF, K_ESC, K_UP, K_DOWN, K_LEFT, K_RIGHT,
-	K_PGUP, K_PGDN, K_HOME, K_END, K_DEL
+	K_NONE = 0x100, K_EOF, K_UP, K_DOWN, K_LEFT, K_RIGHT,
+	K_PGUP, K_PGDN, K_HOME, K_END
 };
 
 /*
@@ -80,6 +85,7 @@ enum {
  * plain characters, control codes via CTL(), or the K_* specials.
  * The filter prompt deliberately keeps fixed editing keys
  * (type / Backspace / Ctrl-u / Enter / Esc), vim-prompt style.
+ * usage()'s keys section is generated from this table.
  */
 #define CTL(x)	((x) & 0x1f)
 enum {
@@ -88,7 +94,7 @@ enum {
 	A_LEFT, A_RIGHT, A_HSTART, A_HEND,
 	A_FILTER, A_CLEAR_FILTER, A_CANCEL,
 	A_MARK, A_UNMARK, A_COPY,
-	A_FOLLOW, A_RELOAD,
+	A_FOLLOW, A_RELOAD, A_WRAP,
 };
 
 static const struct { int key; int act; } keymap[] = {
@@ -97,6 +103,9 @@ static const struct { int key; int act; } keymap[] = {
 
 	/* vertical movement; sets the space/x sweep direction */
 	{ 'j',	      A_DOWN },
+	{ 'e',	      A_DOWN },
+	{ '\r',	      A_DOWN },
+	{ '\n',	      A_DOWN },
 	{ K_DOWN,	     A_DOWN },
 	{ 'k',	      A_UP },
 	{ K_UP,	   A_UP },
@@ -120,6 +129,7 @@ static const struct { int key; int act; } keymap[] = {
 	{ 'l',	      A_RIGHT },
 	{ K_RIGHT,	    A_RIGHT },
 	{ '0',	      A_HSTART },
+	{ '^',	      A_HSTART },
 	{ '$',	      A_HEND },
 
 	/* filter / marks / clipboard */
@@ -130,11 +140,10 @@ static const struct { int key; int act; } keymap[] = {
 	{ 'x',	      A_UNMARK },
 	{ 'c',	      A_COPY },
 	{ 'y',	      A_COPY },
-	{ '\r',	     A_COPY },
-	{ '\n',	     A_COPY },
 
 	/* toggles */
 	{ 'f',	      A_FOLLOW },
+	{ 'w',	      A_WRAP },
 	{ 'r',	      A_RELOAD },
 	{ CTL('l'),   A_REPAINT },
 };
@@ -465,7 +474,6 @@ static void load_all(void)
 		if (fd < 0)
 			die("cannot open %s", path);
 	}
-	fsize = 0;
 	read_available(fd);
 	flush_pending();
 	fsize = lseek(fd, 0, SEEK_CUR);
@@ -499,6 +507,8 @@ static int append_new(void)
 
 /* --- filtering --- */
 
+static size_t line_rows(const Line *L);
+
 static void push_view(size_t i)
 {
 	if (nv == vcap) {
@@ -515,16 +525,56 @@ static void ensure_visible(void)
 		cur = nv ? nv - 1 : 0;
 	if (cur < top)
 		top = cur;
-	if (cur >= top + vis)
+	else if (wrap) {
+		/* lowest window that fits cur: walk up from cur while the
+		 * accumulated rows fit the pane */
+		size_t acc = 0, i = cur;
+		while (i > top) {
+			size_t hr = line_rows(&lines[view[i]]);
+			if (acc + hr > vis) {
+				if (i < cur)
+					i++;   /* exclude the line that broke the budget */
+				break; /* else: line is taller than the pane, pin it */
+			}
+			acc += hr;
+			i--;
+		}
+		top = i;
+	} else if (cur >= top + vis) {
 		top = cur - vis + 1;
+	}
+	/* the list shrank (filter/reload/rotation): don't leave the
+	 * viewport stranded past the last line -- end-anchor it instead */
+	if (!wrap) {
+		if (top + vis > nv)
+			top = nv > vis ? nv - vis : 0;
+		return;
+	}
+	/* wrap: same anchor, in rows. Early-out when the tail fills the pane. */
+	size_t acc = 0, i = top;
+	while (i < nv && acc < vis)
+		acc += line_rows(&lines[view[i++]]);
+	if (acc >= vis)
+		return;
+	acc = 0;
+	i = nv;
+	while (i > 0) {
+		size_t hr = line_rows(&lines[view[i - 1]]);
+		if (acc + hr > vis)
+			break;
+		i--;
+		acc += hr;
+	}
+	top = i;
 }
 
 static void rebuild_view(void);
 
 static void update_filter(const char *q)
 {
+	int was_filtered = filtered, clearing = !*q;
 	msg[0] = 0;
-	if (!*q) {
+	if (clearing) {
 		if (filtered)
 			regfree(&re);
 		filtered = 0;
@@ -549,6 +599,30 @@ static void update_filter(const char *q)
 		snprintf(query, sizeof query, "%s", q);
 	}
 	rebuild_view();
+	if (clearing && was_filtered && filter_anchor < nlines) {
+		/* return to the line selected before filtering began; view[]
+		 * is sorted, so the line is a binary search away. If it left
+		 * with a rotation/reload, keep the clamped position instead. */
+		size_t lo = 0, hi = nv;
+		while (lo < hi) {
+			size_t mid = lo + (hi - lo) / 2;
+			if (view[mid] < filter_anchor)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+		if (lo < nv && view[lo] == filter_anchor) {
+			cur = lo;
+			/* re-window so the line lands on the row it occupied
+			 * before filtering; ensure_visible() keeps this as-is */
+			size_t vis = (size_t)(rows > 1 ? rows - 1 : 1);
+			size_t max_top = nv > vis ? nv - vis : 0;
+			top = lo > filter_row ? lo - filter_row : 0;
+			if (top > max_top)
+				top = max_top;
+		}
+	}
+	ensure_visible();
 }
 
 static void extend_view(size_t from)
@@ -562,10 +636,7 @@ static void extend_view(size_t from)
 static void rebuild_view(void)
 {
 	nv = 0;
-	for (size_t i = 0; i < nlines; i++) {
-		if (!filtered || regexec(&re, lines[i].s, 0, NULL, 0) == 0)
-			push_view(i);
-	}
+	extend_view(0);
 	ensure_visible();
 }
 
@@ -639,16 +710,27 @@ static unsigned u8_decode(const char *s, size_t rem, size_t *cl)
 	return cp;
 }
 
-/* cell width of a whole line, for $-style end alignment */
-static size_t line_cols(const Line *L)
+/* display width in terminal cells, for cursor placement and
+ * $-style end alignment */
+static size_t str_cols(const char *s, size_t n)
 {
 	size_t w = 0;
-	for (size_t i = 0; i < L->len; ) {
+	for (size_t i = 0; i < n; ) {
 		size_t cl;
-		w += (size_t)glyph_width(u8_decode(L->s + i, L->len - i, &cl));
+		w += (size_t)glyph_width(u8_decode(s + i, n - i, &cl));
 		i += cl;
 	}
-	return w;
+		return w;
+}
+
+/* pane rows the logical line occupies */
+static size_t line_rows(const Line *L)
+{
+	if (!wrap)
+		return 1;
+	size_t w = str_cols(L->s, L->len);
+	size_t n = (w + (size_t)cols - 1) / (size_t)cols;
+	return n ? n : 1;
 }
 
 
@@ -665,6 +747,8 @@ static const char *severity(const char *s)
 	/* a keyword counts only when its left neighbor isn't part of a word,
 	 * flag or path: "--debug", "/var/debug" and "terrain" (for "err")
 	 * must not dim the line; "level=debug", "<warn>", "errors" must */
+	if (nocolor)
+		return "";
 	for (int i = 0; sev[i][0]; i++) {
 		const char *p = s;
 		while ((p = strcasestr(p, sev[i][0])) != NULL) {
@@ -713,7 +797,7 @@ static const char *token_attr(const char *s, size_t n)
 		{ "audit",  "\x1b[38;5;146m" },	/* lilac */
 	};
 	char buf[16];
-	if (n == 0 || n >= sizeof buf)
+	if (nocolor || n == 0 || n >= sizeof buf)
 		return NULL;
 	memcpy(buf, s, n);
 	buf[n] = 0;
@@ -731,6 +815,8 @@ static int collect_spans(const Line *L, Span *sp)
 	int n = 0;
 	const char *s = L->s;
 
+	if (nocolor)		/* tinting is purely cosmetic */
+		return 0;
 	if (L->tag_so > 0)
 		add_span(sp, &n, 0, L->tag_so, DIM);
 	if (L->slot >= 0)
@@ -814,7 +900,10 @@ static int collect_spans(const Line *L, Span *sp)
 	return n;
 }
 
-static void draw_line(size_t idx, int iscur)
+/* draw one logical line into the pane starting at row r0 (0-based),
+ * using at most vmax rows; returns rows consumed. Wrap mode continues
+ * on the next row; otherwise it stops at the right edge (hscroll). */
+static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 {
 	Line *L = &lines[idx];
 	const char *col = severity(L->s);
@@ -830,30 +919,55 @@ static void draw_line(size_t idx, int iscur)
 
 	const Span *act = NULL;
 	size_t si = 0;
-	size_t b = 0, dc = 0, emitted = 0;
+	size_t b = 0, dc = 0, sc = 0, row = r0;
 
 	/* base style = cursor/mark bg + severity fg (+match inverse if mid-match) */
 #define BASE() do { \
 		fputs("\x1b[0m", stdout); \
 		if (iscur) \
-			fputs("\x1b[100m", stdout); \
+			fputs(nocolor ? "\x1b[7m" : "\x1b[100m", stdout); \
 		else if (L->marked) \
-			fputs(MARK_BG, stdout); \
+			fputs(mark_bg, stdout); \
 		if (*col) \
 			fputs(col, stdout); \
 		if (ms >= 0 && b >= (size_t)ms && b < (size_t)me) \
 			fputs("\x1b[7m", stdout); \
 	} while (0)
 
+	printf("\x1b[%zu;1H", row + 1);
 	BASE();
 
 	while (b < L->len) {
 		size_t cl;
 		int gw = glyph_width(u8_decode(L->s + b, L->len - b, &cl));
-		/* stop before a glyph that would straddle the right edge and
-		 * wrap onto the next row */
-		if (dc + (size_t)gw > (size_t)hscroll + (size_t)cols)
-			break;
+		if ((wrap ? sc + (size_t)gw > (size_t)cols
+			   : dc + (size_t)gw > (size_t)hscroll + (size_t)cols)) {
+			if (!wrap)
+				break;
+			if (sc == 0) {	/* lone glyph wider than a whole row */
+				fputc('?', stdout);
+				b += cl;
+				dc += (size_t)gw;
+				sc = 1;
+				continue;
+			}
+			if (row + 1 >= vmax)
+				break;
+			for (size_t k = sc; k < (size_t)cols; k++)
+				fputc(' ', stdout);
+			row++;
+			printf("\x1b[%zu;1H", row + 1);
+			BASE();
+			if (act)	/* span styling doesn't survive SGR reset */
+				fputs(act->attr, stdout);
+			sc = 0;
+			continue;
+		}
+		if (!wrap && dc < (size_t)hscroll) {
+			b += cl;
+			dc += (size_t)gw;
+			continue;
+		}
 		if (act && (size_t)act->se <= b) {
 			act = NULL;
 			BASE();
@@ -864,21 +978,20 @@ static void draw_line(size_t idx, int iscur)
 		}
 		if (ms >= 0 && b == (size_t)ms)
 			fputs("\x1b[7m", stdout);
-		if (dc >= (size_t)hscroll) {
-			fwrite(L->s + b, 1, cl, stdout);
-			emitted += (size_t)gw;
-		}
+		fwrite(L->s + b, 1, cl, stdout);
 		if (me >= 0 && b + cl == (size_t)me)
 			fputs("\x1b[27m", stdout);
 		b += cl;
 		dc += (size_t)gw;
+		sc += (size_t)gw;
 	}
 	BASE();
 #undef BASE
 	/* pad to viewport width so shorter lines erase longer predecessors */
-	for (size_t k = emitted; k < (size_t)cols; k++)
+	for (size_t k = sc; k < (size_t)cols; k++)
 		fputc(' ', stdout);
 	fputs("\x1b[0m", stdout);
+	return row - r0 + 1;
 }
 
 static void draw_status(void)
@@ -888,17 +1001,11 @@ static void draw_status(void)
 	char left[512];
 
 	if (editing) {
-		snprintf(left, sizeof left, "/%s", edit);
-		fputs("\x1b[1;7m ", stdout);
-		fputs(left, stdout);
+		fputs("\x1b[1;7m /", stdout);
+		fputs(edit, stdout);
 		fputs(" \x1b[0m", stdout);
-		int cc = 0;	/* cursor column: cells, not bytes */
-		for (size_t i = 0; i < strlen(left); ) {
-			size_t cl;
-			cc += glyph_width(u8_decode(left + i, strlen(left) - i, &cl));
-			i += cl;
-		}
-		printf("\x1b[%d;%dH\x1b[?25h", rows, cc + 3);
+		printf("\x1b[%d;%dH\x1b[?25h", rows,
+		       (int)str_cols(edit, strlen(edit)) + 3);
 		return;
 	}
 
@@ -980,16 +1087,14 @@ static void render(void)
 {
 	size_t vis = (size_t)(rows - 1);
 	fputs("\x1b[H", stdout);
-	for (size_t r = 0; r < vis; r++) {
+	size_t r = 0, i = top;
+	for (; i < nv && r < vis; i++)
+		r += draw_line(view[i], i == cur, r, vis);
+	if (r < vis) {
 		printf("\x1b[%zu;1H", r + 1);
-		if (top + r < nv) {
-			draw_line(view[top + r], top + r == cur);
-		} else {
-			if (nv == 0 && r == 0 && !filtered)
-				fputs("(empty)", stdout);
-			fputs("\x1b[J", stdout);
-			break;
-		}
+		if (nv == 0 && !filtered)
+			fputs("(empty)", stdout);
+		fputs("\x1b[J", stdout);
 	}
 	draw_status();
 	fflush(stdout);
@@ -1044,14 +1149,14 @@ static int has_prog(const char *prog)
 
 static void clip_helper(const char *s, size_t len)
 {
-	struct { const char *name; const char *argv[5]; } cands[] = {
-		{ "xclip",  { "xclip", "-selection", "clipboard", "-in", NULL } },
-		{ "wl-copy", { "wl-copy", NULL } },
-		{ "pbcopy", { "pbcopy", NULL } },
-		{ "termux-clipboard-set", { "termux-clipboard-set", NULL } },
+	static const char *const cands[][5] = {
+		{ "xclip", "-selection", "clipboard", "-in", NULL },
+		{ "wl-copy", NULL },
+		{ "pbcopy", NULL },
+		{ "termux-clipboard-set", NULL },
 	};
 	for (size_t i = 0; i < sizeof cands / sizeof cands[0]; i++) {
-		if (!has_prog(cands[i].name))
+		if (!has_prog(cands[i][0]))
 			continue;
 		int pp[2];
 		if (pipe(pp) < 0)
@@ -1064,7 +1169,7 @@ static void clip_helper(const char *s, size_t len)
 		if (pid == 0) {
 			dup2(pp[0], STDIN_FILENO);
 			close(pp[0]); close(pp[1]);
-			execvp(cands[i].name, (char *const *)cands[i].argv);
+			execvp(cands[i][0], (char *const *)cands[i]);
 			_exit(127);
 		}
 		close(pp[0]);
@@ -1141,7 +1246,7 @@ static int wait_byte(void)
 {
 	struct pollfd p = { .fd = kfd, .events = POLLIN };
 	if (poll(&p, 1, 50) <= 0)
-		return K_ESC;
+		return K_NONE;
 	return read_byte();
 }
 
@@ -1163,7 +1268,6 @@ static int decode_csi(const char *seq, size_t n)
 			case '4': case '8': return K_END;
 			case '5': return K_PGUP;
 			case '6': return K_PGDN;
-			case '3': return K_DEL;
 			}
 		}
 		return K_NONE;	/* 2 ins, 15+ F-keys, 200/201 paste ... */
@@ -1179,7 +1283,7 @@ static int read_key(void)
 		return c;
 	int c2 = wait_byte();
 	if (c2 != '[' && c2 != 'O')
-		return K_ESC;
+		return c;	/* lone Escape */
 	/* swallow the whole sequence up to its final byte (@..~) so no
 	 * leftover bytes ever replay as keystrokes */
 	char seq[16];
@@ -1187,8 +1291,8 @@ static int read_key(void)
 	int f;
 	do {
 		f = wait_byte();
-		if (f == K_ESC)
-			return K_ESC;
+		if (f == K_EOF || f == K_NONE)
+			return c;	/* aborted sequence: treat as Esc */
 		if (n < sizeof seq - 1)
 			seq[n++] = (char)f;
 	} while (f < 0x40 || f > 0x7e);
@@ -1203,22 +1307,91 @@ static void apply_edit(void)
 
 /* --- main --- */
 
+static const char *key_name(int key, char *buf, size_t n)
+{
+	switch (key) {
+	case 0x1b:		return "Esc";
+	case '\r': case '\n':	return "Enter";
+	case ' ':		return "Space";
+	}
+	switch (key) {
+	case K_UP:	return "Up";
+	case K_DOWN:	return "Down";
+	case K_LEFT:	return "Left";
+	case K_RIGHT:	return "Right";
+	case K_PGUP:	return "PgUp";
+	case K_PGDN:	return "PgDn";
+	case K_HOME:	return "Home";
+	case K_END:	return "End";
+	}
+	if (key < 32) {			/* CTL(x): x & 0x1f */
+		snprintf(buf, n, "Ctrl-%c", key + '`');
+		return buf;
+	}
+	snprintf(buf, n, "%c", key);
+	return buf;
+}
+
+/* keys section of --help, generated from keymap[] so the two never drift */
+static void print_keys(FILE *out)
+{
+	static const struct { int act; const char *desc; } acts[] = {
+		{ A_DOWN,	"next line" },
+		{ A_UP,		"previous line" },
+		{ A_PGDOWN,	"page down" },
+		{ A_PGUP,	"page up" },
+		{ A_TOP,	"go to top" },
+		{ A_BOT,	"go to bottom" },
+		{ A_LEFT,	"scroll left" },
+		{ A_RIGHT,	"scroll right" },
+		{ A_HSTART,	"scroll to left edge" },
+		{ A_HEND,	"scroll to right edge" },
+		{ A_FILTER,	"filter (incremental regex, smart case)" },
+		{ A_CLEAR_FILTER, "clear filter" },
+		{ A_CANCEL,	"cancel editing; clear marks, else filter" },
+		{ A_MARK,	"mark line and sweep" },
+		{ A_UNMARK,	"unmark line and sweep" },
+		{ A_COPY,	"copy marked lines (clears marks), else current" },
+		{ A_FOLLOW,	"toggle follow" },
+		{ A_RELOAD,	"reload file" },
+		{ A_WRAP,	"toggle line wrap" },
+		{ A_QUIT,	"quit" },
+	};
+	for (size_t i = 0; i < sizeof acts / sizeof acts[0]; i++) {
+		char keys[64], nm[16], prev[16];
+		size_t used = 0;
+		keys[0] = prev[0] = 0;
+		for (size_t k = 0; k < sizeof keymap / sizeof keymap[0]; k++) {
+			if (keymap[k].act != acts[i].act)
+				continue;
+			const char *nm2 = key_name(keymap[k].key, nm, sizeof nm);
+			if (!strcmp(nm2, prev))
+				continue;	/* \r and \n are both Enter */
+			snprintf(prev, sizeof prev, "%s", nm2);
+			used += (size_t)snprintf(keys + used,
+						 sizeof keys - used,
+						 used ? "/%s" : "%s", nm2);
+		}
+		fprintf(out, "  %-23s%s\n", keys, acts[i].desc);
+	}
+	fputs("\n  Sweep direction follows the last up/down move.\n", out);
+}
+
 static void usage(FILE *out)
 {
 	fputs(
-"usage: comb [-e REGEX] FILE | -\n"
+"usage: comb [-e REGEX] [--no-color] [FILE]\n"
 "\n"
-"keys:\n"
-"  j/k, arrows      scroll          g/G, Home/End   top/bottom\n"
-"  Ctrl-d/u, PgDn/U page            h/l, Left/Right scroll sideways\n"
-"  /                filter (regex, incremental; smart case)\n"
-"  ?                clear filter\n"
-"  Enter            accept filter   Esc             cancel; clear marks or filter\n"
-"  Space            mark line, sweep        x       unmark line, sweep\n"
-"                   (sweep direction follows the last j/k or arrow)\n"
-"  c or y           copy marked lines (clears marks), else current line\n"
-"  f                toggle live follow      r       reload\n"
-"  q, Ctrl-c        quit\n", out);
+"View, filter and copy log files. Reads FILE, or stdin when piped.\n"
+"\n"
+"options:\n"
+"  -e REGEX               start with REGEX as the filter\n"
+"  --no-color, -C         disable syntax coloring (also honors NO_COLOR)\n"
+"  -                      read from stdin (implied when stdin is not a tty)\n"
+"  -h, --help             show this help\n"
+"\n"
+"keys:\n", out);
+	print_keys(out);
 }
 
 int main(int argc, char **argv)
@@ -1232,6 +1405,8 @@ int main(int argc, char **argv)
 		} else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
 			usage(stdout);
 			return 0;
+		} else if (!strcmp(argv[i], "--no-color") || !strcmp(argv[i], "-C")) {
+			nocolor = 1;
 		} else if (!strcmp(argv[i], "-")) {
 			use_stdin = 1;
 		} else if (argv[i][0] == '-') {
@@ -1241,6 +1416,8 @@ int main(int argc, char **argv)
 			file = argv[i];
 		}
 	}
+	if (!file && !use_stdin && !isatty(STDIN_FILENO))
+		use_stdin = 1;	/* piped or redirected: no need for an explicit - */
 	if (!file && !use_stdin) {
 		usage(stderr);
 		return 1;
@@ -1250,14 +1427,23 @@ int main(int argc, char **argv)
 			die("path too long");
 	}
 
+	if (!isatty(STDIN_FILENO)) {
+		/* keys must not come from piped/redirected data */
+		int t = open("/dev/tty", O_RDONLY);
+		if (t >= 0) {
+			kfd = t;
+		} else if (use_stdin) {
+			die("stdin is not interactive and /dev/tty unavailable");
+		}
+	}
+
+	if (getenv("NO_COLOR"))
+		nocolor = 1;
+	mark_bg = nocolor ? "\x1b[7m" : MARK_BG;
+
 	signal(SIGPIPE, SIG_IGN);
 	signal(SIGCHLD, SIG_IGN);	/* auto-reap; wl-copy must outlive us */
 	signal(SIGWINCH, on_winch);
-	if (use_stdin) {
-		kfd = open("/dev/tty", O_RDONLY);
-		if (kfd < 0)
-			die("stdin is not interactive and /dev/tty unavailable");
-	}
 	raw_on();
 	get_winsize();
 	fputs("\x1b[?1049h\x1b[?25l\x1b[2J", stdout);
@@ -1350,7 +1536,8 @@ int main(int argc, char **argv)
 			continue;
 		}
 
-		switch (key_action(key)) {
+		int act = key_action(key);
+		switch (act) {
 		case A_QUIT:
 			running = 0;
 			break;
@@ -1391,8 +1578,8 @@ int main(int argc, char **argv)
 			break;
 		case A_HEND:
 			if (nv) {
-				Line *L = &lines[view[cur]];
-				size_t cw = line_cols(L);
+				const Line *L = &lines[view[cur]];
+				size_t cw = str_cols(L->s, L->len);
 				hscroll = cw > (size_t)cols
 						  ? (int)(cw - (size_t)cols)
 						  : 0;
@@ -1400,14 +1587,18 @@ int main(int argc, char **argv)
 			break;
 		case A_FILTER:
 			editing = 1;
+			filter_anchor = nv ? view[cur] : 0;
+			filter_row = cur - top;
 			snprintf(edit, sizeof edit, "%s", query);
 			break;
 		case A_MARK:
+		case A_UNMARK: {
+			int want = (act == A_MARK);
 			if (nv) {
 				Line *L = &lines[view[cur]];
-				if (!L->marked) {
-					L->marked = 1;
-					nmarked++;
+				if ((int)L->marked != want) {
+					L->marked = (unsigned char)want;
+					nmarked += want ? 1 : -1;
 				}
 				if (mdir < 0) {
 					if (cur > 0)
@@ -1417,21 +1608,7 @@ int main(int argc, char **argv)
 				}
 			}
 			break;
-		case A_UNMARK:
-			if (nv) {
-				Line *L = &lines[view[cur]];
-				if (L->marked) {
-					L->marked = 0;
-					nmarked--;
-				}
-				if (mdir < 0) {
-					if (cur > 0)
-						cur--;
-				} else if (cur + 1 < nv) {
-					cur++;
-				}
-			}
-			break;
+		}
 		case A_CLEAR_FILTER:
 			if (filtered) {
 				edit[0] = 0;
@@ -1448,6 +1625,11 @@ int main(int argc, char **argv)
 				edit[0] = 0;
 				update_filter("");
 			}
+			break;
+		case A_WRAP:
+			wrap = !wrap;
+			snprintf(msg, sizeof msg, "wrap %s",
+				 wrap ? "on" : "off");
 			break;
 		case A_COPY:
 			copy_current();

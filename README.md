@@ -16,6 +16,8 @@ A small terminal log viewer in plain C (libc only, no ncurses).
   logs are visible immediately; follow mode sticks by default
 - incremental `/` filter — POSIX ERE, smart case (lowercase = case-insensitive)
 - live follow with `poll()`, handles file truncation/rotation
+- `w` toggles soft line wrap (h/l/$ horizontal scrolling applies when
+  wrap is off)
 - mark lines with space (x unmarks), copy them all with c/y via
   OSC 52 (works over ssh); falls back to xclip / wl-copy / pbcopy /
   termux-clipboard-set when installed
@@ -43,24 +45,28 @@ Try live follow in one terminal:
 
 ## Usage
 
-    comb [-e REGEX] FILE | -
+    comb [-e REGEX] [--no-color] [FILE]
+
+`--no-color` (or `-C`, or the `NO_COLOR` env var) strips syntax coloring but keeps inverse-video cursor/marks.
+
+Reads FILE, or piped/redirected stdin (`dmesg | comb`, `comb < file`); the explicit `comb -` still works. When reading stdin, keys come from /dev/tty.
 
 ## Keys
 
 | key              | action                                    |
 |------------------|-------------------------------------------|
-| j/k, arrows      | scroll (sets sweep direction)             |
-| Ctrl-d/u, PgDn/U | half page                                 |
-| Ctrl-f/b         | page                                      |
+| j/k/e, arrows     | next / previous line (sets sweep dir)     |
+| Ctrl-d/u/f/b, PgDn/Up | page down / up                        |
 | g/G, Home/End    | top / bottom                              |
 | h/l, Left/Right  | scroll sideways (0 = home, $ = end)       |
 | /                | filter (incremental regex, smart case)    |
 | ?                | clear filter                              |
-| Enter            | accept filter                             |
 | Space / x        | mark / unmark line, sweep in last direction |
 | c or y           | copy marked lines, else current line      |
+| Enter            | scroll down (accepts filter in prompt)    |
 | Esc              | cancel editing; clear marks or filter     |
 | f                | toggle follow                             |
+| w                | toggle line wrap                          |
 | r                | reload file                               |
 | q, Ctrl-c        | quit                                      |
 
