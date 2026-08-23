@@ -567,9 +567,11 @@ static int append_new(void)
 
 /* --- filtering --- */
 
-/* layout: top bar (source/position/keys), log pane, input bar (prompt
- * or notices); tiny ttys drop the input bar first, then the top bar */
-static int have_top_bar(void)
+/* layout: log pane, then status bar (source/position/keys), then the
+ * command line -- everything worth looking at sits at the bottom, near
+ * the eye's resting point. Tiny ttys drop the command line first, then
+ * the status bar */
+static int have_status_bar(void)
 {
 	return rows >= 2;
 }
@@ -581,7 +583,7 @@ static int have_input_bar(void)
 
 static size_t pane_rows(void)
 {
-	int n = rows - have_top_bar() - have_input_bar();
+	int n = rows - have_status_bar() - have_input_bar();
 	return (size_t)(n > 0 ? n : 1);
 }
 
@@ -1092,9 +1094,9 @@ static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 /* top bar: one inverse strip -- source, position and state on the left,
  * key reference right-aligned. A hint that can't fit is hidden whole,
  * never shrunk into noise. */
-static void draw_top_bar(void)
+static void draw_status_bar(void)
 {
-	if (!have_top_bar())
+	if (!have_status_bar())
 		return;
 	static const char *const hints[] = {
 		"/ filter  ? clear  spc/x mark  c copy  f follow  w wrap  r reload  q quit",
@@ -1159,7 +1161,8 @@ static void draw_top_bar(void)
 		}
 	}
 
-	printf("\x1b[1;1H\x1b[1;7m");
+	printf("\x1b[%d;1H\x1b[1;7m",
+	       have_input_bar() ? rows - 1 : rows);
 	fputs(left, stdout);
 	for (int i = 0; i < cols - lw - hw - 1; i++)
 		fputc(' ', stdout);
@@ -1227,16 +1230,16 @@ static void render(void)
 {
 	size_t vis = pane_rows();
 	fputs("\x1b[H", stdout);
-	size_t r0 = have_top_bar(), r = r0, i = top;
-	for (; i < nv && r - r0 < vis; i++)
+	size_t r = 0, i = top;
+	for (; i < nv && r < vis; i++)
 		r += draw_line(view[i], i == cur, r, vis);
-	if (r - r0 < vis) {
+	if (r < vis) {
 		printf("\x1b[%zu;1H", r + 1);
 		if (nv == 0 && !filtered)
 			fputs("(empty)", stdout);
 		fputs("\x1b[J", stdout);
 	}
-	draw_top_bar();
+	draw_status_bar();
 	draw_input_bar();
 	fflush(stdout);
 }
