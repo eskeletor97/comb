@@ -171,8 +171,22 @@ static void die(const char *fmt, ...)
 	va_start(ap, fmt);
 	fprintf(stderr, "comb: ");
 	vfprintf(stderr, fmt, ap);
-	if (errno)
-		fprintf(stderr, ": %s", strerror(errno));
+	fputc('\n', stderr);
+	va_end(ap);
+	exit(1);
+}
+
+/* syscall failures append strerror(errno); plain die() must not -- errno
+ * is too often stale from benign calls that ignored their own failure */
+static void die_sys(const char *fmt, ...)
+{
+	int e = errno;
+	va_list ap;
+	restore_terminal();
+	va_start(ap, fmt);
+	fprintf(stderr, "comb: ");
+	vfprintf(stderr, fmt, ap);
+	fprintf(stderr, ": %s", strerror(e));
 	fputc('\n', stderr);
 	va_end(ap);
 	exit(1);
@@ -191,14 +205,14 @@ static void *xrealloc(void *p, size_t n)
 static void raw_on(void)
 {
 	if (tcgetattr(kfd, &saved_tio))
-		die("not a terminal");
+		die_sys("not a terminal");
 	struct termios t = saved_tio;
 	t.c_iflag &= ~(unsigned)(IXON | ICRNL | BRKINT);
 	t.c_lflag &= ~(unsigned)(ECHO | ICANON | ISIG | IEXTEN);
 	t.c_cc[VMIN] = 1;
 	t.c_cc[VTIME] = 0;
 	if (tcsetattr(kfd, TCSANOW, &t) < 0)
-		die("tcsetattr");
+		die_sys("tcsetattr");
 	tio_saved = 1;
 }
 
@@ -210,6 +224,18 @@ static void restore_terminal(void)
 	fputs("\x1b[0m\x1b[?25h\x1b[?1049l", stdout);
 	fflush(stdout);
 	tcsetattr(kfd, TCSANOW, &saved_tio);
+}
+
+/* emergency terminal restore on SIGTERM/SIGHUP/SIGINT: only
+ * async-signal-safe calls, unlike restore_terminal()'s stdio */
+static void on_sigexit(int sig)
+{
+	if (tio_saved) {
+		tcsetattr(kfd, TCSANOW, &saved_tio);
+		write(STDOUT_FILENO, "\x1b[0m\x1b[?25h\x1b[?1049l",
+		      sizeof "\x1b[0m\x1b[?25h\x1b[?1049l" - 1);
+	}
+	_exit(128 + sig);
 }
 
 static void get_winsize(void)
@@ -462,6 +488,7 @@ static void reset_lines(void)
 	plen = 0;
 	flushed_partial = 0;
 	nmarked = 0;
+	nv = 0;	/* view entries referenced the freed buffers */
 	nsvc_seen = 0;	/* tag pointers referenced the freed buffers */
 }
 
@@ -483,7 +510,7 @@ static void load_all(void)
 	if (fd < 0) {
 		fd = open(path, O_RDONLY);
 		if (fd < 0)
-			die("cannot open %s", path);
+			die_sys("cannot open %s", path);
 	}
 	read_available(fd);
 	flush_pending();
@@ -1215,6 +1242,12 @@ static void clip_helper(const char *s, size_t len)
 			return;
 		}
 		if (pid == 0) {
+			int dn = open("/dev/null", O_WRONLY);
+			if (dn >= 0) {	/* a failing xclip must not garble the TUI */
+				dup2(dn, STDOUT_FILENO);
+				dup2(dn, STDERR_FILENO);
+				close(dn);
+			}
 			dup2(pp[0], STDIN_FILENO);
 			close(pp[0]); close(pp[1]);
 			execvp(cands[i][0], (char *const *)cands[i]);
@@ -1282,12 +1315,25 @@ static void copy_current(void)
 
 /* --- input --- */
 
+static int peeked = -1;	/* unget buffer for read_key()'s Esc lookahead */
+
 static int read_byte(void)
 {
+	if (peeked >= 0) {
+		int c = peeked;
+		peeked = -1;
+		return c;
+	}
 	unsigned char c;
 	if (read(kfd, &c, 1) != 1)
 		return K_EOF;
 	return c;
+}
+
+/* peeked byte awaits: main loop must not poll-wait on the empty fd */
+static int key_pending(void)
+{
+	return peeked >= 0;
 }
 
 static int wait_byte(void)
@@ -1330,8 +1376,12 @@ static int read_key(void)
 	if (c != 0x1b)
 		return c;
 	int c2 = wait_byte();
-	if (c2 != '[' && c2 != 'O')
+	if (c2 != '[' && c2 != 'O') {
+		/* Alt-chord / fast Esc+key: don't swallow the byte */
+		if (c2 < K_NONE)
+			peeked = c2;
 		return c;	/* lone Escape */
+	}
 	/* swallow the whole sequence up to its final byte (@..~) so no
 	 * leftover bytes ever replay as keystrokes */
 	char seq[16];
@@ -1492,6 +1542,9 @@ int main(int argc, char **argv)
 	signal(SIGPIPE, SIG_IGN);
 	signal(SIGCHLD, SIG_IGN);	/* auto-reap; wl-copy must outlive us */
 	signal(SIGWINCH, on_winch);
+	signal(SIGTERM, on_sigexit);
+	signal(SIGHUP, on_sigexit);
+	signal(SIGINT, on_sigexit);
 	raw_on();
 	get_winsize();
 	fputs("\x1b[?1049h\x1b[?25l\x1b[2J", stdout);
@@ -1516,9 +1569,18 @@ int main(int argc, char **argv)
 			ensure_visible();
 			dirty = 1;
 		}
-		if (follow && fd >= 0) {
+		if (follow && !use_stdin) {
 			int stick = nv > 0 && cur >= nv - 1;
 			size_t old = nlines;
+			if (fd < 0) {
+				/* rotation race lost the file between stat and
+				 * open; retry until it reappears */
+				fd = open(path, O_RDONLY);
+				if (fd >= 0)
+					fsize = 0;
+			}
+			if (fd < 0)
+				continue;
 			int got = append_new();
 			if (got == 2)
 				rebuild_view();	/* rotation: lines[] were rebuilt from scratch */
@@ -1536,9 +1598,9 @@ int main(int argc, char **argv)
 		/* Paint when no keystroke is already waiting; if input is
 		 * queued (key repeat), keep draining and coalesce the repaint. */
 		if (!dirty) {
-			if (poll(&p, 1, 200) <= 0)
+			if (!key_pending() && poll(&p, 1, 200) <= 0)
 				continue;
-		} else if (poll(&p, 1, 0) <= 0) {
+		} else if (!key_pending() && poll(&p, 1, 0) <= 0) {
 			render();
 			dirty = 0;
 			continue;
@@ -1571,7 +1633,7 @@ int main(int argc, char **argv)
 				apply_edit();
 				break;
 			default:
-				if (key >= 32 && key < 127 &&
+				if (key >= 32 && key < 256 && key != 127 &&
 				    strlen(edit) < MAX_QUERY - 1) {
 					size_t l = strlen(edit);
 					edit[l] = (char)key;

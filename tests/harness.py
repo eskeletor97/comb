@@ -370,6 +370,30 @@ def _check_mark_empty_lines(binary):
         return 'no copy confirmation in status bar'
 
 
+def _check_alt_chord_not_swallowed(binary):
+    # terminals send Alt+j as ESC j; the j must survive as a keystroke
+    text = 'one\ntwo\nthree\n'
+    res = run([binary, '-'], keys='g\x1bjq', stdin_text=text)
+    # repaints mean several status frames; only the last one counts
+    st = re.findall(rb'(\d+)/(\d+)', res.output)
+    if not st or st[-1][0] != b'2':
+        return f'ESC j lost the j; final cursor at {st[-1][0].decode() if st else "?"}'
+
+
+def _check_filter_accepts_utf8(binary):
+    # multi-byte query characters must reach regcomp intact; assert on the
+    # match result -- the status bar legitimately elides long queries
+    text = 'Sch\u00f6ne Gr\u00fc\u00dfe\nplain line\n'
+    res = run([binary, '-'], keys='g/Gr\u00fc\u00dfe\rq',
+              stdin_text=text)
+    scr = '\n'.join(res.screen())
+    want = 'Sch\u00f6ne Gr\u00fc\u00dfe'.encode('utf-8').decode('latin-1')
+    if want not in scr:
+        return f'UTF-8 query did not match: {scr!r}'
+    if 'plain line' in scr:
+        return 'filter did not narrow: unmatched line still visible'
+
+
 def _check_dmesg_padded_timestamp_dim(binary):
     # dmesg pads inside the brackets ([    0.4]); the epoch-stamp scan
     # must tolerate the padding or the timestamp renders plain
@@ -395,8 +419,11 @@ def _check_sloppy_colon_tag_shared(binary):
 
 def _check_metachar_query(binary):
     # invalid intermediate regexes must keep the old view and raise a
-    # notice; completing a valid one must filter; Esc must clear cleanly
-    keys = '/[a+b(c)|\x1bG/a.*b\\d\x1bq'
+    # notice; completing a valid one must filter; Esc must clear cleanly.
+    # 'G' after the final Esc gives comb a keystroke-driven repaint of
+    # the cleared view -- Esc+q now arrives as two keys (no swallow) and
+    # quits before any repaint, ending the stream on a prompt frame
+    keys = '/[a+b(c)|\x1bG/a.*b\\d\x1bGq'
     out = run([binary, SAMPLE], keys=keys)
     if b'bad regex' not in out.output:
         return 'no bad-regex notice while typing invalid intermediates'
@@ -422,6 +449,8 @@ CHECKS = [
     ('regex metachar queries stay sane',         _check_metachar_query),
     ('dmesg padded timestamp dims',              _check_dmesg_padded_timestamp_dim),
     ('sloppy colon tag shared across siblings',  _check_sloppy_colon_tag_shared),
+    ('alt-chord key survives lone Esc lookahead', _check_alt_chord_not_swallowed),
+    ('filter prompt accepts UTF-8 queries',      _check_filter_accepts_utf8),
 ]
 
 
