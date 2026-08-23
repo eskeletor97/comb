@@ -33,13 +33,15 @@ import time
 
 
 class RunResult:
-    def __init__(self, output, status):
+    def __init__(self, output, status, rows=24, cols=80):
         self.output = output      # raw bytes from the pty master
         self.status = status      # exit status
+        self.rows = rows
+        self.cols = cols
 
     def screen(self):
         """Final visible text grid as a list of row strings."""
-        return render_screen(self.output)
+        return render_screen(self.output, self.rows, self.cols)
 
     def text(self):
         """ANSI-free transcript."""
@@ -47,7 +49,7 @@ class RunResult:
                       b'', self.output)
 
 
-def _child_setup(slave, stdin_pipe_r):
+def _child_setup(slave, stdin_pipe_r, env_color=True):
     os.setsid()
     fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
     os.dup2(stdin_pipe_r if stdin_pipe_r is not None else slave, 0)
@@ -59,7 +61,10 @@ def _child_setup(slave, stdin_pipe_r):
         except OSError:
             pass
     os.environ['TERM'] = 'xterm'
-    os.environ.pop('NO_COLOR', None)
+    if env_color:
+        os.environ.pop('NO_COLOR', None)
+    else:
+        os.environ['NO_COLOR'] = '1'
 
 
 def run(argv, keys=b'', stdin_text=None, rows=24, cols=80, env_color=True,
@@ -77,7 +82,7 @@ def run(argv, keys=b'', stdin_text=None, rows=24, cols=80, env_color=True,
 
     pid = os.fork()
     if pid == 0:
-        _child_setup(slave, stdin_r)
+        _child_setup(slave, stdin_r, env_color)
         os.execvp(argv[0], argv)
 
     os.close(slave)
@@ -121,7 +126,7 @@ def run(argv, keys=b'', stdin_text=None, rows=24, cols=80, env_color=True,
         pass
     _, status = os.waitpid(pid, 0)
     os.close(master)
-    return RunResult(bytes(out), status)
+    return RunResult(bytes(out), status, rows, cols)
 
 
 # --- tiny VT interpreter: enough of CUP/EL/ED for screen assertions ---
@@ -180,12 +185,15 @@ def _parse_args():
                     help='render final screen instead of transcript')
     ap.add_argument('--compare', nargs=2, metavar=('OLD', 'NEW'),
                     help='byte-diff two builds over the scenario suite')
+    ap.add_argument('--check', action='store_true',
+                    help='run absolute behavior assertions against the build '
+                         'given in cmd (default when --compare is absent)')
     ap.add_argument('cmd', nargs=argparse.REMAINDER, help='-- ./comb [args]')
     return ap.parse_args()
 
 
 SCENARIOS = [
-    ('bottom+copy',       'jjkG$0ww/err\x1b cq', {'stdin_text': None}),
+    ('bottom+copy',       'jjkG$0ww/err\x1b cq', {}),
     ('wrap+hscroll',      'wjjkkll$0Gq',         {}),
     ('wrap toggle twice', 'wwggjk\x1bGq',        {}),
     ('mark+copy',         ' x x jk c q',         {}),
@@ -193,10 +201,105 @@ SCENARIOS = [
     ('instant quit',      'q',                   {}),
     ('edges',             'wgg0$q',              {}),
     ('follow+reload',     'jkjkfrrq',            {}),
+    # real escape-sequence keys: arrows, PgDn/PgUp, Home/End
+    ('arrow keys',        '\x1b[B\x1b[B\x1b[A\x1b[6~\x1b[5~\x1b[H\x1b[Fq', {}),
+    ('ctrl paging',       '\x04\x04\x15\x06ggq',  {}),
+    # wrap over the CJK/fullwidth lines exercises line_rows()
+    ('wrap cjk nav',      'wwjjjjGGgjk0$$qq',    {}),
+    ('hscroll cjk $',     'GG$hhhh0$q',          {}),
+    ('filter nomatch',    '/zzznomatch\x1bG?gq', {}),
+    ('marks sweep up',    'GGkk xkx q',          {}),
+    ('esc clears marks',  'GGxkx\x1bg/err\x1bq',  {}),
+]
+
+# Absolute assertions against a single build (no reference binary needed):
+# each returns None on pass, or a detail string on failure.
+def _check_empty_stdin(binary):
+    scr = run([binary, '-'], keys='q', stdin_text='').screen()
+    if not any('(empty)' in row for row in scr):
+        return '(empty) not shown for empty stdin'
+
+
+def _check_no_trailing_newline(binary):
+    scr = run([binary, '-'], keys='gq', stdin_text='last line has no newline').screen()
+    if not any('last line has no newline' in row for row in scr):
+        return 'final partial line was dropped'
+
+
+def _check_filter_nomatch_status(binary):
+    # at narrow widths the left status side yields to the keybinding hint,
+    # so give the pane enough columns for the suffix to survive
+    res = run([binary, '-e', 'zzznomatch', 'sample.log'], keys='q', cols=140)
+    if not any('(no matches)' in row for row in res.screen()):
+        return '(no matches) missing from status line'
+
+
+def _check_filter_narrows(binary):
+    scr = run([binary, '-e', 'NetworkManager', 'sample.log'], keys='gq').screen()
+    if not any('NetworkManager' in r for r in scr):
+        return 'filtered view shows no matching lines'
+    if not any(re.search(r'\d+/\d+', r) for r in scr):
+        return 'status counter missing'
+
+
+def _check_ansi_sanitized(binary):
+    dirty = '\x1b[31mRED\x1b[0m plain \x1b]0;title\x07tail\n'
+    scr = run([binary, '-'], keys='gq', stdin_text=dirty).screen()
+    joined = '\n'.join(scr)
+    if 'RED plain tail' not in joined:
+        return f'input ANSI leaked into display: {joined!r}'
+
+
+def _check_copy_osc52(binary):
+    out = run([binary, 'sample.log'], keys='cq').output
+    if b'\x1b]52;c;' not in out:
+        return 'OSC 52 sequence missing after copy'
+
+
+def _no_hl_sgr(out):
+    # severity/palette/token SGRs: bright reds/magenta/yellow + 256-palette fg
+    return not re.search(rb'\x1b\[(1;9[15]|2;|38;5;\d+)m', out)
+
+
+def _check_no_color_flag(binary):
+    out = run([binary, '--no-color', 'sample.log'], keys='Gq').output
+    if not _no_hl_sgr(out):
+        return '--no-color still emits highlighting SGRs'
+
+
+def _check_no_color_env(binary):
+    out = run([binary, 'sample.log'], keys='Gq', env_color=False).output
+    if not _no_hl_sgr(out):
+        return 'NO_COLOR env still emits highlighting SGRs'
+
+
+def _check_wrap_long_line(binary):
+    # a line wider than the pane must span multiple rows when wrapped,
+    # and exactly one row (clipped) when not
+    long = 'x' * 200 + '\n'
+    wrapped = run([binary, '-'], keys='wgq', stdin_text=long)
+    rows_used = sum(1 for r in wrapped.screen() if set(r.strip()) <= {'x'} and r.strip())
+    if rows_used < 2:
+        return f'long line occupied {rows_used} rows with wrap on, expected >= 2'
+    plain = run([binary, '-'], keys='gq', stdin_text=long).screen()
+    if sum(1 for r in plain[:-1] if r.strip()) != 1:   # [:-1]: skip status bar
+        return 'unwrapped long line spilled over multiple rows'
+
+
+CHECKS = [
+    ('empty stdin shows placeholder', _check_empty_stdin),
+    ('final line without newline kept', _check_no_trailing_newline),
+    ('-e no-match status',            _check_filter_nomatch_status),
+    ('-e narrows view',               _check_filter_narrows),
+    ('input ANSI sanitized',          _check_ansi_sanitized),
+    ('copy emits OSC 52',             _check_copy_osc52),
+    ('--no-color strips highlighting', _check_no_color_flag),
+    ('NO_COLOR env strips highlighting', _check_no_color_env),
+    ('wrap splits long lines only in wrap mode', _check_wrap_long_line),
 ]
 
 
-def _run_scenario(binary, name, keys, opts):
+def _run_scenario(binary, keys, opts):
     argv = [binary, 'sample.log']
     return run(argv, keys=keys, **opts)
 
@@ -209,27 +312,41 @@ def main():
         old, new = a.compare
         fails = 0
         for name, keys, opts in SCENARIOS:
-            o = _run_scenario(old, name, keys, opts).output
-            n = _run_scenario(new, name, keys, opts).output
+            o = _run_scenario(old, keys, opts).output
+            n = _run_scenario(new, keys, opts).output
             ok = o == n
             print(('OK   ' if ok else 'DIFF ') + name)
             fails += 0 if ok else 1
         sys.exit(1 if fails else 0)
 
-    if not cmd:
-        sys.exit('need a command: -- ./comb sample.log')
+    # explicit single-run inspection mode
+    if cmd and (a.raw or a.screen or not a.check):
+        stdin_text = open('sample.log').read() if a.stdin and cmd[-1] == '-' else None
+        res = run(cmd, keys=a.keys, stdin_text=stdin_text,
+                  rows=a.rows, cols=a.cols)
+        if a.raw:
+            sys.stdout.buffer.write(res.output)
+        elif a.screen:
+            print('\n'.join(res.screen()))
+        else:
+            sys.stdout.buffer.write(res.text())
+        if res.status:
+            print(f'\n[exit status {res.status}]', file=sys.stderr)
+        return
 
-    stdin_text = open('sample.log').read() if a.stdin and cmd[-1] == '-' else None
-    res = run(cmd, keys=a.keys, stdin_text=stdin_text,
-              rows=a.rows, cols=a.cols)
-    if a.raw:
-        sys.stdout.buffer.write(res.output)
-    elif a.screen:
-        print('\n'.join(res.screen()))
-    else:
-        sys.stdout.buffer.write(res.text())
-    if res.status:
-        print(f'\n[exit status {res.status}]', file=sys.stderr)
+    binary = cmd[0] if cmd else './comb'
+    fails = 0
+    for name, fn in CHECKS:
+        try:
+            detail = fn(binary)
+        except Exception as e:      # report and keep going; one bad check
+            detail = f'harness exception: {e!r}'   # shouldn't hide the rest
+        if detail is None:
+            print('OK   ' + name)
+        else:
+            fails += 1
+            print(f'FAIL {name}: {detail}')
+    sys.exit(1 if fails else 0)
 
 
 if __name__ == '__main__':
