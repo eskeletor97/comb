@@ -11,7 +11,7 @@ Without stdin_text, comb's stdin is the pty itself, like running
 
 Usage:
   # show final screen of one run
-  python3 tests/harness.py --keys 'Gq' -- ./comb sample.log
+  python3 tests/harness.py --keys 'Gq' -- ./comb tests/sample.log
 
   # same, feeding stdin (dmesg style)
   python3 tests/harness.py --keys 'q' --stdin - -- ./comb -
@@ -31,6 +31,8 @@ import sys
 import tempfile
 import termios
 import time
+
+SAMPLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sample.log')
 
 
 class RunResult:
@@ -188,7 +190,7 @@ def _parse_args():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--keys', default='q', help='keystrokes to send (default: q)')
     ap.add_argument('--stdin', action='store_true',
-                    help='pipe the file argument through comb\'s stdin '
+                    help='pipe the fixture through comb\'s stdin '
                          '(argv keeps "-", so use `-- ./comb -`)')
     ap.add_argument('--rows', type=int, default=24)
     ap.add_argument('--cols', type=int, default=80)
@@ -243,13 +245,13 @@ def _check_no_trailing_newline(binary):
 def _check_filter_nomatch_status(binary):
     # at narrow widths the left status side yields to the keybinding hint,
     # so give the pane enough columns for the suffix to survive
-    res = run([binary, '-e', 'zzznomatch', 'sample.log'], keys='q', cols=140)
+    res = run([binary, '-e', 'zzznomatch', SAMPLE], keys='q', cols=140)
     if not any('(no matches)' in row for row in res.screen()):
         return '(no matches) missing from status line'
 
 
 def _check_filter_narrows(binary):
-    scr = run([binary, '-e', 'NetworkManager', 'sample.log'], keys='gq').screen()
+    scr = run([binary, '-e', 'NetworkManager', SAMPLE], keys='gq').screen()
     if not any('NetworkManager' in r for r in scr):
         return 'filtered view shows no matching lines'
     if not any(re.search(r'\d+/\d+', r) for r in scr):
@@ -265,7 +267,7 @@ def _check_ansi_sanitized(binary):
 
 
 def _check_copy_osc52(binary):
-    out = run([binary, 'sample.log'], keys='cq').output
+    out = run([binary, SAMPLE], keys='cq').output
     if b'\x1b]52;c;' not in out:
         return 'OSC 52 sequence missing after copy'
 
@@ -276,13 +278,13 @@ def _no_hl_sgr(out):
 
 
 def _check_no_color_flag(binary):
-    out = run([binary, '--no-color', 'sample.log'], keys='Gq').output
+    out = run([binary, '--no-color', SAMPLE], keys='Gq').output
     if not _no_hl_sgr(out):
         return '--no-color still emits highlighting SGRs'
 
 
 def _check_no_color_env(binary):
-    out = run([binary, 'sample.log'], keys='Gq', env_color=False).output
+    out = run([binary, SAMPLE], keys='Gq', env_color=False).output
     if not _no_hl_sgr(out):
         return 'NO_COLOR env still emits highlighting SGRs'
 
@@ -304,7 +306,7 @@ def _check_prompt_never_overflows(binary):
     # the editing frame must never emit more visible cells than the pane
     # is wide, or terminals autowrap and scroll the screen per keystroke
     for cols in (40, 80):
-        out = run([binary, 'sample.log'], keys='/' + 'a' * 200 + 'q',
+        out = run([binary, SAMPLE], keys='/' + 'a' * 200 + 'q',
                   cols=cols).output
         for frame in out.split(b'\x1b[1;7m /')[1:]:
             seg = frame.split(b'\x1b[0m')[0]
@@ -314,7 +316,7 @@ def _check_prompt_never_overflows(binary):
 
 def _check_prompt_clips_multibyte(binary):
     # clipping must respect UTF-8 boundaries and glyph widths
-    out = run([binary, 'sample.log'], keys='/' + '\u3042' * 60 + 'q', cols=40).output
+    out = run([binary, SAMPLE], keys='/' + '\u3042' * 60 + 'q', cols=40).output
     frame = out.split(b'\x1b[1;7m /')[1]
     seg = frame.split(b'\x1b[0m')[0].rstrip(b' ')
     if len(seg) % 3 != 0 or len(seg) > 36 * 3:
@@ -372,7 +374,7 @@ def _check_metachar_query(binary):
     # invalid intermediate regexes must keep the old view and raise a
     # notice; completing a valid one must filter; Esc must clear cleanly
     keys = '/[a+b(c)|\x1bG/a.*b\\d\x1bq'
-    out = run([binary, 'sample.log'], keys=keys)
+    out = run([binary, SAMPLE], keys=keys)
     if b'bad regex' not in out.output:
         return 'no bad-regex notice while typing invalid intermediates'
     if not any(re.search(r'\d+/\d+', r) for r in out.screen()):
@@ -399,7 +401,7 @@ CHECKS = [
 
 
 def _run_scenario(binary, keys, opts):
-    argv = [binary, 'sample.log']
+    argv = [binary, SAMPLE]
     return run(argv, keys=keys, **opts)
 
 
@@ -420,7 +422,7 @@ def main():
 
     # explicit single-run inspection mode
     if cmd and (a.raw or a.screen or not a.check):
-        stdin_text = open('sample.log').read() if a.stdin and cmd[-1] == '-' else None
+        stdin_text = open(SAMPLE).read() if a.stdin and cmd[-1] == '-' else None
         res = run(cmd, keys=a.keys, stdin_text=stdin_text,
                   rows=a.rows, cols=a.cols)
         if a.raw:
