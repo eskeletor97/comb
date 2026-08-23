@@ -370,6 +370,29 @@ def _check_mark_empty_lines(binary):
         return 'no copy confirmation in status bar'
 
 
+def _check_dmesg_padded_timestamp_dim(binary):
+    # dmesg pads inside the brackets ([    0.4]); the epoch-stamp scan
+    # must tolerate the padding or the timestamp renders plain
+    text = '[    0.403686] LVT offset 0 assigned for vector 0x400\n'
+    out = run([binary, '-'], keys='gq', stdin_text=text).output
+    if b'\x1b[2m[    0.403686]' not in out:
+        return 'padded dmesg timestamp not dimmed'
+
+
+def _check_sloppy_colon_tag_shared(binary):
+    # "Spectre V2 :" (space before colon) must yield one stable tag shared
+    # by sibling lines, not phantom tags grabbed from later prose words
+    text = ''.join('[    0.16345%d] Spectre V2 : Enabling thing %d '
+                   'Mitigation: x\n' % (i, i) for i in range(3))
+    out = run([binary, '-'], keys='gq', stdin_text=text).output
+    tags = re.findall(rb'\x1b\[38;5;(\d+)mV2', out)
+    # repaints may duplicate draws; every sighting must agree on one color
+    if not tags or len(set(tags)) != 1:
+        return f'"V2" tag colors inconsistent across siblings: {tags}'
+    if re.search(rb'\x1b\[38;5;\d+mMitigation', out):
+        return 'prose word "Mitigation" stolen as tag'
+
+
 def _check_metachar_query(binary):
     # invalid intermediate regexes must keep the old view and raise a
     # notice; completing a valid one must filter; Esc must clear cleanly
@@ -397,6 +420,8 @@ CHECKS = [
     ('copytruncate clears stale lines',          _check_copytruncate),
     ('marked empty lines copy cleanly',          _check_mark_empty_lines),
     ('regex metachar queries stay sane',         _check_metachar_query),
+    ('dmesg padded timestamp dims',              _check_dmesg_padded_timestamp_dim),
+    ('sloppy colon tag shared across siblings',  _check_sloppy_colon_tag_shared),
 ]
 
 
