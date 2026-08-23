@@ -363,11 +363,15 @@ static size_t nsvc_seen;
  * Field 1 is the timestamp, ISO 8601 or syslog's "Aug 22 23:53:27"
  * (the time words never end in ':'). Guards: empty field, no trailing
  * ':', longer than 64 bytes, or a leading '<' -- a verbosity token
- * like <info>, not a tag. "chronyd[553]:" and bare "foo:" match. */
+ * like <info>, not a tag. "chronyd[553]:" and bare "foo:" match.
+ * A lone ':' also matches, absorbing the preceding word, so sloppy
+ * spacing like the kernel's "Spectre V2 : Mitigation: ..." yields
+ * one stable tag per prefix instead of random prose words. */
 static int tag_span(const char *s, size_t n, int *so, int *eo)
 {
 	size_t i = 0;
 	int field = 0, saw_digit = 0;
+	size_t pfs = (size_t)-1;	/* start of the previous field */
 	while (i < n) {
 		while (i < n && s[i] == ' ')
 			i++;
@@ -377,6 +381,8 @@ static int tag_span(const char *s, size_t n, int *so, int *eo)
 		while (i < n && s[i] != ' ')
 			i++;
 		size_t fe = i;
+		size_t pf = pfs;
+		pfs = fs;
 		int digit = 0;
 		for (size_t k = fs; k < fe; k++)
 			if (s[k] >= '0' && s[k] <= '9') {
@@ -389,17 +395,25 @@ static int tag_span(const char *s, size_t n, int *so, int *eo)
 					 * else prose reads as "tag: text" */
 		if (fe == fs || s[fe - 1] != ':' || fe - fs > 64 || s[fs] == '<')
 			continue;
-		size_t e = fe - 1;
-		if (e > fs && s[e - 1] == ']') {
+		size_t b = fs, e = fe - 1;
+		if (e == b) {	/* lone ':': reach back one word */
+			if (pf == (size_t)-1)
+				continue;
+			b = pf;
+			e = fs;	/* stop before the ':' */
+		}
+		if (e > b && s[e - 1] == ']') {
 			size_t k = e - 1;
-			while (k > fs && s[k - 1] != '[')
+			while (k > b && s[k - 1] != '[')
 				k--;
-			if (k > fs)
+			if (k > b)
 				e = k - 1;
 		}
-		if (e == fs)
+		while (e > b && s[e - 1] == ' ')
+			e--;
+		if (e == b)
 			continue;
-		*so = (int)fs;
+		*so = (int)b;
 		*eo = (int)e;
 		return 1;
 	}
@@ -852,6 +866,8 @@ static int collect_spans(const Line *L, Span *sp)
 		if (s[k] != '[')
 			continue;
 		size_t j = k + 1;
+		while (j < L->len && s[j] == ' ')
+			j++;	/* dmesg pads: [    0.403686] */
 		while (j < L->len && ((s[j] >= '0' && s[j] <= '9') ||
 				      s[j] == '.'))
 			j++;
