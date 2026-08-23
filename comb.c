@@ -1015,11 +1015,35 @@ static void draw_status(void)
 	char left[512];
 
 	if (editing) {
+		/* keep the tail of the query visible: a prompt wider than the
+		 * pane would autowrap and scroll the whole screen per keystroke */
+		size_t elen = strlen(edit);
+		int ew = (int)str_cols(edit, elen);
+		int maxw = cols - 4 > 1 ? cols - 4 : 1;	/* " /" + cursor + " " */
+		int tw = ew;
+		size_t off = 0, p = 0;
+		while (tw > maxw && p < elen) {
+			size_t cl;
+			tw -= glyph_width(u8_decode(edit + p, elen - p, &cl));
+			p += cl;
+			off = p;
+		}
 		fputs("\x1b[1;7m /", stdout);
-		fputs(edit, stdout);
+		fputs(edit + off, stdout);
 		fputs(" \x1b[0m", stdout);
-		printf("\x1b[%d;%dH\x1b[?25h", rows,
-		       (int)str_cols(edit, strlen(edit)) + 3);
+		int pw = (tw > 0 ? tw : 0) + 3;
+		/* surface notices like "bad regex" -- they must not hide behind
+		 * the prompt, or typing an invalid pattern gives zero feedback */
+		int nw = (int)strlen(msg);
+		int room = cols - (pw - 1);
+		if (*msg && nw < room) {
+			for (int i = 0; i < room - nw; i++)
+				fputc(' ', stdout);
+			fputs("\x1b[1;7m", stdout);
+			fwrite(msg, 1, (size_t)nw, stdout);
+			fputs("\x1b[0m", stdout);
+		}
+		printf("\x1b[%d;%dH\x1b[?25h", rows, pw);
 		return;
 	}
 
