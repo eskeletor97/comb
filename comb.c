@@ -1848,8 +1848,12 @@ int main(int argc, char **argv)
 			 * continue, pick up exactly where we left off */
 			restore_terminal();
 			signal(SIGTSTP, SIG_DFL);	/* may be inherited as SIG_IGN */
-			raise(SIGTSTP);
+			/* stop the whole foreground group, like kernel ISIG would:
+			 * under doas/sudo our parent shares the pgrp, and until it
+			 * stops too the waiting shell never regains the prompt */
+			kill(0, SIGTSTP);
 			tty_enter();
+			tcflush(kfd, TCIFLUSH);	/* keys typed while suspended */
 			dirty = 1;
 			break;
 		case A_REPAINT:
