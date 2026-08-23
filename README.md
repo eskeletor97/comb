@@ -72,3 +72,7 @@ Reads FILE, or piped/redirected stdin (`dmesg | comb`, `comb < file`); the expli
 
 Bindings live in the `keymap[]` table near the top of `comb.c` — edit
 and rebuild to taste.
+
+## License
+
+0BSD (see LICENSE).
