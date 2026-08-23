@@ -16,7 +16,6 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -32,6 +31,8 @@ typedef struct {
 	int tag_so, tag_eo;	/* byte span of the service tag, -1 if none */
 	int slot;		/* svc_palette index, -1 if no tag */
 	unsigned char marked;
+	size_t wcols;		/* display width cache, 0 = uncomputed */
+	const char *sev;	/* severity SGR cache, NULL = unscanned */
 } Line;
 
 static Line *lines;
@@ -236,6 +237,8 @@ static void push_line(char *clean, size_t len)
 	lines[nlines].s = clean;
 	lines[nlines].len = len;
 	lines[nlines].marked = 0;
+	lines[nlines].wcols = 0;
+	lines[nlines].sev = NULL;
 	assign_service(&lines[nlines]);
 	nlines++;
 }
@@ -507,7 +510,12 @@ static int append_new(void)
 
 /* --- filtering --- */
 
-static size_t line_rows(const Line *L);
+static size_t pane_rows(void)
+{
+	return (size_t)(rows > 1 ? rows - 1 : 1);
+}
+
+static size_t line_rows(Line *L);
 
 static void push_view(size_t i)
 {
@@ -520,7 +528,7 @@ static void push_view(size_t i)
 
 static void ensure_visible(void)
 {
-	size_t vis = (size_t)(rows > 1 ? rows - 1 : 1);
+	size_t vis = pane_rows();
 	if (cur >= nv)
 		cur = nv ? nv - 1 : 0;
 	if (cur < top)
@@ -615,7 +623,7 @@ static void update_filter(const char *q)
 			cur = lo;
 			/* re-window so the line lands on the row it occupied
 			 * before filtering; ensure_visible() keeps this as-is */
-			size_t vis = (size_t)(rows > 1 ? rows - 1 : 1);
+			size_t vis = pane_rows();
 			size_t max_top = nv > vis ? nv - vis : 0;
 			top = lo > filter_row ? lo - filter_row : 0;
 			if (top > max_top)
@@ -720,16 +728,23 @@ static size_t str_cols(const char *s, size_t n)
 		w += (size_t)glyph_width(u8_decode(s + i, n - i, &cl));
 		i += cl;
 	}
-		return w;
+	return w;
+}
+
+/* cached str_cols(); widths never change once a line is stored */
+static size_t line_cols(Line *L)
+{
+	if (!L->wcols)
+		L->wcols = str_cols(L->s, L->len);
+	return L->wcols;
 }
 
 /* pane rows the logical line occupies */
-static size_t line_rows(const Line *L)
+static size_t line_rows(Line *L)
 {
 	if (!wrap)
 		return 1;
-	size_t w = str_cols(L->s, L->len);
-	size_t n = (w + (size_t)cols - 1) / (size_t)cols;
+	size_t n = (line_cols(L) + (size_t)cols - 1) / (size_t)cols;
 	return n ? n : 1;
 }
 
@@ -796,13 +811,10 @@ static const char *token_attr(const char *s, size_t n)
 		{ "notice", "\x1b[38;5;79m" },	/* seafoam */
 		{ "audit",  "\x1b[38;5;146m" },	/* lilac */
 	};
-	char buf[16];
-	if (nocolor || n == 0 || n >= sizeof buf)
+	if (nocolor || n == 0)
 		return NULL;
-	memcpy(buf, s, n);
-	buf[n] = 0;
 	for (size_t i = 0; i < sizeof tok / sizeof tok[0]; i++)
-		if (!strcasecmp(buf, tok[i].w))
+		if (strlen(tok[i].w) == n && !strncasecmp(s, tok[i].w, n))
 			return tok[i].a;
 	return NULL;
 }
@@ -906,7 +918,9 @@ static int collect_spans(const Line *L, Span *sp)
 static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 {
 	Line *L = &lines[idx];
-	const char *col = severity(L->s);
+	if (!L->sev)
+		L->sev = severity(L->s);	/* scan once, lines are immutable */
+	const char *col = L->sev;
 	regmatch_t m;
 	int ms = -1, me = -1;
 	if (filtered && regexec(&re, L->s, 1, &m, 0) == 0) {
@@ -1578,8 +1592,8 @@ int main(int argc, char **argv)
 			break;
 		case A_HEND:
 			if (nv) {
-				const Line *L = &lines[view[cur]];
-				size_t cw = str_cols(L->s, L->len);
+				Line *L = &lines[view[cur]];
+				size_t cw = line_cols(L);
 				hscroll = cw > (size_t)cols
 						  ? (int)(cw - (size_t)cols)
 						  : 0;
