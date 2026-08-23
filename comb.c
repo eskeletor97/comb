@@ -21,6 +21,8 @@
 
 #define MAX_QUERY 256
 #define MARK_BG "\x1b[48;5;238m"
+#define TTY_ENTER "\x1b[?1049h\x1b[?25l\x1b[2J"
+#define TTY_LEAVE "\x1b[0m\x1b[?25h\x1b[?1049l"
 #define VAL_COLOR "\x1b[38;5;223m"	/* quoted values */
 #define PAREN_COLOR "\x1b[38;5;115m"	/* (...) context */
 #define DIM "\x1b[2m"
@@ -60,6 +62,7 @@ static const char *mark_bg = MARK_BG;
 static int running = 1;
 static int dirty = 1;
 
+static size_t widest;	/* display cols of the widest line seen */
 static size_t cur, top;
 static size_t filter_anchor;	/* line selected when filtering began */
 static size_t filter_row;	/* its screen row, restored on clear */
@@ -74,6 +77,7 @@ static size_t nmarked;
 static int mdir = -1;	/* space/x sweep direction: -1 up, 1 down */
 
 static void assign_service(Line *L);
+static size_t str_cols(const char *s, size_t n);
 
 enum {
 	K_NONE = 0x100, K_EOF, K_UP, K_DOWN, K_LEFT, K_RIGHT,
@@ -223,7 +227,7 @@ static void restore_terminal(void)
 {
 	if (!tio_saved)
 		return;
-	fputs("\x1b[0m\x1b[?25h\x1b[?1049l", stdout);
+	fputs(TTY_LEAVE, stdout);
 	fflush(stdout);
 	tcsetattr(kfd, TCSANOW, &saved_tio);
 }
@@ -234,8 +238,7 @@ static void on_sigexit(int sig)
 {
 	if (tio_saved) {
 		tcsetattr(kfd, TCSANOW, &saved_tio);
-		write(STDOUT_FILENO, "\x1b[0m\x1b[?25h\x1b[?1049l",
-		      sizeof "\x1b[0m\x1b[?25h\x1b[?1049l" - 1);
+		write(STDOUT_FILENO, TTY_LEAVE, sizeof TTY_LEAVE - 1);
 	}
 	_exit(128 + sig);
 }
@@ -247,6 +250,15 @@ static void get_winsize(void)
 		cols = ws.ws_col;
 		rows = ws.ws_row;
 	}
+}
+
+/* (re)acquire the terminal: raw mode + fresh alternate screen */
+static void tty_enter(void)
+{
+	raw_on();
+	get_winsize();
+	fputs(TTY_ENTER, stdout);
+	fflush(stdout);
 }
 
 /* --- input feeding / line storage --- */
@@ -267,6 +279,13 @@ static void push_line(char *clean, size_t len)
 	lines[nlines].wcols = 0;
 	lines[nlines].sev = NULL;
 	assign_service(&lines[nlines]);
+	{
+		Line *L = &lines[nlines];
+		size_t w = str_cols(L->s, L->len);
+		L->wcols = w;	/* cache; draw time would recompute anyway */
+		if (w > widest)
+			widest = w;
+	}
 	nlines++;
 }
 
@@ -490,6 +509,7 @@ static void reset_lines(void)
 	plen = 0;
 	flushed_partial = 0;
 	nmarked = 0;
+	widest = 0;
 	nv = 0;	/* view entries referenced the freed buffers */
 	nsvc_seen = 0;	/* tag pointers referenced the freed buffers */
 }
@@ -547,9 +567,22 @@ static int append_new(void)
 
 /* --- filtering --- */
 
+/* layout: top bar (source/position/keys), log pane, input bar (prompt
+ * or notices); tiny ttys drop the input bar first, then the top bar */
+static int have_top_bar(void)
+{
+	return rows >= 2;
+}
+
+static int have_input_bar(void)
+{
+	return rows >= 3;
+}
+
 static size_t pane_rows(void)
 {
-	return (size_t)(rows > 1 ? rows - 1 : 1);
+	int n = rows - have_top_bar() - have_input_bar();
+	return (size_t)(n > 0 ? n : 1);
 }
 
 static size_t line_rows(Line *L);
@@ -971,6 +1004,7 @@ static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 	size_t nsp = (size_t)collect_spans(L, sp);
 
 	const Span *act = NULL;
+	int inv = 0;	/* match-highlight state, kept in sync across BASE() */
 	size_t si = 0;
 	size_t b = 0, dc = 0, sc = 0, row = r0;
 
@@ -983,7 +1017,8 @@ static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 			fputs(mark_bg, stdout); \
 		if (*col) \
 			fputs(col, stdout); \
-		if (ms >= 0 && b >= (size_t)ms && b < (size_t)me) \
+		inv = ms >= 0 && b >= (size_t)ms && b < (size_t)me; \
+		if (inv) \
 			fputs("\x1b[7m", stdout); \
 	} while (0)
 
@@ -1025,15 +1060,22 @@ static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 			act = NULL;
 			BASE();
 		}
-		if (!act && si < nsp && (size_t)sp[si].so == b) {
+		while (si < nsp && (size_t)sp[si].se <= b)
+			si++;	/* spans that ended off-screen */
+		if (!act && si < nsp && (size_t)sp[si].so <= b) {
 			act = &sp[si++];
 			fputs(act->attr, stdout);
 		}
-		if (ms >= 0 && b == (size_t)ms)
+		int want_inv = ms >= 0 && b >= (size_t)ms && b < (size_t)me;
+		if (want_inv && !inv) {
 			fputs("\x1b[7m", stdout);
+			inv = 1;
+		}
 		fwrite(L->s + b, 1, cl, stdout);
-		if (me >= 0 && b + cl == (size_t)me)
+		if (!want_inv && inv) {
 			fputs("\x1b[27m", stdout);
+			inv = 0;
+		}
 		b += cl;
 		dc += (size_t)gw;
 		sc += (size_t)gw;
@@ -1047,69 +1089,29 @@ static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 	return row - r0 + 1;
 }
 
-static void draw_status(void)
+/* top bar: one inverse strip -- source, position and state on the left,
+ * key reference right-aligned. A hint that can't fit is hidden whole,
+ * never shrunk into noise. */
+static void draw_top_bar(void)
 {
-	printf("\x1b[%d;1H\x1b[K", rows);
+	if (!have_top_bar())
+		return;
+	static const char *const hints[] = {
+		"/ filter  ? clear  spc/x mark  c copy  f follow  w wrap  r reload  q quit",
+		"/ filter  ? clear  spc/x mark  c copy  f follow  r reload  q quit",
+		"/ filter  spc mark  c copy  q quit",
+	};
 	const char *src = use_stdin ? "(stdin)" : path;
 	char left[512];
-
-	if (editing) {
-		/* show the tail: a prompt wider than the pane would autowrap
-		 * and scroll the screen on every keystroke */
-		size_t elen = strlen(edit);
-		int ew = (int)str_cols(edit, elen);
-		int maxw = cols - 4 > 1 ? cols - 4 : 1;	/* " /" + cursor + " " */
-		int tw = ew;
-		size_t off = 0, p = 0;
-		while (tw > maxw && p < elen) {
-			size_t cl;
-			tw -= glyph_width(u8_decode(edit + p, elen - p, &cl));
-			p += cl;
-			off = p;
-		}
-		fputs("\x1b[1;7m /", stdout);
-		fputs(edit + off, stdout);
-		fputs(" \x1b[0m", stdout);
-		int pw = (tw > 0 ? tw : 0) + 3;
-		/* show update_filter() notices (e.g. "bad regex") instead of
-		 * hiding them behind the prompt */
-		int nw = (int)strlen(msg);
-		int room = cols - (pw - 1);
-		if (*msg && nw < room) {
-			for (int i = 0; i < room - nw; i++)
-				fputc(' ', stdout);
-			fputs("\x1b[1;7m", stdout);
-			fwrite(msg, 1, (size_t)nw, stdout);
-			fputs("\x1b[0m", stdout);
-		}
-		printf("\x1b[%d;%dH\x1b[?25h", rows, pw);
-		return;
-	}
 
 	char where[64];
 	snprintf(where, sizeof where, "%zu/%zu", nv ? cur + 1 : 0, nv);
 
-	char hint[128];
-	if (msg[0])
-		snprintf(hint, sizeof hint, "%.120s ", msg);
-	else if (cols >= 68)
-		snprintf(hint, sizeof hint,
-			 "/ filter  ? clear  spc/x mark  c copy  f follow  r reload  q quit");
-	else if (cols >= 38)
-		snprintf(hint, sizeof hint, "/ filter  spc mark  c copy  q quit");
-	else
-		hint[0] = 0;
-	int hw = (int)strlen(hint);
-	if (hw > cols - 2) {
-		hw = cols - 2;
-		hint[hw] = 0;
-	}
-
-	/* fit left of the hint: shrink the path, then the query, then drop
-	 * decorations; a wrapped status line would scroll the pane up and
-	 * swallow a content row */
+	/* fit within the row: shrink the path, then the query, then drop
+	 * decorations; a wrapped bar would scroll the pane and swallow
+	 * a content row */
+	int budget = cols - 2;
 	const char *flw = follow && !use_stdin ? "  follow" : "";
-	int budget = cols - hw - 2;
 	char mk[32];
 	mk[0] = 0;
 	if (nmarked)
@@ -1145,35 +1147,97 @@ static void draw_status(void)
 		left[budget] = 0;
 		lw = budget;
 	}
-	int pad = cols - lw - hw;
-	if (pad < 1)
-		pad = 1;
+	/* longest reference that fits whole; none if the row is too tight */
+	const char *hint = NULL;
+	int hw = 0;
+	for (size_t k = 0; k < sizeof hints / sizeof hints[0]; k++) {
+		int len = (int)strlen(hints[k]);
+		if (lw + len + 2 <= cols) {
+			hint = hints[k];
+			hw = len;	/* only set when actually shown */
+			break;
+		}
+	}
 
-	fputs("\x1b[1;7m", stdout);
+	printf("\x1b[1;1H\x1b[1;7m");
 	fputs(left, stdout);
-	fputs("\x1b[0m", stdout);
-	for (int i = 0; i < pad; i++)
+	for (int i = 0; i < cols - lw - hw - 1; i++)
 		fputc(' ', stdout);
-	fputs(msg[0] ? "\x1b[1;7m" : "\x1b[2m", stdout);
-	fputs(hint, stdout);
+	if (hint)
+		fputs(hint, stdout);
+	fputc(' ', stdout);
 	fputs("\x1b[0m", stdout);
+}
+
+/* command line, vim-style: the filter prompt while editing, transient
+ * notices otherwise; reserved for future commands (:...) */
+static void draw_input_bar(void)
+{
+	if (!editing && !have_input_bar()) {
+		fputs("\x1b[?25l", stdout);
+		return;
+	}
+	printf("\x1b[%d;1H\x1b[K", rows);
+
+	if (editing) {
+		/* show the tail: a prompt wider than the pane would autowrap
+		 * and scroll the screen on every keystroke */
+		size_t elen = strlen(edit);
+		int ew = (int)str_cols(edit, elen);
+		int maxw = cols - 4 > 1 ? cols - 4 : 1;	/* " /" + cursor + " " */
+		int tw = ew;
+		size_t off = 0, p = 0;
+		while (tw > maxw && p < elen) {
+			size_t cl;
+			tw -= glyph_width(u8_decode(edit + p, elen - p, &cl));
+			p += cl;
+			off = p;
+		}
+		fputs("\x1b[1;7m /", stdout);
+		fputs(edit + off, stdout);
+		fputs(" \x1b[0m", stdout);
+		int pw = (tw > 0 ? tw : 0) + 3;
+		/* show update_filter() notices (e.g. "bad regex") instead of
+		 * hiding them behind the prompt */
+		int nw = (int)strlen(msg);
+		int room = cols - (pw - 1);
+		if (*msg && nw < room) {
+			for (int i = 0; i < room - nw; i++)
+				fputc(' ', stdout);
+			fputs("\x1b[1;7m", stdout);
+			fwrite(msg, 1, (size_t)nw, stdout);
+			fputs("\x1b[0m", stdout);
+		}
+		printf("\x1b[%d;%dH\x1b[?25h", rows, pw);
+		return;
+	}
+
+	if (*msg) {
+		int nw = (int)strlen(msg);
+		if (nw > cols - 2)
+			nw = cols - 2;
+		fputs("\x1b[1;7m ", stdout);
+		fwrite(msg, 1, (size_t)nw, stdout);
+		fputs(" \x1b[0m", stdout);
+	}
 	fputs("\x1b[?25l", stdout);
 }
 
 static void render(void)
 {
-	size_t vis = (size_t)(rows - 1);
+	size_t vis = pane_rows();
 	fputs("\x1b[H", stdout);
-	size_t r = 0, i = top;
-	for (; i < nv && r < vis; i++)
+	size_t r0 = have_top_bar(), r = r0, i = top;
+	for (; i < nv && r - r0 < vis; i++)
 		r += draw_line(view[i], i == cur, r, vis);
-	if (r < vis) {
+	if (r - r0 < vis) {
 		printf("\x1b[%zu;1H", r + 1);
 		if (nv == 0 && !filtered)
 			fputs("(empty)", stdout);
 		fputs("\x1b[J", stdout);
 	}
-	draw_status();
+	draw_top_bar();
+	draw_input_bar();
 	fflush(stdout);
 }
 
@@ -1281,6 +1345,13 @@ static void copy_text(const char *s, size_t len)
 	clip_helper(s, len);
 }
 
+static void clear_marks(void)
+{
+	for (size_t i = 0; i < nlines; i++)
+		lines[i].marked = 0;
+	nmarked = 0;
+}
+
 static void copy_current(void)
 {
 	if (nmarked > 0) {
@@ -1301,9 +1372,7 @@ static void copy_current(void)
 		}
 		copy_text(buf, off);
 		free(buf);
-		for (size_t i = 0; i < nlines; i++)
-			lines[i].marked = 0;
-		nmarked = 0;
+		clear_marks();
 		snprintf(msg, sizeof msg, "copied %d marked lines (%zu bytes)",
 			 cnt, off);
 		return;
@@ -1548,10 +1617,7 @@ int main(int argc, char **argv)
 	signal(SIGTERM, on_sigexit);
 	signal(SIGHUP, on_sigexit);
 	signal(SIGINT, on_sigexit);
-	raw_on();
-	get_winsize();
-	fputs("\x1b[?1049h\x1b[?25l\x1b[2J", stdout);
-	fflush(stdout);
+	tty_enter();
 
 	load_all();
 	if (init_re)
@@ -1683,9 +1749,16 @@ int main(int argc, char **argv)
 			if (hscroll < 0)
 				hscroll = 0;
 			break;
-		case A_RIGHT:
-			hscroll += 8;
+		case A_RIGHT: {
+			/* stop where content stops: past the widest line is
+			 * blankness that only looks like more log */
+			size_t max = widest > (size_t)cols
+					   ? widest - (size_t)cols : 0;
+			if ((size_t)hscroll < max)
+				hscroll = (size_t)hscroll + 8 > max
+						  ? (int)max : hscroll + 8;
 			break;
+		}
 		case A_HSTART:
 			hscroll = 0;
 			break;
@@ -1730,9 +1803,7 @@ int main(int argc, char **argv)
 			break;
 		case A_CANCEL:
 			if (nmarked) {
-				for (size_t i = 0; i < nlines; i++)
-					lines[i].marked = 0;
-				nmarked = 0;
+				clear_marks();
 				snprintf(msg, sizeof msg, "marks cleared");
 			} else if (filtered) {
 				edit[0] = 0;
@@ -1775,10 +1846,7 @@ int main(int argc, char **argv)
 			restore_terminal();
 			signal(SIGTSTP, SIG_DFL);	/* may be inherited as SIG_IGN */
 			raise(SIGTSTP);
-			raw_on();
-			get_winsize();
-			fputs("\x1b[?1049h\x1b[?25l\x1b[2J", stdout);
-			fflush(stdout);
+			tty_enter();
 			dirty = 1;
 			break;
 		case A_REPAINT:

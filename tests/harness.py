@@ -298,7 +298,8 @@ def _check_wrap_long_line(binary):
     if rows_used < 2:
         return f'long line occupied {rows_used} rows with wrap on, expected >= 2'
     plain = run([binary, '-'], keys='gq', stdin_text=long).screen()
-    if sum(1 for r in plain[:-1] if r.strip()) != 1:   # [:-1]: skip status bar
+    # count only rows made purely of x's: ignores the top/input bars
+    if sum(1 for r in plain if set(r.strip()) <= {'x'} and r.strip()) != 1:
         return 'unwrapped long line spilled over multiple rows'
 
 
@@ -368,6 +369,31 @@ def _check_mark_empty_lines(binary):
         return 'copying marked empty lines produced no OSC 52'
     if not any('copied' in r for r in res.screen()):
         return 'no copy confirmation in status bar'
+
+
+def _check_hscroll_caps_at_content(binary):
+    # scrolling right must stop at the widest line, not wander into
+    # blankness that looks like unread log
+    text = ('short\n' + ''.join(str(i % 10) for i in range(300)) +
+            '\nshort2\n')
+    s30 = run([binary, '-'], keys='g' + 'l' * 30 + 'q', stdin_text=text).screen()
+    s200 = run([binary, '-'], keys='g' + 'l' * 200 + 'q', stdin_text=text).screen()
+    if s30 != s200:
+        return 'view changed between 30 and 200 right-taps; cap not engaged'
+    pane = next((r for r in s30 if r.strip() and r.strip()[0].isdigit()), '')
+    if not pane.rstrip().endswith('9'):
+        return f'right edge of widest line not shown: {pane[-12:]!r}'
+
+
+def _check_hscroll_keeps_spans(binary):
+    # the skip loop for horizontally scrolled bytes must keep span state,
+    # or everything right of the window renders uncolored
+    text = ('Aug 22 23:53:27 host NetworkManager[508]: '
+            '"quoted value" tail aaaaaaaaaaaaaaaaaaaaaaaa\n')
+    out = run([binary, '-'], keys='glllq', stdin_text=text).output
+    last = out.split(b'\x1b[H')[-1]
+    if b'\x1b[38;5;223m' not in last:
+        return 'quoted-value color lost after horizontal scroll'
 
 
 def _check_alt_chord_not_swallowed(binary):
@@ -451,6 +477,8 @@ CHECKS = [
     ('sloppy colon tag shared across siblings',  _check_sloppy_colon_tag_shared),
     ('alt-chord key survives lone Esc lookahead', _check_alt_chord_not_swallowed),
     ('filter prompt accepts UTF-8 queries',      _check_filter_accepts_utf8),
+    ('hscroll keeps structural coloring',        _check_hscroll_keeps_spans),
+    ('hscroll caps at widest line',              _check_hscroll_caps_at_content),
 ]
 
 
