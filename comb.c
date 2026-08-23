@@ -216,6 +216,7 @@ static void get_winsize(void)
 
 static char *pend;
 static size_t plen;
+static int flushed_partial;	/* last pushed line had no trailing newline */
 
 static void push_line(char *clean, size_t len)
 {
@@ -285,7 +286,12 @@ static void feed(const char *data, size_t n)
 	memcpy(pend + plen, data, n);
 	plen += n;
 	size_t start = 0;
-	for (size_t i = 0; i < plen; i++) {
+	/* If a final partial line was flushed as a line, a leading '\n' merely
+	 * terminates it; don't emit a spurious empty line for it. */
+	if (flushed_partial && plen > 0 && pend[0] == '\n')
+		start = 1;
+	flushed_partial = 0;
+	for (size_t i = start; i < plen; i++) {
 		if (pend[i] == '\n') {
 			size_t len;
 			char *clean = sanitize(pend + start, i - start, &len);
@@ -295,6 +301,20 @@ static void feed(const char *data, size_t n)
 	}
 	memmove(pend, pend + start, plen - start);
 	plen -= start;
+}
+
+/* push any trailing partial line (no trailing newline) as a real line.
+ * Used at load/reload and when follow turns off, so a file whose last
+ * record lacks a newline still shows it. */
+static void flush_pending(void)
+{
+	if (plen == 0)
+		return;
+	size_t len;
+	char *clean = sanitize(pend, plen, &len);
+	push_line(clean, len);
+	plen = 0;
+	flushed_partial = 1;
 }
 
 /* per-service color: pastel foreground assigned by rotation in order of
@@ -420,6 +440,7 @@ static void reset_lines(void)
 		free(lines[i].s);
 	nlines = 0;
 	plen = 0;
+	flushed_partial = 0;
 	nmarked = 0;
 	nsvc_seen = 0;	/* tag pointers referenced the freed buffers */
 }
@@ -436,6 +457,7 @@ static void load_all(void)
 {
 	if (use_stdin) {
 		read_available(STDIN_FILENO);
+		flush_pending();
 		return;
 	}
 	if (fd < 0) {
@@ -445,13 +467,15 @@ static void load_all(void)
 	}
 	fsize = 0;
 	read_available(fd);
+	flush_pending();
 	fsize = lseek(fd, 0, SEEK_CUR);
 }
 
-/* returns 1 if new data arrived (or the file was rotated) */
+/* returns 0 = no new data, 1 = new lines appended, 2 = file rotated */
 static int append_new(void)
 {
 	struct stat st, fst;
+	int rotated = 0;
 	/* rotation by rename+recreate keeps our fd on the old inode whose
 	 * size never changes, so also compare the path's inode; the size
 	 * check alone covers copytruncate-style truncation */
@@ -464,12 +488,13 @@ static int append_new(void)
 		if (fd < 0)
 			return 0;
 		fsize = 0;
+		rotated = 1;
 	}
 	off_t before = lseek(fd, 0, SEEK_CUR);
 	read_available(fd);
 	off_t now = lseek(fd, 0, SEEK_CUR);
 	fsize = now;
-	return now != before;
+	return rotated ? 2 : (now != before);
 }
 
 /* --- filtering --- */
@@ -620,7 +645,7 @@ static size_t line_cols(const Line *L)
 	size_t w = 0;
 	for (size_t i = 0; i < L->len; ) {
 		size_t cl;
-		w += glyph_width(u8_decode(L->s + i, L->len - i, &cl));
+		w += (size_t)glyph_width(u8_decode(L->s + i, L->len - i, &cl));
 		i += cl;
 	}
 	return w;
@@ -1260,11 +1285,12 @@ int main(int argc, char **argv)
 		if (follow && fd >= 0) {
 			int stick = nv > 0 && cur >= nv - 1;
 			size_t old = nlines;
-			if (append_new()) {
-				if (nlines >= old)	/* rotation resets lines[] */
-					extend_view(old);
-				else
-					rebuild_view();
+			int got = append_new();
+			if (got == 2)
+				rebuild_view();	/* rotation: lines[] were rebuilt from scratch */
+			else if (got == 1)
+				extend_view(old);
+			if (got) {
 				if (stick)
 					cur = nv ? nv - 1 : 0;
 				ensure_visible();
@@ -1383,8 +1409,12 @@ int main(int argc, char **argv)
 					L->marked = 1;
 					nmarked++;
 				}
-				if (mdir < 0 ? cur > 0 : cur + 1 < nv)
-					cur += mdir;	/* sweep in last-moved direction */
+				if (mdir < 0) {
+					if (cur > 0)
+						cur--;
+				} else if (cur + 1 < nv) {
+					cur++;
+				}
 			}
 			break;
 		case A_UNMARK:
@@ -1394,8 +1424,12 @@ int main(int argc, char **argv)
 					L->marked = 0;
 					nmarked--;
 				}
-				if (mdir < 0 ? cur > 0 : cur + 1 < nv)
-					cur += mdir;
+				if (mdir < 0) {
+					if (cur > 0)
+						cur--;
+				} else if (cur + 1 < nv) {
+					cur++;
+				}
 			}
 			break;
 		case A_CLEAR_FILTER:
@@ -1420,6 +1454,10 @@ int main(int argc, char **argv)
 			break;
 		case A_FOLLOW:
 			follow = !follow;
+			if (!follow) {
+				flush_pending();	/* settle a final partial line */
+				rebuild_view();
+			}
 			snprintf(msg, sizeof msg, "follow %s",
 				 follow ? "on" : "off");
 			break;
