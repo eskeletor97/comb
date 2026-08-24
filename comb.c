@@ -1744,7 +1744,6 @@ static void print_keys(FILE *out)
 		{ A_FOLLOW,	"toggle follow" },
 		{ A_RELOAD,	"reload file" },
 		{ A_WRAP,	"toggle line wrap" },
-		{ A_STOP,	"suspend comb (fg to resume)" },
 		{ A_QUIT,	"quit" },
 	};
 	for (size_t i = 0; i < sizeof acts / sizeof acts[0]; i++) {
@@ -1781,7 +1780,6 @@ static void usage(FILE *out)
 "options:\n"
 "  -e REGEX               start with REGEX as the filter\n"
 "  --no-color, -C         disable syntax coloring (also honors NO_COLOR)\n"
-"  -                      read from stdin (implied when stdin is not a tty)\n"
 "  -h, --help             show this help\n"
 "\n"
 "keys:\n", out);
@@ -2017,15 +2015,20 @@ int main(int argc, char **argv)
 	const char *init_re = NULL;
 	const char *file = NULL;
 
+	int endopts = 0;
 	for (int i = 1; i < argc; i++) {
-		if (!strcmp(argv[i], "-e") && i + 1 < argc) {
+		if (!endopts && !strcmp(argv[i], "--")) {
+			endopts = 1;
+		} else if (!endopts && !strcmp(argv[i], "-e") && i + 1 < argc) {
 			init_re = argv[++i];
-		} else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+		} else if (!endopts &&
+			   (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help"))) {
 			usage(stdout);
 			return 0;
-		} else if (!strcmp(argv[i], "--no-color") || !strcmp(argv[i], "-C")) {
+		} else if (!endopts &&
+			   (!strcmp(argv[i], "--no-color") || !strcmp(argv[i], "-C"))) {
 			nocolor = 1;
-		} else if (!strcmp(argv[i], "-")) {
+		} else if (!endopts && !strcmp(argv[i], "-")) {
 			use_stdin = 1;
 		} else if (argv[i][0] == '-') {
 			usage(stderr);

@@ -13,10 +13,15 @@ check: comb tests/selftest
 	./tests/selftest
 	python3 tests/harness.py --check ./comb
 
-install: comb
+install: comb comb.1
 	install -Dm755 comb $(DESTDIR)$(PREFIX)/bin/comb
+	install -Dm644 comb.1 $(DESTDIR)$(PREFIX)/share/man/man1/comb.1
+
+uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/bin/comb
+	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/comb.1
 
 clean:
 	rm -f comb tests/selftest
 
-.PHONY: check clean install
+.PHONY: check clean install uninstall

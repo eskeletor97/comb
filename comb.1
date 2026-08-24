@@ -1,0 +1,124 @@
+.TH COMB 1 "2026" "comb" "User Commands"
+.SH NAME
+comb \- view, filter and copy log files in a terminal
+.SH SYNOPSIS
+.B comb
+.RB [ \-e
+.IR REGEX ]
+.RB [ \-\-no\-color ]
+.RI [ FILE ]
+.SH DESCRIPTION
+.B comb
+loads a log file (or piped stdin) into a scrollable pane with severity
+highlighting, service-tag coloring, an incremental filter, line marking and
+clipboard copy. When stdin is a pipe it is read automatically; a live file is
+followed as it grows, surviving truncation and rotation.
+.PP
+Filters match literal text by default with smart case (a pattern containing
+no uppercase letters matches case-insensitively). A leading
+.B ^
+or trailing
+.B $
+anchors to the line start or end.
+Ctrl\-R in the filter prompt switches to POSIX ERE mode; the status bar shows
+.B (R)
+while regex mode is on. Ctrl\-V excludes matching lines instead of showing
+them, like
+.BR "grep \-v" ;
+the status bar shows
+.B (!)
+while active.
+.SH OPTIONS
+.TP
+.BI \-e " REGEX"
+start with
+.I REGEX
+as the initial (regex-mode) filter
+.TP
+.BR \-\-no\-color ", " \-C
+disable syntax coloring; also honors the
+.B NO_COLOR
+environment variable. Cursor and marks remain inverse video.
+.TP
+.BR \-h ", " \-\-help
+show help and exit
+.TP
+.B \-
+read from stdin; implied when stdin is not a tty
+.TP
+.B \-\-
+treat all following arguments as positional, not options
+.SH KEYS
+The key bindings below are factory defaults compiled into the binary;
+there is currently no remapping configuration. The filter prompt accepts
+editing keys; Up/Down/PgUp/PgDn stay live there so
+results can be scrolled while typing (terminal wheel scroll arrives as these
+keys too).
+.TP
+.BR j ", " e ", " Enter ", " Down
+next line
+.TP
+.BR k ", " Up
+previous line
+.TP
+.BR d ", " Ctrl\-d ", " PgDn ", " Ctrl\-f
+page down
+.TP
+.BR u ", " Ctrl\-u ", " PgUp ", " b
+page up
+.TP
+.BR g ", " Home
+go to top
+.TP
+.BR G ", " End
+go to bottom
+.TP
+.BR h ", " Left ", " l ", " Right
+scroll sideways by 8 columns; 0 or ^ go to the left edge, $ follows the
+current line's end
+.TP
+.B /
+open filter prompt (incremental)
+.TP
+.B ?
+clear the filter
+.TP
+.B Esc
+close the prompt; otherwise clear marks if any, else clear the filter
+.TP
+.BR Space ", " x
+mark / unmark the current line and sweep in the direction of the last
+vertical move
+.TP
+.BR c ", " y
+copy marked lines (and clear the marks), else the current line. The
+OSC 52 escape sequence is always emitted, so copy works over ssh and in
+supporting terminals; helper programs (wl\-copy, xclip, pbcopy,
+termux\-clipboard\-set) are additionally spawned when available
+.TP
+.B f
+toggle follow mode
+.TP
+.B w
+toggle soft line wrap
+.TP
+.B r
+reload the file from disk
+.TP
+.B q ", " Ctrl\-c
+quit
+.SH ENVIRONMENT
+.TP
+.B NO_COLOR
+disable syntax coloring when set
+.TP
+.B WAYLAND_DISPLAY ", " DISPLAY
+gate the clipboard helper search: wl\-copy is only tried when
+.B WAYLAND_DISPLAY
+is set, xclip only when
+.B DISPLAY
+is. With both set (common under XWayland) the Wayland helper wins because
+it is tried first; pbcopy and termux\-clipboard\-set are session\-independent.
+.SH SEE ALSO
+.BR grep (1),
+.BR less (1)
