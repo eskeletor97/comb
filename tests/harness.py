@@ -446,15 +446,38 @@ def _check_sloppy_colon_tag_shared(binary):
 def _check_metachar_query(binary):
     # invalid intermediate regexes must keep the old view and raise a
     # notice; completing a valid one must filter; Esc must clear cleanly.
+    # Ctrl-R (\x12) switches the prompt to regex mode first: by default
+    # queries are literal, so metachars never raise a bad-regex notice.
     # 'G' after the final Esc gives comb a keystroke-driven repaint of
     # the cleared view -- Esc+q now arrives as two keys (no swallow) and
     # quits before any repaint, ending the stream on a prompt frame
-    keys = '/[a+b(c)|\x1bG/a.*b\\d\x1bGq'
+    keys = '/\x12[a+b(c)|\x1bG/a.*b\\d\x1bGq'
     out = run([binary, SAMPLE], keys=keys)
     if b'bad regex' not in out.output:
         return 'no bad-regex notice while typing invalid intermediates'
     if not any(re.search(r'\d+/\d+', r) for r in out.screen()):
         return 'status counter lost after metachar queries'
+
+
+def _check_regex_toggle_badge(binary):
+    # Ctrl-R in the prompt flips to regex mode; the status bar must say so
+    out = run([binary, SAMPLE], keys='/\x12err\x1bGq')
+    if not any('(R)' in r for r in out.screen()):
+        return '(R) badge missing from status bar in regex mode'
+    out = run([binary, SAMPLE], keys='/err\x1bGq')
+    if any('(R)' in r for r in out.screen()):
+        return '(R) badge shown while still in literal mode'
+
+
+def _check_literal_metachars_match(binary):
+    # literal mode treats metachars literally; no bad-regex notice may fire
+    text = 'a.c [x] literal\nother line\n'
+    res = run([binary, '-'], keys='g/a.c [x]\rq', stdin_text=text)
+    scr = '\n'.join(res.screen())
+    if 'literal' not in scr:
+        return f'literal query did not match: {scr!r}'
+    if 'other line' in scr:
+        return 'literal filter did not narrow: unmatched line still visible'
 
 
 CHECKS = [
@@ -472,6 +495,8 @@ CHECKS = [
     ('follow picks up appended lines',           _check_follow_append),
     ('copytruncate clears stale lines',          _check_copytruncate),
     ('marked empty lines copy cleanly',          _check_mark_empty_lines),
+    ('regex toggle shows (R) badge',  _check_regex_toggle_badge),
+    ('literal filter matches metachars', _check_literal_metachars_match),
     ('regex metachar queries stay sane',         _check_metachar_query),
     ('dmesg padded timestamp dims',              _check_dmesg_padded_timestamp_dim),
     ('sloppy colon tag shared across siblings',  _check_sloppy_colon_tag_shared),

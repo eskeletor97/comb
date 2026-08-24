@@ -12,7 +12,10 @@ A small terminal log viewer in plain C (libc only, no ncurses).
 - structural tinting: dim timestamps/host/epoch stamps, colored verbosity
   tokens (<info>, <notice>), accented "quoted" values and (parenthesized)
   context — pure heuristics, no format config
-- incremental `/` filter — POSIX ERE, smart case (lowercase = case-insensitive)
+- incremental `/` filter — literal substring by default, smart case
+  (lowercase = case-insensitive); `^`/`$` anchor to line start/end.
+  Ctrl-R in the prompt switches to POSIX ERE; the status bar shows (R)
+  while regex mode is on
 - live follow with `poll()`, handles file truncation/rotation
 - `w` toggles soft line wrap (h/l/$ horizontal scrolling applies when
   wrap is off)
@@ -50,7 +53,8 @@ For those, pipe: `journalctl -o short-precise | comb`, `zcat error.log.gz | comb
 | Ctrl-d/u/f/b, PgDn/Up | page down / up                        |
 | g/G, Home/End    | top / bottom                              |
 | h/l, Left/Right  | scroll sideways (0 = home, $ = end)       |
-| /                | filter (incremental regex, smart case)    |
+| /                | filter (incremental literal, smart case)  |
+| Ctrl-r (in prompt) | toggle literal / regex (ERE) filtering   |
 | ?                | clear filter                              |
 | Space / x        | mark / unmark line, sweep in last direction |
 | c or y           | copy marked lines, else current line      |

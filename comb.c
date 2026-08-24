@@ -53,6 +53,8 @@ static off_t fsize;
 
 static regex_t re;
 static int filtered;
+static int re_mode;		/* UI toggle for the next filter: literal vs ERE */
+static int filtered_re;		/* the live filter is a compiled regex */
 static char query[MAX_QUERY];
 static char edit[MAX_QUERY];
 static int editing;
@@ -767,58 +769,50 @@ static void ensure_visible(void)
 
 static void rebuild_view(void);
 
-/* Fast-path literal for the filter: glibc's per-regexec setup cost is
- * fatal over millions of lines, so plain '^'?literal'$'? queries get a
- * memchr prefilter first. Necessary condition only -- hits still go
- * through regexec, misses are impossible. */
-static char lit_buf[64];
-static size_t lit_len;
-static int lit_anchored, lit_icase, lit_valid;
+/* Literal filter (the default): memmem/memchr beats glibc regexec by
+ * orders of magnitude over millions of lines. The pattern is a plain
+ * substring; leading ^ / trailing $ anchor to line start/end. Ctrl-R
+ * in the prompt flips to POSIX ERE mode instead. */
+static char lit_buf[MAX_QUERY];
+static size_t lit_len;		/* 0: degenerate pattern, matches everywhere */
+static int lit_bol, lit_eol, lit_icase;
 
 static void lit_update(const char *q, int icase)
 {
-	lit_valid = 0;
-	lit_anchored = (*q == '^');
-	const char *p = q + lit_anchored;
-	size_t n = 0;
-	while (p[n] && p[n] != '$') {
-		if (strchr("\\^.[|()*+?{}", p[n]))
-			return;	/* anything regex-y: no hint */
-		n++;
-	}
-	if (p[n] != '$') {	/* must end exactly at the optional anchor */
-		if (p[n] != '\0')
-			return;
-	} else if (p[n + 1] != '\0') {
-		return;
-	}
-	if (n == 0 || n > sizeof lit_buf)
-		return;
+	lit_len = 0;
+	lit_bol = (*q == '^');
+	const char *p = q + lit_bol;
+	size_t n = strlen(p);
+	lit_eol = n > 0 && p[n - 1] == '$';
+	if (lit_eol)
+		n--;
 	memcpy(lit_buf, p, n);
 	lit_len = n;
 	lit_icase = icase;
-	lit_valid = 1;
 }
 
-static int line_has_lit(const char *s, size_t len)
+/* byte offset of the first literal hit in s[0..len), or -1 */
+static ptrdiff_t lit_find(const char *s, size_t len)
 {
-	if (!lit_valid)
-		return 1;
-	if (lit_anchored)
-		return len >= lit_len &&
-		       !(lit_icase ? strncasecmp(s, lit_buf, lit_len)
-				   : memcmp(s, lit_buf, lit_len));
+#define LIT_EQ(p) \
+	!(lit_icase ? strncasecmp((p), lit_buf, lit_len) \
+		    : memcmp((p), lit_buf, lit_len))
+	if (lit_len == 0)
+		return lit_bol && lit_eol ? (len == 0 ? 0 : -1) : 0;
+	if (len < lit_len)
+		return -1;
+	size_t tail = len - lit_len;
+	if (lit_bol && lit_eol)
+		return len == lit_len && LIT_EQ(s) ? 0 : -1;
+	if (lit_bol)
+		return LIT_EQ(s) ? 0 : -1;
+	if (lit_eol)
+		return LIT_EQ(s + tail) ? (ptrdiff_t)tail : -1;
 	if (!lit_icase) {
-		const char *p = s, *end = s + len;
-		while ((p = memchr(p, lit_buf[0], (size_t)(end - p))) != NULL) {
-			if ((size_t)(end - p) >= lit_len &&
-			    !memcmp(p, lit_buf, lit_len))
-				return 1;
-			p++;
-		}
-		return 0;
+		const char *h = memmem(s, len, lit_buf, lit_len);
+		return h ? (ptrdiff_t)(h - s) : -1;
 	}
-		/* icase: memchr either case of byte 0 (SIMD), verify fold */
+	/* icase: memchr either case of byte 0 (SIMD), verify folded */
 	char lo = (char)tolower((unsigned char)lit_buf[0]);
 	char hi = (char)toupper((unsigned char)lit_buf[0]);
 	const char *p = s, *end = s + len;
@@ -828,28 +822,44 @@ static int line_has_lit(const char *s, size_t len)
 		const char *b = lo == hi ? NULL : memchr(p, hi, rem);
 		const char *hit = !a ? b : !b ? a : (a < b ? a : b);
 		if (!hit)
-			return 0;
-		if ((size_t)(end - hit) >= lit_len &&
-		    !strncasecmp(hit, lit_buf, lit_len))
-			return 1;
+			return -1;
+		if ((size_t)(end - hit) >= lit_len && LIT_EQ(hit))
+			return hit - s;
 		p = hit + 1;
 	}
-	return 0;
+#undef LIT_EQ
+	return -1;
+}
+
+/* active-filter test; on match fills m with the highlight span */
+static int query_match(const Line *L, regmatch_t *m)
+{
+	if (!filtered) {
+		m->rm_so = m->rm_eo = 0;	/* empty span: nothing to highlight */
+		return 1;
+	}
+	if (!filtered_re) {
+		ptrdiff_t off = lit_find(L->s, L->len);
+		if (off < 0)
+			return 0;
+		m->rm_so = (regoff_t)off;
+		m->rm_eo = (regoff_t)(off + lit_len);
+		return 1;
+	}
+	m->rm_so = 0;
+	m->rm_eo = (regoff_t)L->len;	/* REG_STARTEND: no NUL needed */
+	return regexec(&re, L->s, 1, m, REG_STARTEND) == 0;
 }
 
 /* Narrow an extended query in place: appending chars can only shrink
  * the match set, so survivors must already be in view[]. */
 static void refilter_narrow(void)
 {
+	regmatch_t m;
 	size_t k = 0;
-	for (size_t i = 0; i < nv; i++) {
-		const Line *L = &lines[view[i]];
-		if (line_has_lit(L->s, L->len)) {
-			regmatch_t whole = { 0, (regoff_t)L->len };
-			if (regexec(&re, L->s, 1, &whole, REG_STARTEND) == 0)
-				view[k++] = view[i];
-		}
-	}
+	for (size_t i = 0; i < nv; i++)
+		if (query_match(&lines[view[i]], &m))
+			view[k++] = view[i];
 	nv = k;
 }
 
@@ -860,11 +870,12 @@ static void update_filter(const char *q)
 	snprintf(prev, sizeof prev, "%s", query);
 	msg[0] = 0;
 	if (clearing) {
-		if (filtered)
+		if (filtered && filtered_re)
 			regfree(&re);
+		filtered_re = 0;
 		filtered = 0;
 		query[0] = 0;
-		lit_valid = 0;
+		lit_len = 0;
 	} else {
 		int icase = 1;
 		for (const char *p = q; *p; p++)
@@ -873,16 +884,24 @@ static void update_filter(const char *q)
 				break;
 			}
 		regex_t nr;
-		int flags = REG_EXTENDED | (icase ? REG_ICASE : 0);
-		if (regcomp(&nr, q, flags) != 0) {
-			snprintf(msg, sizeof msg, "bad regex: %s", q);
-			return;
+		if (re_mode) {
+			int flags = REG_EXTENDED | (icase ? REG_ICASE : 0);
+			if (regcomp(&nr, q, flags) != 0) {
+				snprintf(msg, sizeof msg, "bad regex: %s", q);
+				return;
+			}
 		}
-		if (filtered)
+		/* compile before freeing: a bad regex must keep the old view */
+		if (filtered && filtered_re)
 			regfree(&re);
-		re = nr;
+		filtered_re = 0;
+		if (re_mode) {
+			re = nr;
+			filtered_re = 1;
+		} else {
+			lit_update(q, icase);
+		}
 		filtered = 1;
-		lit_update(q, icase);
 		snprintf(query, sizeof query, "%s", q);
 	}
 	/* query grew by appended chars: old matches are a superset */
@@ -920,14 +939,10 @@ static void update_filter(const char *q)
 
 static void extend_view(size_t from)
 {
-	for (size_t i = from; i < nlines; i++) {
-		if (filtered && !line_has_lit(lines[i].s, lines[i].len))
-			continue;
-		regmatch_t whole = { 0, (regoff_t)lines[i].len };
-		if (!filtered ||
-		    regexec(&re, lines[i].s, 1, &whole, REG_STARTEND) == 0)
+	regmatch_t m;
+	for (size_t i = from; i < nlines; i++)
+		if (query_match(&lines[i], &m))
 			push_view(i);
-	}
 }
 
 static void rebuild_view(void)
@@ -1238,7 +1253,7 @@ static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 	int ms = -1, me = -1;
 	m.rm_so = 0;
 	m.rm_eo = (regoff_t)L->len;	/* REG_STARTEND: no NUL needed */
-	if (filtered && regexec(&re, L->s, 1, &m, REG_STARTEND) == 0) {
+	if (query_match(L, &m)) {
 		ms = (int)m.rm_so;
 		me = (int)m.rm_eo;
 	}
@@ -1355,6 +1370,7 @@ static void draw_status_bar(void)
 	 * a content row */
 	int budget = cols - 2;
 	const char *flw = follow && !use_stdin ? "  follow" : "";
+	const char *rmk = re_mode ? "  (R)" : "";
 	char mk[32];
 	mk[0] = 0;
 	if (nmarked)
@@ -1362,8 +1378,8 @@ static void draw_status_bar(void)
 			 budget >= 16 ? "  %zu marked" : " *%zu", nmarked);
 	size_t sl = strlen(src), ql = filtered ? strlen(query) : 0;
 	for (;;) {
-		snprintf(left, sizeof left, " %.*s  %s%s%s%s%.*s%s",
-			 (int)sl, src, where, mk, flw,
+		snprintf(left, sizeof left, " %.*s  %s%s%s%s%s%.*s%s",
+			 (int)sl, src, where, mk, flw, rmk,
 			 filtered ? "  /" : "", (int)ql, query,
 			 (nv == 0 && filtered) ? "  (no matches)" : "");
 		if ((int)strlen(left) <= budget)
@@ -1378,6 +1394,8 @@ static void draw_status_bar(void)
 				ql--;
 		} else if (*flw) {
 			flw = "";
+		} else if (*rmk) {
+			rmk = "";
 		} else {
 			break;	/* only position (+marks) left: clamp below */
 		}
@@ -1415,6 +1433,25 @@ static void draw_status_bar(void)
 
 /* command line, vim-style: the filter prompt while editing, transient
  * notices otherwise; reserved for future commands (:...) */
+/* transient notice (bad regex, mode flips, copy confirmations), drawn
+ * right-aligned on the input bar row so it never hides behind prompt
+ * content: pad from column curcol, then inverse video ending exactly at
+ * the right edge. One renderer for both the editing and idle bars. */
+static void notice(int curcol)
+{
+	if (!*msg)
+		return;
+	int nw = (int)strlen(msg);
+	int room = cols - curcol + 1;
+	if (nw > room)
+		return;
+	for (int i = 0; i < room - nw; i++)
+		fputc(' ', stdout);
+	fputs("\x1b[1;7m", stdout);
+	fwrite(msg, 1, (size_t)nw, stdout);
+	fputs("\x1b[0m", stdout);
+}
+
 static void draw_input_bar(void)
 {
 	if (!editing && !have_input_bar()) {
@@ -1428,7 +1465,8 @@ static void draw_input_bar(void)
 		 * and scroll the screen on every keystroke */
 		size_t elen = strlen(edit);
 		int ew = (int)str_cols(edit, elen);
-		int maxw = cols - 4 > 1 ? cols - 4 : 1;	/* " /" + cursor + " " */
+		int pfx = re_mode ? 3 : 2;	/* " /" vs " /r" */
+		int maxw = cols - (pfx + 2) > 1 ? cols - (pfx + 2) : 1;
 		int tw = ew;
 		size_t off = 0, p = 0;
 		while (tw > maxw && p < elen) {
@@ -1437,33 +1475,16 @@ static void draw_input_bar(void)
 			p += cl;
 			off = p;
 		}
-		fputs("\x1b[1;7m /", stdout);
+		fputs(re_mode ? "\x1b[1;7m /r" : "\x1b[1;7m /", stdout);
 		fputs(edit + off, stdout);
 		fputs(" \x1b[0m", stdout);
-		int pw = (tw > 0 ? tw : 0) + 3;
-		/* show update_filter() notices (e.g. "bad regex") instead of
-		 * hiding them behind the prompt */
-		int nw = (int)strlen(msg);
-		int room = cols - (pw - 1);
-		if (*msg && nw < room) {
-			for (int i = 0; i < room - nw; i++)
-				fputc(' ', stdout);
-			fputs("\x1b[1;7m", stdout);
-			fwrite(msg, 1, (size_t)nw, stdout);
-			fputs("\x1b[0m", stdout);
-		}
+		int pw = (tw > 0 ? tw : 0) + pfx + 1;
+		notice(pw + 1);
 		printf("\x1b[%d;%dH\x1b[?25h", rows, pw);
 		return;
 	}
 
-	if (*msg) {
-		int nw = (int)strlen(msg);
-		if (nw > cols - 2)
-			nw = cols - 2;
-		fputs("\x1b[1;7m ", stdout);
-		fwrite(msg, 1, (size_t)nw, stdout);
-		fputs(" \x1b[0m", stdout);
-	}
+	notice(1);
 	fputs("\x1b[?25l", stdout);
 }
 
@@ -1766,7 +1787,7 @@ static void print_keys(FILE *out)
 		{ A_RIGHT,	"scroll right" },
 		{ A_HSTART,	"scroll to left edge" },
 		{ A_HEND,	"scroll to right edge" },
-		{ A_FILTER,	"filter (incremental regex, smart case)" },
+		{ A_FILTER,	"filter (incremental, smart case literal)" },
 		{ A_CLEAR_FILTER, "clear filter" },
 		{ A_CANCEL,	"cancel editing; clear marks, else filter" },
 		{ A_MARK,	"mark line and sweep" },
@@ -1795,7 +1816,9 @@ static void print_keys(FILE *out)
 		}
 		fprintf(out, "  %-23s%s\n", keys, acts[i].desc);
 	}
-	fputs("\n  Sweep direction follows the last up/down move.\n", out);
+	fputs("\n  Sweep direction follows the last up/down move.\n"
+	      "  In the filter prompt, Ctrl-R toggles literal/regex mode;\n"
+	      "  the status bar shows (R) while regex mode is on.\n", out);
 }
 
 static void usage(FILE *out)
@@ -1804,6 +1827,8 @@ static void usage(FILE *out)
 "usage: comb [-e REGEX] [--no-color] [FILE]\n"
 "\n"
 "View, filter and copy log files. Reads FILE, or stdin when piped.\n"
+"Filters match literal text by default (smart case); Ctrl-R in the\n"
+"filter prompt switches to POSIX ERE.\n"
 "\n"
 "options:\n"
 "  -e REGEX               start with REGEX as the filter\n"
@@ -1882,9 +1907,10 @@ int main(int argc, char **argv)
 	tty_enter();
 
 	load_all();
-	if (init_re)
+	if (init_re) {
+		re_mode = 1;	/* -e promises a REGEX */
 		update_filter(init_re);
-	else
+	} else
 		rebuild_view();
 	cur = nv ? nv - 1 : 0;
 	ensure_visible();
@@ -1984,6 +2010,13 @@ int main(int argc, char **argv)
 			case 21: /* ctrl-u */
 				edit[0] = 0;
 				apply_edit();
+				break;
+			case 18: /* ctrl-r: toggle literal/regex filter */
+				re_mode = !re_mode;
+				apply_edit();
+				if (!*msg)	/* bad-regex notice wins over the mode notice */
+					snprintf(msg, sizeof msg, re_mode ? "regex mode"
+									  : "literal mode");
 				break;
 			default:
 				if (key >= 32 && key < 256 && key != 127 &&
