@@ -17,6 +17,9 @@ A small terminal log viewer in plain C (libc only, no ncurses).
   Ctrl-R in the prompt switches to POSIX ERE; Ctrl-V excludes matching
   lines instead (grep -v). The status bar shows (R)/(!) while regex
   mode is on or matches are excluded
+- highlight-only search: `\\` colors matches in place without narrowing;
+  `n`/`N` jump between them (shifting the view to reveal off-screen
+  matches), `|` clears, and the right-edge scrollbar marks hit rows
 - live follow with `poll()`, handles file truncation/rotation
 - `w` toggles soft line wrap (h/l/$ horizontal scrolling applies when
   wrap is off)
@@ -59,6 +62,9 @@ For those, pipe: `journalctl -o short-precise | comb`, `zcat error.log.gz | comb
 |                  | Up/Down/PgUp/PgDn scroll results live     |
 | Ctrl-r (in prompt) | toggle literal / regex (ERE) filtering   |
 | Ctrl-v (in prompt) | exclude matching lines instead (grep -v)  |
+| \\                 | search: highlight matches, don't filter   |
+| n / N             | next / previous search match              |
+| |                 | clear the highlight search                |
 | ?                | clear filter                              |
 | Space / x        | mark / unmark line, sweep in last direction |
 | c or y           | copy marked lines, else current line      |

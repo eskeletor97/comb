@@ -60,6 +60,7 @@ enum {
 	A_FILTER, A_CLEAR_FILTER, A_CANCEL,
 	A_MARK, A_UNMARK, A_COPY,
 	A_FOLLOW, A_RELOAD, A_WRAP, A_STOP,
+	A_SEARCH, A_SNEXT, A_SPREV, A_CLEAR_SEARCH,
 };
 
 static const struct { int key; int act; } keymap[] = {
@@ -104,6 +105,10 @@ static const struct { int key; int act; } keymap[] = {
 	{ 'y',	      A_COPY },
 
 	{ CTL('z'),  A_STOP },
+	{ '\\',	     A_SEARCH },
+	{ '|',	      A_CLEAR_SEARCH },
+	{ 'n',	      A_SNEXT },
+	{ 'N',	      A_SPREV },
 
 	{ 'f',	      A_FOLLOW },
 	{ 'w',	      A_WRAP },

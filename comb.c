@@ -28,6 +28,7 @@ typedef struct {
 	int tag_so, tag_eo;	/* byte span of the service tag, -1 if none */
 	int slot;		/* svc_palette index, -1 if no tag */
 	unsigned char marked;
+	unsigned char srchit;	/* highlight-search hit, for n/N + scrollbar */
 	size_t wcols;		/* display width cache, 0 = uncomputed */
 	const char *sev;	/* severity SGR cache, NULL = unscanned */
 } Line;
@@ -54,6 +55,16 @@ static char edit[MAX_QUERY];
 static int editing;
 static size_t ecur;	/* insertion point: byte offset into edit[] */
 
+/* highlight-only search: marks lines but never narrows view[] */
+static char search[MAX_QUERY];
+static int searched;
+static int editing_search;	/* prompt currently edits search, not filter */
+static regex_t sre;
+static int searched_re;
+static char slit_buf[MAX_QUERY];
+static size_t slit_len;
+static int slit_bol, slit_eol, slit_icase;
+
 static int follow = 1;
 static int wrap;
 static int nocolor;
@@ -76,6 +87,7 @@ static int mdir = -1;	/* space/x sweep direction: -1 up, 1 down */
 
 static void assign_service(Line *L);
 static size_t str_cols(const char *s, size_t n);
+static int search_match(const Line *L, regmatch_t *m);
 
 static int key_action(int key)
 {
@@ -231,7 +243,9 @@ static void push_line(const char *clean, size_t len)
 	Line *L = &lines[nlines];
 	L->s = clean;
 	L->len = len;
+	regmatch_t sm;
 	L->marked = 0;
+	L->srchit = (unsigned char)(searched && search_match(L, &sm));
 	L->sev = NULL;
 	assign_service(L);
 	nlines++;
@@ -674,6 +688,20 @@ static void ensure_visible(void)
 	top = i;
 }
 
+/* first view slot holding a line index >= line; view[] is sorted */
+static size_t view_floor(size_t line)
+{
+	size_t lo = 0, hi = nv;
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		if (view[mid] < line)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
 static void rebuild_view(void);
 
 /* Literal filter (the default): memmem/memchr beats glibc regexec by
@@ -698,30 +726,31 @@ static void lit_update(const char *q, int icase)
 	lit_icase = icase;
 }
 
-/* byte offset of the first literal hit in s[0..len), or -1 */
-static ptrdiff_t lit_find(const char *s, size_t len)
+/* byte offset of the first hit of pat[0..plen) in s[0..len), or -1;
+ * shared by the filter's and the search's literal matchers */
+static ptrdiff_t pat_find(const char *pat, size_t plen, int bol, int eol,
+			  int icase, const char *s, size_t len)
 {
-#define LIT_EQ(p) \
-	!(lit_icase ? strncasecmp((p), lit_buf, lit_len) \
-		    : memcmp((p), lit_buf, lit_len))
-	if (lit_len == 0)
-		return lit_bol && lit_eol ? (len == 0 ? 0 : -1) : 0;
-	if (len < lit_len)
+#define PAT_EQ(p) \
+	!(icase ? strncasecmp((p), pat, plen) : memcmp((p), pat, plen))
+	if (plen == 0)
+		return bol && eol ? (len == 0 ? 0 : -1) : 0;
+	if (len < plen)
 		return -1;
-	size_t tail = len - lit_len;
-	if (lit_bol && lit_eol)
-		return len == lit_len && LIT_EQ(s) ? 0 : -1;
-	if (lit_bol)
-		return LIT_EQ(s) ? 0 : -1;
-	if (lit_eol)
-		return LIT_EQ(s + tail) ? (ptrdiff_t)tail : -1;
-	if (!lit_icase) {
-		const char *h = memmem(s, len, lit_buf, lit_len);
+	size_t tail = len - plen;
+	if (bol && eol)
+		return len == plen && PAT_EQ(s) ? 0 : -1;
+	if (bol)
+		return PAT_EQ(s) ? 0 : -1;
+	if (eol)
+		return PAT_EQ(s + tail) ? (ptrdiff_t)tail : -1;
+	if (!icase) {
+		const char *h = memmem(s, len, pat, plen);
 		return h ? (ptrdiff_t)(h - s) : -1;
 	}
 	/* icase: memchr either case of byte 0 (SIMD), verify folded */
-	char lo = (char)tolower((unsigned char)lit_buf[0]);
-	char hi = (char)toupper((unsigned char)lit_buf[0]);
+	char lo = (char)tolower((unsigned char)pat[0]);
+	char hi = (char)toupper((unsigned char)pat[0]);
 	const char *p = s, *end = s + len;
 	while (p < end) {
 		size_t rem = (size_t)(end - p);
@@ -730,12 +759,18 @@ static ptrdiff_t lit_find(const char *s, size_t len)
 		const char *hit = !a ? b : !b ? a : (a < b ? a : b);
 		if (!hit)
 			return -1;
-		if ((size_t)(end - hit) >= lit_len && LIT_EQ(hit))
+		if ((size_t)(end - hit) >= plen && PAT_EQ(hit))
 			return hit - s;
 		p = hit + 1;
 	}
-#undef LIT_EQ
+#undef PAT_EQ
 	return -1;
+}
+
+/* byte offset of the first literal filter hit in s[0..len), or -1 */
+static ptrdiff_t lit_find(const char *s, size_t len)
+{
+	return pat_find(lit_buf, lit_len, lit_bol, lit_eol, lit_icase, s, len);
 }
 
 /* active-filter test; on match fills m with the highlight span */
@@ -755,6 +790,8 @@ static int query_match(const Line *L, regmatch_t *m)
 	}
 	m->rm_so = 0;
 	m->rm_eo = (regoff_t)L->len;	/* REG_STARTEND: no NUL needed */
+	/* no zero-width guard here: the return decides view membership, and
+	 * a pattern like a* matching empty must keep lines visible */
 	return regexec(&re, L->s, 1, m, REG_STARTEND) == 0;
 }
 
@@ -775,6 +812,8 @@ static void update_filter(const char *q)
 	int was_filtered = filtered, clearing = !*q;
 	char prev[sizeof query];
 	snprintf(prev, sizeof prev, "%s", query);
+	size_t was = nv ? view[cur] : 0;
+	size_t was_row = cur - top;
 	msg[0] = 0;
 	if (clearing) {
 		if (filtered && filtered_re)
@@ -795,7 +834,7 @@ static void update_filter(const char *q)
 		if (re_mode) {
 			int flags = REG_EXTENDED | (icase ? REG_ICASE : 0);
 			if (regcomp(&nr, q, flags) != 0) {
-				snprintf(msg, sizeof msg, "bad regex: %s", q);
+				snprintf(msg, sizeof msg, "bad regex: %.100s", q);
 				return;
 			}
 		}
@@ -822,17 +861,10 @@ static void update_filter(const char *q)
 	else
 		rebuild_view();
 	if (clearing && was_filtered && filter_anchor < nlines) {
-		/* return to the line selected before filtering began; view[]
-		 * is sorted, so the line is a binary search away. If it left
-		 * with a rotation/reload, keep the clamped position instead. */
-		size_t lo = 0, hi = nv;
-		while (lo < hi) {
-			size_t mid = lo + (hi - lo) / 2;
-			if (view[mid] < filter_anchor)
-				lo = mid + 1;
-			else
-				hi = mid;
-		}
+		/* return to the line selected before filtering began; it is a
+		 * binary search away since view[] is sorted. If it left with
+		 * a rotation/reload, keep the clamped position instead. */
+		size_t lo = view_floor(filter_anchor);
 		if (lo < nv && view[lo] == filter_anchor) {
 			cur = lo;
 			/* re-window so the line lands on the row it occupied
@@ -843,6 +875,18 @@ static void update_filter(const char *q)
 			if (top > max_top)
 				top = max_top;
 		}
+	} else if (!clearing) {
+		/* membership reshuffled (mode flip, exclude-mode edits): a
+		 * numeric cur would point at an arbitrary line, so re-anchor
+		 * to the nearest line in file order instead */
+		cur = view_floor(was);
+		/* window the landed line back onto its old screen row,
+		 * clamped like the clear-path restore below */
+		size_t vis = pane_rows();
+		size_t max_top = nv > vis ? nv - vis : 0;
+		top = cur > was_row ? cur - was_row : 0;
+		if (top > max_top)
+			top = max_top;
 	}
 	ensure_visible();
 }
@@ -860,6 +904,78 @@ static void rebuild_view(void)
 	nv = 0;
 	extend_view(0);
 	ensure_visible();
+}
+
+/* does the highlight-search pattern hit this line? fills m with the span */
+static int search_match(const Line *L, regmatch_t *m)
+{
+	if (!searched)
+		return 0;
+	m->rm_so = 0;
+	m->rm_eo = (regoff_t)L->len;
+	if (searched_re)
+		return regexec(&sre, L->s, 1, m, REG_STARTEND) == 0 &&
+		       m->rm_eo > m->rm_so;
+	ptrdiff_t off = pat_find(slit_buf, slit_len, slit_bol, slit_eol,
+				 slit_icase, L->s, L->len);
+	if (off < 0)
+		return 0;
+	m->rm_so = (regoff_t)off;
+	m->rm_eo = (regoff_t)(off + (ptrdiff_t)slit_len);
+	return 1;
+}
+
+/* commit a highlight-search pattern: validate, then mark every line.
+ * Extending a literal pattern can only turn hits off, so lines already
+ * marked false are skipped -- typing stays cheap on huge files. */
+static void update_search(const char *q)
+{
+	static char prev[MAX_QUERY];
+	int icase = 1;
+	for (const char *p = q; *p; p++)
+		if (isupper((unsigned char)*p)) {
+			icase = 0;
+			break;
+		}
+	size_t prevlen = strlen(prev);
+	int extend = searched && !searched_re && !re_mode && prevlen &&
+		     strlen(q) > prevlen && !memcmp(q, prev, prevlen);
+	if (*q && re_mode) {
+		regex_t nr;
+		if (regcomp(&nr, q, REG_EXTENDED | (icase ? REG_ICASE : 0))) {
+			snprintf(msg, sizeof msg, "bad regex: %.100s", q);
+			return;	/* keep the old search */
+		}
+		if (searched_re)
+			regfree(&sre);
+		sre = nr;
+		searched_re = 1;
+	} else if (*q) {
+		slit_bol = (*q == '^');
+		const char *p = q + slit_bol;
+		size_t n = strlen(p);
+		slit_eol = n > 0 && p[n - 1] == '$';
+		if (slit_eol)
+			n--;
+		memcpy(slit_buf, p, n);
+		slit_len = n;
+		slit_icase = icase;
+		searched_re = 0;
+	}
+	snprintf(search, sizeof search, "%s", q);
+	searched = !!*q;
+	for (size_t i = 0; i < nlines; i++) {
+		if (!searched) {
+			lines[i].srchit = 0;
+			continue;
+		}
+		if (extend && !lines[i].srchit)
+			continue;
+		regmatch_t sm;
+		lines[i].srchit = (unsigned char)search_match(&lines[i], &sm);
+	}
+	snprintf(prev, sizeof prev, "%s", q);
+	dirty = 1;
 }
 
 static size_t u8len(unsigned char c)
@@ -1154,8 +1270,16 @@ static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 	const char *col = L->sev;
 	regmatch_t m;
 	int ms = -1, me = -1;
+	int ss = -1, se = -1;	/* search-match overlay, like the filter's */
 	m.rm_so = 0;
 	m.rm_eo = (regoff_t)L->len;	/* REG_STARTEND: no NUL needed */
+	if (!nocolor && L->srchit) {
+		regmatch_t sm;
+		if (search_match(L, &sm)) {
+			ss = (int)sm.rm_so;
+			se = (int)sm.rm_eo;
+		}
+	}
 	if (query_match(L, &m)) {
 		ms = (int)m.rm_so;
 		me = (int)m.rm_eo;
@@ -1165,11 +1289,12 @@ static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 	size_t nsp = (size_t)collect_spans(L, sp);
 
 	const Span *act = NULL;
-	int inv = 0;	/* match-highlight state, kept in sync across BASE() */
+	int inv = 0;	/* filter-match inverse state, synced across BASE() */
+	int sinv = 0;	/* search-highlight overlay state */
 	size_t si = 0;
 	size_t b = 0, dc = 0, sc = 0, row = r0;
 
-	/* base style = cursor/mark bg + severity fg (+match inverse if mid-match) */
+	/* base style = cursor/mark bg + severity fg + both match overlays */
 #define BASE() do { \
 		fputs("\x1b[0m", stdout); \
 		if (iscur) \
@@ -1179,7 +1304,8 @@ static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 		if (*col) \
 			fputs(col, stdout); \
 		inv = ms >= 0 && b >= (size_t)ms && b < (size_t)me; \
-		if (inv) \
+		sinv = ss >= 0 && b >= (size_t)ss && b < (size_t)se; \
+		if (inv || sinv) \
 			fputs("\x1b[7m", stdout); \
 	} while (0)
 
@@ -1207,7 +1333,7 @@ static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 			row++;
 			printf("\x1b[%zu;1H", row + 1);
 			BASE();
-			if (act)	/* span styling doesn't survive SGR reset */
+			if (act && !sinv)	/* span styling doesn't survive reset */
 				fputs(act->attr, stdout);
 			sc = 0;
 			continue;
@@ -1225,14 +1351,15 @@ static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 			si++;	/* spans that ended off-screen */
 		if (!act && si < nsp && (size_t)sp[si].so <= b) {
 			act = &sp[si++];
-			fputs(act->attr, stdout);
+			if (!sinv)	/* search overlay outranks spans */
+				fputs(act->attr, stdout);
 		}
 		int want_inv = ms >= 0 && b >= (size_t)ms && b < (size_t)me;
-		if (want_inv != inv) {	/* SGR must land before the glyph, or
-					 * the char at the match edge keeps the
-					 * stale attribute */
-			fputs(want_inv ? "\x1b[7m" : "\x1b[27m", stdout);
-			inv = want_inv;
+		int want_sinv = ss >= 0 && b >= (size_t)ss && b < (size_t)se;
+		if (want_inv != inv || want_sinv != sinv) {
+			BASE();	/* repaint the whole stack on any overlay edge */
+			if (act && !sinv)	/* span yields to the search overlay */
+				fputs(act->attr, stdout);
 		}
 		fwrite(L->s + b, 1, cl, stdout);
 		b += cl;
@@ -1367,7 +1494,8 @@ static void draw_input_bar(void)
 		 * and fit maxw cells, clipping both sides. The cursor pins
 		 * toward the right edge while scrolling left. */
 		size_t elen = strlen(edit);
-		int pfx = 2 + (re_mode ? 1 : 0) + (filter_inv ? 1 : 0);
+		int pfx = 2 + (re_mode ? 1 : 0) +
+			  (!editing_search && filter_inv ? 1 : 0);
 		int maxw = cols - (pfx + 2) > 1 ? cols - (pfx + 2) : 1;
 		size_t off = 0;
 		while (off < elen &&
@@ -1387,10 +1515,11 @@ static void draw_input_bar(void)
 			eend += cl;
 		}
 		int cw = (int)str_cols(edit + off, ecur - off);
-		fputs("\x1b[1;7m /", stdout);
+		fputs("\x1b[1;7m ", stdout);
+		fputc(editing_search ? '\\' : '/', stdout);
 		if (re_mode)
 			fputc('r', stdout);
-		if (filter_inv)
+		if (!editing_search && filter_inv)
 			fputc('!', stdout);
 		fwrite(edit + off, 1, eend - off, stdout);
 		fputs(" \x1b[0m", stdout);
@@ -1418,6 +1547,37 @@ static void render(void)
 		if (nv == 0 && !filtered)
 			fputs("(empty)", stdout);
 		fputs("\x1b[J", stdout);
+	}
+	/* scrollbar: right-edge rail over the full line count; '|' is the
+	 * window thumb (always visible), '-' dashes the track, '#' marks
+	 * track rows holding search hits outside the window */
+	if (cols > 1 && (searched || nv > vis) && nv > 0) {
+		size_t drew = i - top;
+		size_t tlo = nv > vis ? top * vis / nv : 0;
+		size_t thi = nv > vis ? (top + drew) * vis / nv : vis;
+		if (thi <= tlo)
+			thi = tlo + 1;
+		fputs("\x1b[0m", stdout);
+		for (size_t sr = 0; sr < vis; sr++) {
+			int hit = 0;
+			if (searched) {
+				size_t lo = sr * nv / vis;
+				size_t hi2 = (sr + 1) * nv / vis;
+				if (hi2 <= lo)
+					hi2 = lo + 1;
+				for (size_t k = lo; k < hi2 && k < nv; k++)
+					if (lines[view[k]].srchit) {
+						hit = 1;
+						break;
+					}
+			}
+			char c = sr >= tlo && sr < thi ? '|' : '-';
+			printf("\x1b[%zu;%zuH", sr + 1, (size_t)cols);
+			if (hit)
+				fputs("\x1b[7m", stdout);
+			fputc(c, stdout);
+			fputs("\x1b[0m", stdout);
+		}
 	}
 	draw_status_bar();
 	draw_input_bar();
@@ -1696,7 +1856,10 @@ static void page_up(void)
 static void apply_edit(void)
 {
 	edit[MAX_QUERY - 1] = 0;
-	update_filter(edit);
+	if (editing_search)
+		update_search(edit);
+	else
+		update_filter(edit);
 }
 
 static const char *key_name(int key, char *buf, size_t n)
@@ -1739,6 +1902,10 @@ static void print_keys(FILE *out)
 		{ A_HSTART,	"scroll to left edge" },
 		{ A_HEND,	"scroll to right edge" },
 		{ A_FILTER,	"filter (incremental, smart case literal)" },
+		{ A_SEARCH,	"highlight-only search (no filtering)" },
+		{ A_SNEXT,	"next search match" },
+		{ A_SPREV,	"previous search match" },
+		{ A_CLEAR_SEARCH, "clear the highlight search" },
 		{ A_CLEAR_FILTER, "clear filter" },
 		{ A_CANCEL,	"cancel editing; clear marks, else filter" },
 		{ A_MARK,	"mark line and sweep" },
@@ -1767,9 +1934,9 @@ static void print_keys(FILE *out)
 		fprintf(out, "  %-23s%s\n", keys, acts[i].desc);
 	}
 	fputs("\n  Sweep direction follows the last up/down move.\n"
-	      "  In the filter prompt, Ctrl-R toggles literal/regex mode and\n"
-	      "  Ctrl-V excludes matching lines; (R)/(!) show in the status bar\n"
-	      "  while regex mode is on or matches are excluded.\n", out);
+	      "  In a prompt, Ctrl-R toggles literal/regex mode; Ctrl-V (filter\n"
+	      "  only) excludes matching lines. (R)/(!) show in the status bar.\n"
+	      "  The right-edge scrollbar marks rows containing search hits.\n", out);
 }
 
 static void usage(FILE *out)
@@ -1798,6 +1965,7 @@ static void edit_key(int key)
 	switch (key) {
 	case 0x1b:	case '\r': case '\n':
 			editing = 0;
+			editing_search = 0;
 			break;
 		case K_UP:
 			move_up();
@@ -1853,6 +2021,8 @@ static void edit_key(int key)
 							  : "literal mode");
 			break;
 		case CTL('v'):	/* exclude instead of include matches */
+			if (editing_search)
+				break;	/* filter-only toggle */
 			filter_inv = !filter_inv;
 			apply_edit();
 			if (!*msg)
@@ -1926,6 +2096,7 @@ static void view_action(int act)
 		break;
 	case A_FILTER:
 		editing = 1;
+		editing_search = 0;
 		filter_anchor = nv ? view[cur] : 0;
 		filter_row = cur - top;
 		snprintf(edit, sizeof edit, "%s", query);
@@ -1953,6 +2124,53 @@ static void view_action(int act)
 		if (filtered) {
 			edit[0] = 0;
 			update_filter("");
+		}
+		break;
+	case A_SEARCH:
+		editing = 1;
+		editing_search = 1;
+		snprintf(edit, sizeof edit, "%s", search);
+		ecur = strlen(edit);
+		break;
+	case A_SNEXT:
+	case A_SPREV: {
+		if (!searched || !nlines)
+			break;
+		int dir = act == A_SNEXT ? 1 : -1;
+		size_t li = view[cur];
+		size_t i = li;
+		do
+			i = dir > 0 ? (i + 1 < nlines ? i + 1 : 0)
+				    : (i > 0 ? i - 1 : nlines - 1);
+		while (!lines[i].srchit && i != li);
+		if (lines[i].srchit) {
+			cur = view_floor(i);
+			/* the hit may sit beyond the right edge: bring its span
+			 * into view, keeping a margin clear of the scrollbar */
+			regmatch_t sm;
+			if (search_match(&lines[i], &sm)) {
+				size_t so = (size_t)sm.rm_so, se = (size_t)sm.rm_eo;
+				size_t maxc = widest_col();
+				size_t max = maxc + 2 > (size_t)cols
+						 ? maxc + 2 - (size_t)cols : 0;
+				size_t hs = (size_t)hscroll;
+				if (se >= hs + (size_t)cols - 1)
+					hs = se + 2 > (size_t)cols
+						     ? se + 2 - (size_t)cols : 0;
+				if (so < hs)
+					hs = so > 2 ? so - 2 : 0;
+				if (hs > max)
+					hs = max;
+				hscroll = (int)hs;
+			}
+		} else
+			snprintf(msg, sizeof msg, "no matches");
+		break;
+	}
+	case A_CLEAR_SEARCH:
+		if (searched) {
+			update_search("");
+			snprintf(msg, sizeof msg, "search cleared");
 		}
 		break;
 	case A_CANCEL:

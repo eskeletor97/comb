@@ -348,6 +348,69 @@ def _check_rename_rotation_no_dupes(binary):
         if n != 1:
             return f'{needle!r} appears {n} times after rotation (expected 1)'
 
+def _check_invert_cursor_continuity(binary):
+    # toggling inversion reshuffles view membership entirely; the cursor
+    # must re-anchor to the nearest line in file order AND keep its old
+    # screen row, not get shoved to a window edge
+    lines = [f'line {i}' + (' needle' if i % 10 == 9 else '') + '\n'
+             for i in range(200)]
+    name = _tmplog(lines)
+    # filter to needles (20), move up 3 to line 169 (pane row 16), reopen
+    # the prompt and invert: line 169 is a needle and vanishes; nearest
+    # line in file order is 170, which must appear on the same pane row
+    res = run([binary, '--no-color', name],
+              keys=b'/needle\rkkk/\x16\x1bq')
+    os.unlink(name)
+    scr = res.screen()
+    text = '\n'.join(scr)
+    if '(!)' not in text or '154/180' not in text:
+        return f'inverted view or cursor line wrong: {text!r}'
+    if scr[16].replace('|', '').strip() != 'line 170':
+        return f'landing line at wrong screen row: {scr[16]!r} at row 16'
+
+def _check_highlight_search(binary):
+    # backslash search highlights without narrowing; scrollbar marks hits
+    lines = [f'line {i}' + (' needle' if i % 10 == 9 else '') + '\n'
+             for i in range(200)]
+    name = _tmplog(lines)
+    res = run([binary, '--no-color', name], keys=b'g\\needle\x1bq')
+    scr = res.screen()
+    text = '\n'.join(scr)
+    if '/200' not in text:
+        return f'search narrowed the view: {text!r}'
+    if not any('needle' in r for r in scr) or \
+       not any(r.strip().rstrip('-:#|').strip() == 'line 5' for r in scr):
+        return 'highlight search lost non-matching or matching lines'
+    # search matches are plain color inversion now: bg flips, glyphs stay
+    marks = len(re.findall(rb'\x1b\[\d+;80H\x1b\[7m-', res.output))
+    if marks < 2:
+        return f'scrollbar hit rows not inverted ({marks}): {scr!r}'
+    # with color enabled, matching text must carry the inversion
+    resc = run([binary, name], keys=b'g\\needle\x1bq')
+    os.unlink(name)
+    if not re.search(rb'\x1b\[7mneedle\x1b\[0m', resc.output):
+        return 'search match not inverted in text'
+
+def _check_search_next_prev(binary):
+    lines = [f'line {i}' + (' needle' if i % 10 == 9 else '') + '\n'
+             for i in range(200)]
+    name = _tmplog(lines)
+    # from the top, n jumps to line 9 (10/200); nn lands on 19; N steps
+    # back; from the top, N wraps around to the last match
+    res = run([binary, '--no-color', name], keys=b'g\\needle\x1bnq')
+    scr = '\n'.join(res.screen())
+    if '10/200' not in scr:
+        return f'n did not jump to next match: {scr!r}'
+    res2 = run([binary, '--no-color', name],
+               keys=b'g\\needle\x1bnnNq')
+    scr2 = '\n'.join(res2.screen())
+    if '10/200' not in scr2:
+        return f'N did not step back a match: {scr2!r}'
+    res3 = run([binary, '--no-color', name], keys=b'g\\needle\x1bNq')
+    os.unlink(name)
+    if '200/200' not in '\n'.join(res3.screen()):
+        return 'N from top did not wrap around to last match'
+
 def _check_mark_empty_lines(binary):
     res = run([binary, '-'], keys='Gxkxcq', stdin_text='\n\n\ncontent\n')
     if b'\x1b]52;c;' not in res.output:
@@ -436,6 +499,9 @@ CHECKS = [
     ('follow picks up appended lines',           _check_follow_append),
     ('copytruncate clears stale lines',          _check_copytruncate),
     ('rename rotation does not duplicate',       _check_rename_rotation_no_dupes),
+    ('inverted filter keeps cursor anchored',    _check_invert_cursor_continuity),
+    ('highlight search without filtering',       _check_highlight_search),
+    ('n/N walk search matches',                  _check_search_next_prev),
     ('marked empty lines copy cleanly',          _check_mark_empty_lines),
     ('regex toggle shows (R) badge',  _check_regex_toggle_badge),
     ('literal filter matches metachars', _check_literal_metachars_match),

@@ -28,6 +28,11 @@ them, like
 the status bar shows
 .B (!)
 while active.
+.PP
+.B \\ opens a highlight-only search: matching text is colored in place but
+the view is not narrowed; n and N jump to the next/previous match,
+wrapping at the file edges. While a search is active, the scrollbar on the
+right edge marks the track rows whose lines contain hits.
 .SH OPTIONS
 .TP
 .BI \-e " REGEX"
@@ -79,6 +84,17 @@ current line's end
 .TP
 .B /
 open filter prompt (incremental)
+.TP
+.B \\
+open highlight-search prompt; matches are colored in place, the view is
+not narrowed. Marks appear on the right-edge scrollbar
+.TP
+.BR n ", " N
+jump to the next / previous search match, wrapping at the file edges;
+the view shifts horizontally to reveal matches beyond the screen width
+.TP
+.B |
+clear the highlight search
 .TP
 .B ?
 clear the filter
