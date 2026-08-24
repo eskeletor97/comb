@@ -563,6 +563,9 @@ static int append_new(void)
 		fsize = 0;
 		rotated = 1;
 		try_map();
+		/* skip what mmap already covered; fmap_len is 0 when unmapped,
+		 * so an mmap failure still reads the whole file */
+		lseek(fd, (off_t)fmap_len, SEEK_SET);
 	}
 	off_t before = lseek(fd, 0, SEEK_CUR);
 	read_available(fd);

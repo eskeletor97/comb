@@ -327,6 +327,27 @@ def _check_copytruncate(binary):
     if any('stale line' in r for r in scr):
         return 'stale lines survived truncation'
 
+def _check_rename_rotation_no_dupes(binary):
+    # rename+recreate rotation with overlapping content: the fresh inode
+    # is loaded through the mmap window; the fd must not re-read the same
+    # bytes through the buffered path afterwards
+    name = _tmplog(['AAA original one\n', 'BBB original two\n'])
+
+    def rotate(fd):
+        os.rename(name, name + '.1')
+        with open(name, 'w') as f:
+            f.write('AAA original one\nBBB original two\nCCC brand new\n')
+
+    scr = run([binary, name], keys='gq', settle=0.6, midrun=rotate).screen()
+    os.unlink(name)
+    os.unlink(name + '.1')
+    if not any('CCC' in r for r in scr):
+        return 'rotated-in line never appeared'
+    for needle in ('AAA', 'BBB', 'CCC'):
+        n = sum(1 for r in scr if needle in r)
+        if n != 1:
+            return f'{needle!r} appears {n} times after rotation (expected 1)'
+
 def _check_mark_empty_lines(binary):
     res = run([binary, '-'], keys='Gxkxcq', stdin_text='\n\n\ncontent\n')
     if b'\x1b]52;c;' not in res.output:
@@ -414,6 +435,7 @@ CHECKS = [
     ('wrap splits long lines only in wrap mode', _check_wrap_long_line),
     ('follow picks up appended lines',           _check_follow_append),
     ('copytruncate clears stale lines',          _check_copytruncate),
+    ('rename rotation does not duplicate',       _check_rename_rotation_no_dupes),
     ('marked empty lines copy cleanly',          _check_mark_empty_lines),
     ('regex toggle shows (R) badge',  _check_regex_toggle_badge),
     ('literal filter matches metachars', _check_literal_metachars_match),
