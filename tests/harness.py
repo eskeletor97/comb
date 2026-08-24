@@ -360,6 +360,29 @@ def _check_filter_accepts_utf8(binary):
     if 'plain line' in scr:
         return 'filter did not narrow: unmatched line still visible'
 
+def _check_filter_invert(binary):
+    # Ctrl-V in the prompt excludes matching lines
+    text = ('ERROR disk failure\nINFO all good\nERROR second fault\n'
+            'plain line\n')
+    res = run([binary, '-'], keys='g/err\x16\rq', stdin_text=text)
+    scr = '\n'.join(res.screen())
+    if 'disk failure' in scr or 'second fault' in scr:
+        return f'inverted filter still shows matching lines: {scr!r}'
+    if 'all good' not in scr or 'plain line' not in scr:
+        return f'inverted filter dropped non-matching lines: {scr!r}'
+    if '(!)' not in scr:
+        return f'(!) badge missing while excluding: {scr!r}'
+    # extending an inverted query must resurrect lines the shorter one hid:
+    # "ERROR " hides both ERRORs; "ERROR d" no longer matches "second
+    # fault", so it must come back (disk failure stays out). This
+    # exercises the suppressed superset-narrowing fast path.
+    res2 = run([binary, '-'], keys='g/ERROR \x16d\rq', stdin_text=text)
+    scr2 = '\n'.join(res2.screen())
+    if 'second fault' not in scr2:
+        return f'inverted query extension did not resurrect lines: {scr2!r}'
+    if 'disk failure' in scr2 or 'all good' not in scr2:
+        return f'extended inverted filter kept wrong lines: {scr2!r}'
+
 def _check_regex_toggle_badge(binary):
     # Ctrl-R in the prompt flips to regex mode; the status bar must say so
     out = run([binary, SAMPLE], keys='/\x12err\x1bGq')
@@ -395,6 +418,7 @@ CHECKS = [
     ('regex toggle shows (R) badge',  _check_regex_toggle_badge),
     ('literal filter matches metachars', _check_literal_metachars_match),
     ('filter prompt accepts UTF-8 queries',      _check_filter_accepts_utf8),
+    ('Ctrl-V inverted filter',                   _check_filter_invert),
     ('hscroll caps at widest line',              _check_hscroll_caps_at_content),
 ]
 

@@ -48,6 +48,7 @@ static regex_t re;
 static int filtered;
 static int re_mode;		/* UI toggle for the next filter: literal vs ERE */
 static int filtered_re;		/* the live filter is a compiled regex */
+static int filter_inv;		/* live filter excludes matching lines */
 static char query[MAX_QUERY];
 static char edit[MAX_QUERY];
 static int editing;
@@ -60,7 +61,6 @@ static const char *mark_bg = MARK_BG;
 static int running = 1;
 static int dirty = 1;
 
-static size_t widest;	/* display cols of the widest line seen */
 static size_t cur, top;
 static size_t filter_anchor;	/* line selected when filtering began */
 static size_t filter_row;	/* its screen row, restored on clear */
@@ -129,8 +129,6 @@ static void *xrealloc(void *p, size_t n)
 	return q;
 }
 
-/* --- terminal --- */
-
 static void raw_on(void)
 {
 	if (tcgetattr(kfd, &saved_tio))
@@ -184,8 +182,6 @@ static void tty_enter(void)
 	fflush(stdout);
 }
 
-/* --- input feeding / line storage --- */
-
 /* Line text lives in bump-allocated ~1 MiB chunks; chunks are never
  * moved or freed individually, so Line.s and svc_seen pointers stay
  * valid until reset_lines rewinds the arena. */
@@ -237,9 +233,6 @@ static void push_line(const char *clean, size_t len)
 	L->len = len;
 	L->marked = 0;
 	L->sev = NULL;
-	L->wcols = str_cols(clean, len);	/* cache; draw time would recompute anyway */
-	if (L->wcols > widest)
-		widest = L->wcols;
 	assign_service(L);
 	nlines++;
 }
@@ -502,7 +495,6 @@ static void reset_lines(void)
 	plen = 0;
 	flushed_partial = 0;
 	nmarked = 0;
-	widest = 0;
 	nv = 0;	/* view entries referenced the freed buffers */
 	nsvc_seen = 0;	/* tag pointers referenced the freed buffers */
 }
@@ -513,6 +505,24 @@ static void read_available(int src)
 	ssize_t g;
 	while ((g = read(src, buf, sizeof buf)) > 0)
 		feed(buf, (size_t)g);
+}
+
+/* Prefer a zero-copy window onto the file when it is regular and
+ * non-empty; anything else (pipes, weird files, mmap failure) falls
+ * back to reading through pend. */
+static void try_map(void)
+{
+	struct stat st;
+	if (fmap || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+	    st.st_size <= 0)
+		return;
+	void *p = mmap(NULL, (size_t)st.st_size, PROT_READ,
+		       MAP_PRIVATE, fd, 0);
+	if (p == MAP_FAILED)
+		return;
+	fmap = p;
+	fmap_len = (size_t)st.st_size;
+	drain_map();
 }
 
 static void load_all(void)
@@ -527,17 +537,7 @@ static void load_all(void)
 		if (fd < 0)
 			die_sys("cannot open %s", path);
 	}
-	struct stat st;
-	if (!fmap && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
-	    st.st_size > 0) {
-		void *p = mmap(NULL, (size_t)st.st_size, PROT_READ,
-			       MAP_PRIVATE, fd, 0);
-		if (p != MAP_FAILED) {
-			fmap = p;
-			fmap_len = (size_t)st.st_size;
-			drain_map();
-		}
-	}
+	try_map();
 	lseek(fd, (off_t)fmap_len, SEEK_SET);
 	read_available(fd);
 	flush_pending();
@@ -562,17 +562,7 @@ static int append_new(void)
 			return 0;
 		fsize = 0;
 		rotated = 1;
-		/* fresh inode: prefer a new zero-copy window over reading the
-		 * whole file through the pipe path */
-		if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
-			void *p = mmap(NULL, (size_t)st.st_size, PROT_READ,
-				       MAP_PRIVATE, fd, 0);
-			if (p != MAP_FAILED) {
-				fmap = p;
-				fmap_len = (size_t)st.st_size;
-				drain_map();
-			}
-		}
+		try_map();
 	}
 	off_t before = lseek(fd, 0, SEEK_CUR);
 	read_available(fd);
@@ -599,8 +589,6 @@ static int pump_follow(void)
 	}
 	return append_new();
 }
-
-/* --- filtering --- */
 
 /* layout: log pane, then status bar (source/position/keys), then the
  * command line -- everything worth looking at sits at the bottom, near
@@ -774,7 +762,7 @@ static void refilter_narrow(void)
 	regmatch_t m;
 	size_t k = 0;
 	for (size_t i = 0; i < nv; i++)
-		if (query_match(&lines[view[i]], &m))
+		if (query_match(&lines[view[i]], &m) != filter_inv)
 			view[k++] = view[i];
 	nv = k;
 }
@@ -790,6 +778,7 @@ static void update_filter(const char *q)
 			regfree(&re);
 		filtered_re = 0;
 		filtered = 0;
+		filter_inv = 0;
 		query[0] = 0;
 		lit_len = 0;
 	} else {
@@ -820,9 +809,11 @@ static void update_filter(const char *q)
 		filtered = 1;
 		snprintf(query, sizeof query, "%s", q);
 	}
-	/* query grew by appended chars: old matches are a superset */
+	/* query grew by appended chars: old matches are a superset, so
+	 * re-testing just view[] suffices -- but only while including.
+	 * Inverted, shrinking matches make outside lines eligible. */
 	size_t prevlen = strlen(prev);
-	if (was_filtered && !clearing && prevlen &&
+	if (was_filtered && !clearing && !filter_inv && prevlen &&
 	    strlen(q) > prevlen && !memcmp(q, prev, prevlen))
 		refilter_narrow();
 	else
@@ -857,7 +848,7 @@ static void extend_view(size_t from)
 {
 	regmatch_t m;
 	for (size_t i = from; i < nlines; i++)
-		if (query_match(&lines[i], &m))
+		if (query_match(&lines[i], &m) != filter_inv)
 			push_view(i);
 }
 
@@ -867,8 +858,6 @@ static void rebuild_view(void)
 	extend_view(0);
 	ensure_visible();
 }
-
-/* --- rendering --- */
 
 static size_t u8len(unsigned char c)
 {
@@ -938,7 +927,6 @@ static unsigned u8_decode(const char *s, size_t rem, size_t *cl)
 	return cp;
 }
 
-/* display width in terminal cells */
 static size_t str_cols(const char *s, size_t n)
 {
 	size_t w = 0, i = 0;
@@ -960,7 +948,7 @@ static size_t str_cols(const char *s, size_t n)
 	return w;
 }
 
-/* cached str_cols(); widths never change once a line is stored */
+/* widths never change once a line is stored */
 static size_t line_cols(Line *L)
 {
 	if (!L->wcols)
@@ -968,7 +956,19 @@ static size_t line_cols(Line *L)
 	return L->wcols;
 }
 
-/* pane rows the logical line occupies */
+/* widest line in the file; measures uncached lines on demand, so the
+ * first hscroll-right pays what load no longer does up front */
+static size_t widest_col(void)
+{
+	size_t w = 0;
+	for (size_t i = 0; i < nlines; i++) {
+		size_t cw = line_cols(&lines[i]);
+		if (cw > w)
+			w = cw;
+	}
+	return w;
+}
+
 static size_t line_rows(Line *L)
 {
 	if (!wrap)
@@ -978,7 +978,7 @@ static size_t line_rows(Line *L)
 }
 
 
-/* case-insensitive find of needle within s[0..n), no NUL needed */
+/* like memmem/strstr but works on non-NUL-terminated spans */
 static const char *case_find(const char *s, size_t n, const char *needle)
 {
 	size_t m = strlen(needle);
@@ -1269,6 +1269,7 @@ static void draw_status_bar(void)
 	int budget = cols - 2;
 	const char *flw = follow && !use_stdin ? "  follow" : "";
 	const char *rmk = re_mode ? "  (R)" : "";
+	const char *imk = filter_inv ? "  (!)" : "";
 	char mk[32];
 	mk[0] = 0;
 	if (nmarked)
@@ -1276,8 +1277,8 @@ static void draw_status_bar(void)
 			 budget >= 16 ? "  %zu marked" : " *%zu", nmarked);
 	size_t sl = strlen(src), ql = filtered ? strlen(query) : 0;
 	for (;;) {
-		snprintf(left, sizeof left, " %.*s  %s%s%s%s%s%.*s%s",
-			 (int)sl, src, where, mk, flw, rmk,
+		snprintf(left, sizeof left, " %.*s  %s%s%s%s%s%s%.*s%s",
+			 (int)sl, src, where, mk, flw, rmk, imk,
 			 filtered ? "  /" : "", (int)ql, query,
 			 (nv == 0 && filtered) ? "  (no matches)" : "");
 		if ((int)strlen(left) <= budget)
@@ -1294,6 +1295,8 @@ static void draw_status_bar(void)
 			flw = "";
 		} else if (*rmk) {
 			rmk = "";
+		} else if (*imk) {
+			imk = "";
 		} else {
 			break;	/* only position (+marks) left: clamp below */
 		}
@@ -1361,7 +1364,7 @@ static void draw_input_bar(void)
 		 * and fit maxw cells, clipping both sides. The cursor pins
 		 * toward the right edge while scrolling left. */
 		size_t elen = strlen(edit);
-		int pfx = re_mode ? 3 : 2;	/* " /" vs " /r" */
+		int pfx = 2 + (re_mode ? 1 : 0) + (filter_inv ? 1 : 0);
 		int maxw = cols - (pfx + 2) > 1 ? cols - (pfx + 2) : 1;
 		size_t off = 0;
 		while (off < elen &&
@@ -1381,7 +1384,11 @@ static void draw_input_bar(void)
 			eend += cl;
 		}
 		int cw = (int)str_cols(edit + off, ecur - off);
-		fputs(re_mode ? "\x1b[1;7m /r" : "\x1b[1;7m /", stdout);
+		fputs("\x1b[1;7m /", stdout);
+		if (re_mode)
+			fputc('r', stdout);
+		if (filter_inv)
+			fputc('!', stdout);
 		fwrite(edit + off, 1, eend - off, stdout);
 		fputs(" \x1b[0m", stdout);
 		/* cursor sits on the char right of it, or on our trailing
@@ -1413,8 +1420,6 @@ static void render(void)
 	draw_input_bar();
 	fflush(stdout);
 }
-
-/* --- clipboard --- */
 
 static size_t b64enc(const char *d, size_t n, char *o)
 {
@@ -1541,20 +1546,18 @@ static void copy_current(void)
 				total += lines[i].len + 1;
 		char *buf = xrealloc(NULL, total + 1);
 		size_t off = 0;
-		int cnt = 0;
 		for (size_t i = 0; i < nlines; i++) {
 			if (!lines[i].marked)
 				continue;
 			memcpy(buf + off, lines[i].s, lines[i].len);
 			off += lines[i].len;
 			buf[off++] = '\n';
-			cnt++;
 		}
 		copy_text(buf, off);
 		free(buf);
+		snprintf(msg, sizeof msg, "copied %zu marked lines (%zu bytes)",
+			 nmarked, off);
 		clear_marks();
-		snprintf(msg, sizeof msg, "copied %d marked lines (%zu bytes)",
-			 cnt, off);
 		return;
 	}
 	if (nv == 0)
@@ -1563,8 +1566,6 @@ static void copy_current(void)
 	copy_text(L->s, L->len);
 	snprintf(msg, sizeof msg, "copied line %zu (%zu bytes)", cur + 1, L->len);
 }
-
-/* --- input --- */
 
 static int peeked = -1;	/* unget buffer for read_key()'s Esc lookahead */
 
@@ -1665,14 +1666,6 @@ static size_t u8_next(const char *s, size_t i, size_t n)
 	return i;
 }
 
-/* vertical cursor moves, shared by the main view and the filter
- * prompt (Up/Down/PgUp/PgDn stay live there); ensure_visible()
- * windows the result */
-static size_t page_step(void)
-{
-	return (size_t)(rows > 2 ? rows - 2 : 1);
-}
-
 static void move_up(void)
 {
 	mdir = -1;
@@ -1689,12 +1682,12 @@ static void move_down(void)
 
 static void page_down(void)
 {
-	cur += page_step();
+	cur += pane_rows();
 }
 
 static void page_up(void)
 {
-	cur = cur > page_step() ? cur - page_step() : 0;
+	cur = cur > pane_rows() ? cur - pane_rows() : 0;
 }
 
 static void apply_edit(void)
@@ -1702,8 +1695,6 @@ static void apply_edit(void)
 	edit[MAX_QUERY - 1] = 0;
 	update_filter(edit);
 }
-
-/* --- main --- */
 
 static const char *key_name(int key, char *buf, size_t n)
 {
@@ -1774,8 +1765,9 @@ static void print_keys(FILE *out)
 		fprintf(out, "  %-23s%s\n", keys, acts[i].desc);
 	}
 	fputs("\n  Sweep direction follows the last up/down move.\n"
-	      "  In the filter prompt, Ctrl-R toggles literal/regex mode;\n"
-	      "  the status bar shows (R) while regex mode is on.\n", out);
+	      "  In the filter prompt, Ctrl-R toggles literal/regex mode and\n"
+	      "  Ctrl-V excludes matching lines; (R)/(!) show in the status bar\n"
+	      "  while regex mode is on or matches are excluded.\n", out);
 }
 
 static void usage(FILE *out)
@@ -1784,8 +1776,7 @@ static void usage(FILE *out)
 "usage: comb [-e REGEX] [--no-color] [FILE]\n"
 "\n"
 "View, filter and copy log files. Reads FILE, or stdin when piped.\n"
-"Filters match literal text by default (smart case); Ctrl-R in the\n"
-"filter prompt switches to POSIX ERE.\n"
+"Filters match literal text by default (smart case).\n"
 "\n"
 "options:\n"
 "  -e REGEX               start with REGEX as the filter\n"
@@ -1860,6 +1851,14 @@ static void edit_key(int key)
 				snprintf(msg, sizeof msg, re_mode ? "regex mode"
 							  : "literal mode");
 			break;
+		case CTL('v'):	/* exclude instead of include matches */
+			filter_inv = !filter_inv;
+			apply_edit();
+			if (!*msg)
+				snprintf(msg, sizeof msg, filter_inv
+							  ? "excluding matches"
+							  : "including matches");
+			break;
 		default:
 			if (key >= 32 && key < 256 && elen < MAX_QUERY - 1) {
 				/* multibyte chars arrive as separate bytes:
@@ -1874,7 +1873,6 @@ static void edit_key(int key)
 	}
 }
 
-/* main-view key actions */
 static void view_action(int act)
 {
 	switch (act) {
@@ -1888,10 +1886,10 @@ static void view_action(int act)
 		move_up();
 		break;
 	case A_PGDOWN:
-		cur += page_step();
+		page_down();
 		break;
 	case A_PGUP:
-		cur = cur > page_step() ? cur - page_step() : 0;
+		page_up();
 		break;
 	case A_TOP:
 		cur = 0;
@@ -1905,8 +1903,9 @@ static void view_action(int act)
 			hscroll = 0;
 		break;
 	case A_RIGHT: {
-		size_t max = widest > (size_t)cols
-				   ? widest - (size_t)cols : 0;
+		size_t maxc = widest_col();
+		size_t max = maxc > (size_t)cols
+				   ? maxc - (size_t)cols : 0;
 		if ((size_t)hscroll < max)
 			hscroll = (size_t)hscroll + 8 > max
 					  ? (int)max : hscroll + 8;
