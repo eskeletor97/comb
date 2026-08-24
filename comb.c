@@ -58,6 +58,7 @@ static int filtered_re;		/* the live filter is a compiled regex */
 static char query[MAX_QUERY];
 static char edit[MAX_QUERY];
 static int editing;
+static size_t ecur;	/* insertion point: byte offset into edit[] */
 
 static int follow = 1;
 static int wrap;
@@ -85,15 +86,16 @@ static size_t str_cols(const char *s, size_t n);
 
 enum {
 	K_NONE = 0x100, K_EOF, K_UP, K_DOWN, K_LEFT, K_RIGHT,
-	K_PGUP, K_PGDN, K_HOME, K_END
+	K_PGUP, K_PGDN, K_HOME, K_END, K_DEL
 };
 
 /*
  * Key bindings -- edit to taste; usage()'s keys section is generated
  * from this table. Keys are whatever read_key() returns: plain
  * characters, CTL() control codes, or the K_* specials. The filter
- * prompt keeps its own fixed editing keys (type, Backspace, Ctrl-u,
- * Enter, Esc).
+ * prompt keeps its own fixed editing keys (type/insert at an arrows-
+ * moved cursor, Home/End, Backspace/Delete, Ctrl-a/e/u, Ctrl-r for
+ * regex mode, Enter, Esc); Up/Down/PgUp/PgDn scroll the view instead.
  */
 #define CTL(x)	((x) & 0x1f)
 enum {
@@ -1325,15 +1327,13 @@ static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 			fputs(act->attr, stdout);
 		}
 		int want_inv = ms >= 0 && b >= (size_t)ms && b < (size_t)me;
-		if (want_inv && !inv) {
-			fputs("\x1b[7m", stdout);
-			inv = 1;
+		if (want_inv != inv) {	/* SGR must land before the glyph, or
+					 * the char at the match edge keeps the
+					 * stale attribute */
+			fputs(want_inv ? "\x1b[7m" : "\x1b[27m", stdout);
+			inv = want_inv;
 		}
 		fwrite(L->s + b, 1, cl, stdout);
-		if (!want_inv && inv) {
-			fputs("\x1b[27m", stdout);
-			inv = 0;
-		}
 		b += cl;
 		dc += (size_t)gw;
 		sc += (size_t)gw;
@@ -1461,24 +1461,36 @@ static void draw_input_bar(void)
 	printf("\x1b[%d;1H\x1b[K", rows);
 
 	if (editing) {
-		/* show the tail: a prompt wider than the pane would autowrap
-		 * and scroll the screen on every keystroke */
+		/* window [off,eend) of the edit buffer: must hold the cursor
+		 * and fit maxw cells, clipping both sides. The cursor pins
+		 * toward the right edge while scrolling left. */
 		size_t elen = strlen(edit);
-		int ew = (int)str_cols(edit, elen);
 		int pfx = re_mode ? 3 : 2;	/* " /" vs " /r" */
 		int maxw = cols - (pfx + 2) > 1 ? cols - (pfx + 2) : 1;
-		int tw = ew;
-		size_t off = 0, p = 0;
-		while (tw > maxw && p < elen) {
+		size_t off = 0;
+		while (off < elen &&
+		       str_cols(edit + off, ecur - off) > (size_t)(maxw - 1)) {
 			size_t cl;
-			tw -= glyph_width(u8_decode(edit + p, elen - p, &cl));
-			p += cl;
-			off = p;
+			u8_decode(edit + off, elen - off, &cl);
+			off += cl;
 		}
+		size_t eend = off, acc = 0;
+		while (eend < elen) {
+			size_t cl;
+			int gw = glyph_width(u8_decode(edit + eend,
+						       elen - eend, &cl));
+			if (acc + (size_t)gw > (size_t)maxw)
+				break;
+			acc += gw;
+			eend += cl;
+		}
+		int cw = (int)str_cols(edit + off, ecur - off);
 		fputs(re_mode ? "\x1b[1;7m /r" : "\x1b[1;7m /", stdout);
-		fputs(edit + off, stdout);
+		fwrite(edit + off, 1, eend - off, stdout);
 		fputs(" \x1b[0m", stdout);
-		int pw = (tw > 0 ? tw : 0) + pfx + 1;
+		/* cursor sits on the char right of it, or on our trailing
+		 * space when it is at the end of the window */
+		int pw = pfx + cw + 1;
 		notice(pw + 1);
 		printf("\x1b[%d;%dH\x1b[?25h", rows, pw);
 		return;
@@ -1702,6 +1714,7 @@ static int decode_csi(const char *seq, size_t n)
 		    (seq[1] == '~' || seq[1] == ';')) {
 			switch (seq[0]) {
 			case '1': case '7': return K_HOME;
+			case '3':	   return K_DEL;
 			case '4': case '8': return K_END;
 			case '5': return K_PGUP;
 			case '6': return K_PGDN;
@@ -1738,6 +1751,44 @@ static int read_key(void)
 			seq[n++] = (char)f;
 	} while (f < 0x40 || f > 0x7e);
 	return decode_csi(seq, n);
+}
+
+/* previous/next UTF-8 boundary around i; i sits on a boundary */
+static size_t u8_prev(const char *s, size_t i)
+{
+	do i--;
+	while (i > 0 && ((unsigned char)s[i] & 0xC0) == 0x80);
+	return i;
+}
+
+static size_t u8_next(const char *s, size_t i, size_t n)
+{
+	i++;
+	while (i < n && ((unsigned char)s[i] & 0xC0) == 0x80)
+		i++;
+	return i;
+}
+
+/* vertical cursor moves, shared by the main view and the filter
+ * prompt (Up/Down/PgUp/PgDn stay live there); ensure_visible()
+ * windows the result */
+static size_t page_step(void)
+{
+	return (size_t)(rows > 2 ? rows - 2 : 1);
+}
+
+static void move_up(void)
+{
+	mdir = -1;
+	if (cur > 0)
+		cur--;
+}
+
+static void move_down(void)
+{
+	mdir = 1;
+	if (cur + 1 < nv)
+		cur++;
 }
 
 static void apply_edit(void)
@@ -1991,6 +2042,7 @@ int main(int argc, char **argv)
 		msg[0] = 0;
 
 		if (editing) {
+			size_t elen = strlen(edit);
 			switch (key) {
 			case 0x1b:
 				editing = 0;
@@ -1998,17 +2050,58 @@ int main(int argc, char **argv)
 			case '\r': case '\n':
 				editing = 0;
 				break;
+			case K_UP:
+			case K_DOWN:
+			case K_PGUP:
+			case K_PGDN: {
+				/* scroll the live results without leaving the
+				 * prompt; terminal wheel scroll arrives as
+				 * these keys too */
+				if (key == K_UP)
+					move_up();
+				else if (key == K_DOWN)
+					move_down();
+				else if (key == K_PGDN)
+					cur += page_step();
+				else
+					cur = cur > page_step() ?
+					      cur - page_step() : 0;
+				break;
+			}
+			case K_LEFT: case CTL('b'):
+				if (ecur > 0)
+					ecur = u8_prev(edit, ecur);
+				break;
+			case K_RIGHT: case CTL('f'):
+				if (ecur < elen)
+					ecur = u8_next(edit, ecur, elen);
+				break;
+			case K_HOME: case CTL('a'):
+				ecur = 0;
+				break;
+			case K_END: case CTL('e'):
+				ecur = elen;
+				break;
+			case K_DEL:
+				if (ecur < elen) {
+					size_t n = u8_next(edit, ecur, elen);
+					memmove(edit + ecur, edit + n,
+						elen - n + 1);
+					apply_edit();
+				}
+				break;
 			case 127: case 8:
-				if (edit[0]) {
-					size_t l = strlen(edit);
-					while (l > 0 && (edit[--l] & 0xC0) == 0x80)
-						;
-					edit[l] = 0;
+				if (ecur > 0) {
+					size_t p = u8_prev(edit, ecur);
+					memmove(edit + p, edit + ecur,
+						elen - ecur + 1);
+					ecur = p;
 					apply_edit();
 				}
 				break;
 			case 21: /* ctrl-u */
 				edit[0] = 0;
+				ecur = 0;
 				apply_edit();
 				break;
 			case 18: /* ctrl-r: toggle literal/regex filter */
@@ -2020,14 +2113,19 @@ int main(int argc, char **argv)
 				break;
 			default:
 				if (key >= 32 && key < 256 && key != 127 &&
-				    strlen(edit) < MAX_QUERY - 1) {
-					size_t l = strlen(edit);
-					edit[l] = (char)key;
-					edit[l + 1] = 0;
+				    elen < MAX_QUERY - 1) {
+					/* multibyte chars arrive as separate
+					 * bytes: in-order insertion keeps them
+					 * contiguous behind the lead byte */
+					memmove(edit + ecur + 1, edit + ecur,
+						elen - ecur + 1);
+					edit[ecur++] = (char)key;
 					apply_edit();
 				}
 				break;
 			}
+			ensure_visible();	/* nav keys above, and narrowing
+						 * queries, both move cur */
 			dirty = 1;
 			continue;
 		}
@@ -2038,23 +2136,17 @@ int main(int argc, char **argv)
 			running = 0;
 			break;
 		case A_DOWN:
-			mdir = 1;
-			if (cur + 1 < nv)
-				cur++;
+			move_down();
 			break;
 		case A_UP:
-			mdir = -1;
-			if (cur > 0)
-				cur--;
+			move_up();
 			break;
 		case A_PGDOWN:
-			cur += (size_t)(rows > 2 ? rows - 2 : 1);
+			cur += page_step();
 			break;
-		case A_PGUP: {
-			size_t step = (size_t)(rows > 2 ? rows - 2 : 1);
-			cur = cur > step ? cur - step : 0;
+		case A_PGUP:
+			cur = cur > page_step() ? cur - page_step() : 0;
 			break;
-		}
 		case A_TOP:
 			cur = 0;
 			break;
@@ -2093,6 +2185,7 @@ int main(int argc, char **argv)
 			filter_anchor = nv ? view[cur] : 0;
 			filter_row = cur - top;
 			snprintf(edit, sizeof edit, "%s", query);
+			ecur = strlen(edit);
 			break;
 		case A_MARK:
 		case A_UNMARK: {

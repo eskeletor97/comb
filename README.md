@@ -53,7 +53,8 @@ For those, pipe: `journalctl -o short-precise | comb`, `zcat error.log.gz | comb
 | Ctrl-d/u/f/b, PgDn/Up | page down / up                        |
 | g/G, Home/End    | top / bottom                              |
 | h/l, Left/Right  | scroll sideways (0 = home, $ = end)       |
-| /                | filter (incremental literal, smart case)  |
+| /                | filter (incremental literal, smart case); |
+|                  | Up/Down/PgUp/PgDn scroll results live     |
 | Ctrl-r (in prompt) | toggle literal / regex (ERE) filtering   |
 | ?                | clear filter                              |
 | Space / x        | mark / unmark line, sweep in last direction |
