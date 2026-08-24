@@ -37,6 +37,7 @@ A small terminal log viewer in plain C (libc only, no ncurses).
 `--no-color` (or `-C`, or the `NO_COLOR` env var) strips syntax coloring but keeps inverse-video cursor/marks.
 
 Reads FILE, or piped/redirected stdin (`dmesg | comb`, `comb < file`); the explicit `comb -` still works. When reading stdin, keys come from /dev/tty.
+Pipe is followed live.
 
 Plain text only: no systemd journal, no binary or compressed logs.
 For those, pipe: `journalctl -o short-precise | comb`, `zcat error.log.gz | comb`.

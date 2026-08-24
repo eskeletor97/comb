@@ -14,9 +14,11 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <termios.h>
+#include <stddef.h>
 #include <unistd.h>
 
 #define MAX_QUERY 256
@@ -28,7 +30,7 @@
 #define DIM "\x1b[2m"
 
 typedef struct {
-	char *s;
+	const char *s;
 	size_t len;
 	int tag_so, tag_eo;	/* byte span of the service tag, -1 if none */
 	int slot;		/* svc_palette index, -1 if no tag */
@@ -263,11 +265,47 @@ static void tty_enter(void)
 
 /* --- input feeding / line storage --- */
 
+/* Line text lives in bump-allocated ~1 MiB chunks; chunks are never
+ * moved or freed individually, so Line.s and svc_seen pointers stay
+ * valid until reset_lines rewinds the arena. */
+#define ARENA_CHUNK ((size_t)1 << 20)
+static char **achunk;
+static size_t nachunk, acap, apos;
+
+static void *arena_alloc(size_t n)
+{
+	if (nachunk == acap) {
+		acap = acap ? acap * 2 : 16;
+		achunk = xrealloc(achunk, acap * sizeof(*achunk));
+	}
+	if (nachunk == 0 || apos + n > ARENA_CHUNK) {
+		size_t cap = n > ARENA_CHUNK ? n : ARENA_CHUNK;
+		achunk[nachunk++] = xrealloc(NULL, cap);
+		apos = 0;
+	}
+	void *p = achunk[nachunk - 1] + apos;
+	apos += n;
+	return p;
+}
+
+static void arena_reset(void)
+{
+	for (size_t i = 0; i < nachunk; i++)
+		free(achunk[i]);
+	nachunk = 0;
+}
+
+/* Zero-copy window onto a regular file: clean lines point into the
+ * mapping instead of owning an arena copy. */
+static char *fmap;
+static size_t fmap_len, fmap_pos;
+
 static char *pend;
 static size_t plen;
 static int flushed_partial;	/* last pushed line had no trailing newline */
+static int stdin_eof;	/* pipe closed: no more input will ever come */
 
-static void push_line(char *clean, size_t len)
+static void push_line(const char *clean, size_t len)
 {
 	if (nlines == lcap) {
 		lcap = lcap ? lcap * 2 : 1024;
@@ -289,15 +327,15 @@ static void push_line(char *clean, size_t len)
 	nlines++;
 }
 
-/* strip ANSI sequences and CRs, expand tabs; returns malloc'd string.
- * Worst case is tab expansion (+3 bytes each); everything else shrinks. */
+/* strip ANSI sequences and CRs, expand tabs; returns arena-allocated
+ * string. Worst case is tab expansion (+3 bytes each). */
 static char *sanitize(const char *s, size_t n, size_t *outlen)
 {
 	size_t extra = 0;
 	for (size_t i = 0; i < n; i++)
 		if (s[i] == '\t')
 			extra += 3;
-	char *o = xrealloc(NULL, n + extra + 1);
+	char *o = arena_alloc(n + extra + 1);
 	size_t j = 0;
 	for (size_t i = 0; i < n; i++) {
 		unsigned char c = (unsigned char)s[i];
@@ -372,6 +410,58 @@ static void flush_pending(void)
 	push_line(clean, len);
 	plen = 0;
 	flushed_partial = 1;
+}
+
+/* scan newly visible mapping range into lines; a trailing partial line
+ * goes back through pend so streaming/follow continue seamlessly */
+static void drain_map(void)
+{
+	size_t start = fmap_pos;
+	for (size_t i = start; i < fmap_len; i++) {
+		if (fmap[i] != '\n')
+			continue;
+		const char *s = fmap + start;
+		size_t n = i - start;
+		size_t j;
+		for (j = 0; j < n; j++) {
+			unsigned char c = (unsigned char)s[j];
+			if (c == '\t' || c == '\r' || c == 0x1b)
+				break;
+		}
+		if (j < n) {	/* needs rewriting: arena copy */
+			size_t len;
+			char *clean = sanitize(s, n, &len);
+			push_line(clean, len);
+		} else {
+			push_line(s, n);
+		}
+		start = i + 1;
+	}
+	fmap_pos = start;
+	if (start < fmap_len)
+		feed(fmap + start, fmap_len - start);
+}
+
+/* non-blocking drain of piped stdin; latches EOF so closed pipes
+ * settle into ordinary one-shot input. Returns 1 if lines were added. */
+static int append_stdin(void)
+{
+	size_t old = nlines;
+	for (;;) {
+		char buf[65536];
+		ssize_t g = read(STDIN_FILENO, buf, sizeof buf);
+		if (g > 0) {
+			feed(buf, (size_t)g);
+			continue;
+		}
+		if (g < 0 && errno == EINTR)
+			continue;
+		stdin_eof = g == 0 || errno != EAGAIN;
+		break;
+	}
+	if (stdin_eof)
+		flush_pending();
+	return nlines != old;
 }
 
 /* per-service pastels, assigned by rotation in order of first appearance
@@ -503,8 +593,12 @@ static void assign_service(Line *L)
 
 static void reset_lines(void)
 {
-	for (size_t i = 0; i < nlines; i++)
-		free(lines[i].s);
+	arena_reset();
+	if (fmap) {
+		munmap(fmap, fmap_len);
+		fmap = NULL;
+		fmap_len = fmap_pos = 0;
+	}
 	nlines = 0;
 	plen = 0;
 	flushed_partial = 0;
@@ -525,7 +619,7 @@ static void read_available(int src)
 static void load_all(void)
 {
 	if (use_stdin) {
-		read_available(STDIN_FILENO);
+		append_stdin();
 		flush_pending();
 		return;
 	}
@@ -534,6 +628,18 @@ static void load_all(void)
 		if (fd < 0)
 			die_sys("cannot open %s", path);
 	}
+	struct stat st;
+	if (!fmap && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+	    st.st_size > 0) {
+		void *p = mmap(NULL, (size_t)st.st_size, PROT_READ,
+			       MAP_PRIVATE, fd, 0);
+		if (p != MAP_FAILED) {
+			fmap = p;
+			fmap_len = (size_t)st.st_size;
+			drain_map();
+		}
+	}
+	lseek(fd, (off_t)fmap_len, SEEK_SET);
 	read_available(fd);
 	flush_pending();
 	fsize = lseek(fd, 0, SEEK_CUR);
@@ -557,6 +663,17 @@ static int append_new(void)
 			return 0;
 		fsize = 0;
 		rotated = 1;
+		/* fresh inode: prefer a new zero-copy window over reading the
+		 * whole file through the pipe path */
+		if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+			void *p = mmap(NULL, (size_t)st.st_size, PROT_READ,
+				       MAP_PRIVATE, fd, 0);
+			if (p != MAP_FAILED) {
+				fmap = p;
+				fmap_len = (size_t)st.st_size;
+				drain_map();
+			}
+		}
 	}
 	off_t before = lseek(fd, 0, SEEK_CUR);
 	read_available(fd);
@@ -650,15 +767,104 @@ static void ensure_visible(void)
 
 static void rebuild_view(void);
 
+/* Fast-path literal for the filter: glibc's per-regexec setup cost is
+ * fatal over millions of lines, so plain '^'?literal'$'? queries get a
+ * memchr prefilter first. Necessary condition only -- hits still go
+ * through regexec, misses are impossible. */
+static char lit_buf[64];
+static size_t lit_len;
+static int lit_anchored, lit_icase, lit_valid;
+
+static void lit_update(const char *q, int icase)
+{
+	lit_valid = 0;
+	lit_anchored = (*q == '^');
+	const char *p = q + lit_anchored;
+	size_t n = 0;
+	while (p[n] && p[n] != '$') {
+		if (strchr("\\^.[|()*+?{}", p[n]))
+			return;	/* anything regex-y: no hint */
+		n++;
+	}
+	if (p[n] != '$') {	/* must end exactly at the optional anchor */
+		if (p[n] != '\0')
+			return;
+	} else if (p[n + 1] != '\0') {
+		return;
+	}
+	if (n == 0 || n > sizeof lit_buf)
+		return;
+	memcpy(lit_buf, p, n);
+	lit_len = n;
+	lit_icase = icase;
+	lit_valid = 1;
+}
+
+static int line_has_lit(const char *s, size_t len)
+{
+	if (!lit_valid)
+		return 1;
+	if (lit_anchored)
+		return len >= lit_len &&
+		       !(lit_icase ? strncasecmp(s, lit_buf, lit_len)
+				   : memcmp(s, lit_buf, lit_len));
+	if (!lit_icase) {
+		const char *p = s, *end = s + len;
+		while ((p = memchr(p, lit_buf[0], (size_t)(end - p))) != NULL) {
+			if ((size_t)(end - p) >= lit_len &&
+			    !memcmp(p, lit_buf, lit_len))
+				return 1;
+			p++;
+		}
+		return 0;
+	}
+		/* icase: memchr either case of byte 0 (SIMD), verify fold */
+	char lo = (char)tolower((unsigned char)lit_buf[0]);
+	char hi = (char)toupper((unsigned char)lit_buf[0]);
+	const char *p = s, *end = s + len;
+	while (p < end) {
+		size_t rem = (size_t)(end - p);
+		const char *a = memchr(p, lo, rem);
+		const char *b = lo == hi ? NULL : memchr(p, hi, rem);
+		const char *hit = !a ? b : !b ? a : (a < b ? a : b);
+		if (!hit)
+			return 0;
+		if ((size_t)(end - hit) >= lit_len &&
+		    !strncasecmp(hit, lit_buf, lit_len))
+			return 1;
+		p = hit + 1;
+	}
+	return 0;
+}
+
+/* Narrow an extended query in place: appending chars can only shrink
+ * the match set, so survivors must already be in view[]. */
+static void refilter_narrow(void)
+{
+	size_t k = 0;
+	for (size_t i = 0; i < nv; i++) {
+		const Line *L = &lines[view[i]];
+		if (line_has_lit(L->s, L->len)) {
+			regmatch_t whole = { 0, (regoff_t)L->len };
+			if (regexec(&re, L->s, 1, &whole, REG_STARTEND) == 0)
+				view[k++] = view[i];
+		}
+	}
+	nv = k;
+}
+
 static void update_filter(const char *q)
 {
 	int was_filtered = filtered, clearing = !*q;
+	char prev[sizeof query];
+	snprintf(prev, sizeof prev, "%s", query);
 	msg[0] = 0;
 	if (clearing) {
 		if (filtered)
 			regfree(&re);
 		filtered = 0;
 		query[0] = 0;
+		lit_valid = 0;
 	} else {
 		int icase = 1;
 		for (const char *p = q; *p; p++)
@@ -676,9 +882,16 @@ static void update_filter(const char *q)
 			regfree(&re);
 		re = nr;
 		filtered = 1;
+		lit_update(q, icase);
 		snprintf(query, sizeof query, "%s", q);
 	}
-	rebuild_view();
+	/* query grew by appended chars: old matches are a superset */
+	size_t plen = strlen(prev);
+	if (was_filtered && !clearing && plen &&
+	    strlen(q) > plen && !memcmp(q, prev, plen))
+		refilter_narrow();
+	else
+		rebuild_view();
 	if (clearing && was_filtered && filter_anchor < nlines) {
 		/* return to the line selected before filtering began; view[]
 		 * is sorted, so the line is a binary search away. If it left
@@ -708,7 +921,11 @@ static void update_filter(const char *q)
 static void extend_view(size_t from)
 {
 	for (size_t i = from; i < nlines; i++) {
-		if (!filtered || regexec(&re, lines[i].s, 0, NULL, 0) == 0)
+		if (filtered && !line_has_lit(lines[i].s, lines[i].len))
+			continue;
+		regmatch_t whole = { 0, (regoff_t)lines[i].len };
+		if (!filtered ||
+		    regexec(&re, lines[i].s, 1, &whole, REG_STARTEND) == 0)
 			push_view(i);
 	}
 }
@@ -793,11 +1010,21 @@ static unsigned u8_decode(const char *s, size_t rem, size_t *cl)
 /* display width in terminal cells */
 static size_t str_cols(const char *s, size_t n)
 {
-	size_t w = 0;
-	for (size_t i = 0; i < n; ) {
-		size_t cl;
-		w += (size_t)glyph_width(u8_decode(s + i, n - i, &cl));
-		i += cl;
+	size_t w = 0, i = 0;
+	while (i < n) {
+		if ((unsigned char)s[i] < 0x80) {
+			/* run of plain ASCII: one cell per byte; this is
+			 * ~all of most logs, so skip UTF-8 decoding */
+			size_t j = i;
+			while (j < n && (unsigned char)s[j] < 0x80)
+				j++;
+			w += j - i;
+			i = j;
+		} else {
+			size_t cl;
+			w += (size_t)glyph_width(u8_decode(s + i, n - i, &cl));
+			i += cl;
+		}
 	}
 	return w;
 }
@@ -820,7 +1047,19 @@ static size_t line_rows(Line *L)
 }
 
 
-static const char *severity(const char *s)
+/* case-insensitive find of needle within s[0..n), no NUL needed */
+static const char *case_find(const char *s, size_t n, const char *needle)
+{
+	size_t m = strlen(needle);
+	if (m == 0 || n < m)
+		return NULL;
+	for (size_t i = 0; i + m <= n; i++)
+		if (!strncasecmp(s + i, needle, m))
+			return s + i;
+	return NULL;
+}
+
+static const char *severity(const char *s, size_t n)
 {
 	static const char *sev[][2] = {
 		{ "fatal", "\x1b[1;95m" }, { "panic", "\x1b[1;95m" },
@@ -837,7 +1076,7 @@ static const char *severity(const char *s)
 		return "";
 	for (int i = 0; sev[i][0]; i++) {
 		const char *p = s;
-		while ((p = strcasestr(p, sev[i][0])) != NULL) {
+		while ((p = case_find(p, (size_t)(s + n - p), sev[i][0])) != NULL) {
 			if (p == s || (!isalnum((unsigned char)p[-1]) &&
 				      p[-1] != '-' && p[-1] != '/'))
 				return sev[i][1];
@@ -993,11 +1232,13 @@ static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 {
 	Line *L = &lines[idx];
 	if (!L->sev)
-		L->sev = severity(L->s);	/* scan once, lines are immutable */
+		L->sev = severity(L->s, L->len);	/* scan once, lines are immutable */
 	const char *col = L->sev;
 	regmatch_t m;
 	int ms = -1, me = -1;
-	if (filtered && regexec(&re, L->s, 1, &m, 0) == 0) {
+	m.rm_so = 0;
+	m.rm_eo = (regoff_t)L->len;	/* REG_STARTEND: no NUL needed */
+	if (filtered && regexec(&re, L->s, 1, &m, REG_STARTEND) == 0) {
 		ms = (int)m.rm_so;
 		me = (int)m.rm_eo;
 	}
@@ -1293,14 +1534,21 @@ static int has_prog(const char *prog)
 
 static void clip_helper(const char *s, size_t len)
 {
-	static const char *const cands[][5] = {
-		{ "xclip", "-selection", "clipboard", "-in", NULL },
-		{ "wl-copy", NULL },
-		{ "pbcopy", NULL },
-		{ "termux-clipboard-set", NULL },
+	static const struct {
+		const char *argv[5];
+		int wl, x11;	/* required session: WAYLAND_DISPLAY / DISPLAY */
+	} cands[] = {
+		{ { "wl-copy", NULL },					1, 0 },
+		{ { "xclip", "-selection", "clipboard", "-in", NULL },	0, 1 },
+		{ { "pbcopy", NULL },					0, 0 },
+		{ { "termux-clipboard-set", NULL },			0, 0 },
 	};
+	int wl = getenv("WAYLAND_DISPLAY") != NULL;
+	int x11 = getenv("DISPLAY") != NULL;
 	for (size_t i = 0; i < sizeof cands / sizeof cands[0]; i++) {
-		if (!has_prog(cands[i][0]))
+		if ((cands[i].wl && !wl) || (cands[i].x11 && !x11))
+			continue;
+		if (!has_prog(cands[i].argv[0]))
 			continue;
 		int pp[2];
 		if (pipe(pp) < 0)
@@ -1319,7 +1567,7 @@ static void clip_helper(const char *s, size_t len)
 			}
 			dup2(pp[0], STDIN_FILENO);
 			close(pp[0]); close(pp[1]);
-			execvp(cands[i][0], (char *const *)cands[i]);
+			execvp(cands[i].argv[0], (char *const *)cands[i].argv);
 			_exit(127);
 		}
 		close(pp[0]);
@@ -1614,12 +1862,23 @@ int main(int argc, char **argv)
 		nocolor = 1;
 	mark_bg = nocolor ? "\x1b[7m" : MARK_BG;
 
+	if (use_stdin)
+		fcntl(STDIN_FILENO, F_SETFL,
+		      fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK);
+
 	signal(SIGPIPE, SIG_IGN);
 	signal(SIGCHLD, SIG_IGN);	/* auto-reap; wl-copy must outlive us */
 	signal(SIGWINCH, on_winch);
 	signal(SIGTERM, on_sigexit);
 	signal(SIGHUP, on_sigexit);
 	signal(SIGINT, on_sigexit);
+	/* A privileged feeder (doas/sudo dmesg -w | comb) prompts for its
+	 * password on this very tty; stay in cooked mode until the pipe
+	 * produces its first byte or closes, so the prompt works. */
+	if (use_stdin) {
+		struct pollfd pw = { .fd = STDIN_FILENO, .events = POLLIN };
+		poll(&pw, 1, -1);
+	}
 	tty_enter();
 
 	load_all();
@@ -1629,9 +1888,6 @@ int main(int argc, char **argv)
 		rebuild_view();
 	cur = nv ? nv - 1 : 0;
 	ensure_visible();
-
-	if (use_stdin)
-		follow = 0;
 
 	int key;
 	while (running) {
@@ -1664,18 +1920,43 @@ int main(int argc, char **argv)
 				ensure_visible();
 				dirty = 1;
 			}
+		} else if (follow && use_stdin && !stdin_eof) {
+			struct pollfd ps = { .fd = STDIN_FILENO, .events = POLLIN };
+			if (poll(&ps, 1, 0) > 0) {
+				int stick = nv > 0 && cur >= nv - 1;
+				size_t old = nlines;
+				if (append_stdin()) {
+					extend_view(old);
+					if (stick)
+						cur = nv ? nv - 1 : 0;
+					ensure_visible();
+					dirty = 1;
+				}
+			}
 		}
 
-		struct pollfd p = { .fd = kfd, .events = POLLIN };
-		/* Paint when no keystroke is already waiting; if input is
-		 * queued (key repeat), keep draining and coalesce the repaint. */
-		if (!dirty) {
-			if (!key_pending() && poll(&p, 1, 200) <= 0)
-				continue;
-		} else if (!key_pending() && poll(&p, 1, 0) <= 0) {
+		/* paint pending changes before waiting; skipped while
+		 * keystrokes are queued so key repeats coalesce */
+		if (dirty && !key_pending()) {
 			render();
 			dirty = 0;
-			continue;
+		}
+
+		if (!key_pending()) {
+			struct pollfd pp[2];
+			pp[0].fd = kfd;
+			pp[0].events = POLLIN;
+			int np = 1;
+			if (follow && use_stdin && !stdin_eof) {
+				pp[1].fd = STDIN_FILENO;
+				pp[1].events = POLLIN;
+				np = 2;
+			}
+			poll(pp, np, 200);
+			/* woke for data (or timed out): lap around; woke for
+			 * a key: fall through and read it */
+			if (!(pp[0].revents & POLLIN))
+				continue;
 		}
 
 		key = read_key();
@@ -1736,11 +2017,11 @@ int main(int argc, char **argv)
 		case A_PGDOWN:
 			cur += (size_t)(rows > 2 ? rows - 2 : 1);
 			break;
-		case A_PGUP:
-			cur -= (size_t)(rows > 2 ? rows - 2 : 1);
-			if (cur > nv)
-				cur = 0;
+		case A_PGUP: {
+			size_t step = (size_t)(rows > 2 ? rows - 2 : 1);
+			cur = cur > step ? cur - step : 0;
 			break;
+		}
 		case A_TOP:
 			cur = 0;
 			break;
@@ -1865,5 +2146,12 @@ int main(int argc, char **argv)
 	}
 
 	restore_terminal();
+	/* a live feeder would outlive us and keep the pipeline (and the
+	 * shell waiting on it) alive; take down the job's group like
+	 * Ctrl-C would. Best effort: root-owned feeders ignore it. */
+	if (use_stdin && !stdin_eof) {
+		tio_saved = 0;	/* on_sigexit must not repaint the leave sequence */
+		kill(0, SIGINT);
+	}
 	return 0;
 }
