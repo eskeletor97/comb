@@ -30,7 +30,8 @@ A small terminal log viewer in plain C (libc only, no ncurses).
 
 ## Tests
 
-    python3 tests/harness.py --check            # behavior assertions
+    make check                                  # selftests + behavior assertions
+    python3 tests/harness.py --check ./comb     # end-to-end assertions (pty)
     python3 tests/harness.py --compare OLD NEW  # byte-diff two builds
 
 ## Usage

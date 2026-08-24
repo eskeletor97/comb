@@ -2,6 +2,7 @@
  * build: cc -O2 -Wall -Wextra -o comb comb.c
  */
 #define _GNU_SOURCE
+#include "config.h"
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -20,14 +21,6 @@
 #include <termios.h>
 #include <stddef.h>
 #include <unistd.h>
-
-#define MAX_QUERY 256
-#define MARK_BG "\x1b[48;5;238m"
-#define TTY_ENTER "\x1b[?1049h\x1b[?25l\x1b[2J"
-#define TTY_LEAVE "\x1b[0m\x1b[?25h\x1b[?1049l"
-#define VAL_COLOR "\x1b[38;5;223m"	/* quoted values */
-#define PAREN_COLOR "\x1b[38;5;115m"	/* (...) context */
-#define DIM "\x1b[2m"
 
 typedef struct {
 	const char *s;
@@ -83,82 +76,6 @@ static int mdir = -1;	/* space/x sweep direction: -1 up, 1 down */
 
 static void assign_service(Line *L);
 static size_t str_cols(const char *s, size_t n);
-
-enum {
-	K_NONE = 0x100, K_EOF, K_UP, K_DOWN, K_LEFT, K_RIGHT,
-	K_PGUP, K_PGDN, K_HOME, K_END, K_DEL
-};
-
-/*
- * Key bindings -- edit to taste; usage()'s keys section is generated
- * from this table. Keys are whatever read_key() returns: plain
- * characters, CTL() control codes, or the K_* specials. The filter
- * prompt keeps its own fixed editing keys (type/insert at an arrows-
- * moved cursor, Home/End, Backspace/Delete, Ctrl-a/e/u, Ctrl-r for
- * regex mode, Enter, Esc); Up/Down/PgUp/PgDn scroll the view instead.
- */
-#define CTL(x)	((x) & 0x1f)
-enum {
-	A_NONE, A_QUIT, A_REPAINT,
-	A_DOWN, A_UP, A_PGDOWN, A_PGUP, A_TOP, A_BOT,
-	A_LEFT, A_RIGHT, A_HSTART, A_HEND,
-	A_FILTER, A_CLEAR_FILTER, A_CANCEL,
-	A_MARK, A_UNMARK, A_COPY,
-	A_FOLLOW, A_RELOAD, A_WRAP, A_STOP,
-};
-
-static const struct { int key; int act; } keymap[] = {
-	{ 'q',	      A_QUIT },
-	{ CTL('c'),   A_QUIT },
-
-	/* vertical movement; sets the space/x sweep direction */
-	{ 'j',	      A_DOWN },
-	{ 'e',	      A_DOWN },
-	{ '\r',	      A_DOWN },
-	{ '\n',	      A_DOWN },
-	{ K_DOWN,	     A_DOWN },
-	{ 'k',	      A_UP },
-	{ K_UP,	   A_UP },
-	{ 'd',	      A_PGDOWN },
-	{ CTL('d'),   A_PGDOWN },
-	{ K_PGDN,	     A_PGDOWN },
-	{ CTL('f'),   A_PGDOWN },
-	{ 'u',	      A_PGUP },
-	{ CTL('u'),   A_PGUP },
-	{ K_PGUP,	     A_PGUP },
-	{ 'b',	      A_PGUP },
-	{ CTL('b'),   A_PGUP },
-	{ 'g',	      A_TOP },
-	{ K_HOME,	     A_TOP },
-	{ 'G',	      A_BOT },
-	{ K_END,	   A_BOT },
-
-	/* horizontal movement */
-	{ 'h',	      A_LEFT },
-	{ K_LEFT,	     A_LEFT },
-	{ 'l',	      A_RIGHT },
-	{ K_RIGHT,	    A_RIGHT },
-	{ '0',	      A_HSTART },
-	{ '^',	      A_HSTART },
-	{ '$',	      A_HEND },
-
-	/* filter / marks / clipboard */
-	{ '/',	      A_FILTER },
-	{ '?',	      A_CLEAR_FILTER },
-	{ 0x1b,	     A_CANCEL },	/* clears marks first, else the filter */
-	{ ' ',	      A_MARK },
-	{ 'x',	      A_UNMARK },
-	{ 'c',	      A_COPY },
-	{ 'y',	      A_COPY },
-
-	{ CTL('z'),   A_STOP },
-
-	/* toggles */
-	{ 'f',	      A_FOLLOW },
-	{ 'w',	      A_WRAP },
-	{ 'r',	      A_RELOAD },
-	{ CTL('l'),   A_REPAINT },
-};
 
 static int key_action(int key)
 {
@@ -315,19 +232,15 @@ static void push_line(const char *clean, size_t len)
 		lcap = lcap ? lcap * 2 : 1024;
 		lines = xrealloc(lines, lcap * sizeof(*lines));
 	}
-	lines[nlines].s = clean;
-	lines[nlines].len = len;
-	lines[nlines].marked = 0;
-	lines[nlines].wcols = 0;
-	lines[nlines].sev = NULL;
-	assign_service(&lines[nlines]);
-	{
-		Line *L = &lines[nlines];
-		size_t w = str_cols(L->s, L->len);
-		L->wcols = w;	/* cache; draw time would recompute anyway */
-		if (w > widest)
-			widest = w;
-	}
+	Line *L = &lines[nlines];
+	L->s = clean;
+	L->len = len;
+	L->marked = 0;
+	L->sev = NULL;
+	L->wcols = str_cols(clean, len);	/* cache; draw time would recompute anyway */
+	if (L->wcols > widest)
+		widest = L->wcols;
+	assign_service(L);
 	nlines++;
 }
 
@@ -467,24 +380,6 @@ static int append_stdin(void)
 		flush_pending();
 	return nlines != old;
 }
-
-/* per-service pastels, assigned by rotation in order of first appearance
- * so neighboring services never share a color */
-static const char *const svc_palette[] = {
-	"\x1b[38;5;215m",	/* peach */
-	"\x1b[38;5;79m",	/* seafoam */
-	"\x1b[38;5;110m",	/* cornflower */
-	"\x1b[38;5;146m",	/* lilac */
-	"\x1b[38;5;151m",	/* sage */
-	"\x1b[38;5;179m",	/* honey */
-	"\x1b[38;5;173m",	/* coral */
-	"\x1b[38;5;80m",	/* sky */
-	"\x1b[38;5;182m",	/* mauve */
-	"\x1b[38;5;144m",	/* sand */
-	"\x1b[38;5;115m",	/* celadon */
-	"\x1b[38;5;250m",	/* silver */
-};
-#define NSVC_COLORS (sizeof svc_palette / sizeof svc_palette[0])
 
 static struct {
 	const char *name;	/* points into a Line's buffer */
@@ -684,6 +579,25 @@ static int append_new(void)
 	off_t now = lseek(fd, 0, SEEK_CUR);
 	fsize = now;
 	return rotated ? 2 : (now != before);
+}
+
+/* one round of new data from the followed source: 0 = none,
+ * 1 = lines appended, 2 = rotation rebuilt all lines */
+static int pump_follow(void)
+{
+	if (use_stdin) {
+		struct pollfd ps = { .fd = STDIN_FILENO, .events = POLLIN };
+		return poll(&ps, 1, 0) > 0 ? append_stdin() : 0;
+	}
+	if (fd < 0) {
+		/* rotation race lost the file between stat and open;
+		 * retry until it reappears */
+		fd = open(path, O_RDONLY);
+		if (fd < 0)
+			return 0;
+		fsize = 0;
+	}
+	return append_new();
 }
 
 /* --- filtering --- */
@@ -907,9 +821,9 @@ static void update_filter(const char *q)
 		snprintf(query, sizeof query, "%s", q);
 	}
 	/* query grew by appended chars: old matches are a superset */
-	size_t plen = strlen(prev);
-	if (was_filtered && !clearing && plen &&
-	    strlen(q) > plen && !memcmp(q, prev, plen))
+	size_t prevlen = strlen(prev);
+	if (was_filtered && !clearing && prevlen &&
+	    strlen(q) > prevlen && !memcmp(q, prev, prevlen))
 		refilter_narrow();
 	else
 		rebuild_view();
@@ -1078,26 +992,18 @@ static const char *case_find(const char *s, size_t n, const char *needle)
 
 static const char *severity(const char *s, size_t n)
 {
-	static const char *sev[][2] = {
-		{ "fatal", "\x1b[1;95m" }, { "panic", "\x1b[1;95m" },
-		{ "emerg", "\x1b[1;95m" }, { "alert", "\x1b[1;95m" },
-		{ "crit",  "\x1b[1;95m" }, { "error", "\x1b[1;91m" },
-		{ "err",   "\x1b[1;91m" }, { "warn",  "\x1b[1;93m" },
-		{ "debug", "\x1b[2m" },    { "trace", "\x1b[2m" },
-		{ NULL, NULL }
-	};
 	/* a keyword counts only when the preceding byte isn't alnum, '-'
 	 * or '/': "--debug", "/var/debug", "terrain" stay plain;
 	 * "level=debug", "<warn>", "errors" still match */
 	if (nocolor)
 		return "";
-	for (int i = 0; sev[i][0]; i++) {
+	for (size_t i = 0; i < sizeof sev_palette / sizeof sev_palette[0]; i++) {
 		const char *p = s;
-		while ((p = case_find(p, (size_t)(s + n - p), sev[i][0])) != NULL) {
+		while ((p = case_find(p, (size_t)(s + n - p), sev_palette[i].w)) != NULL) {
 			if (p == s || (!isalnum((unsigned char)p[-1]) &&
-				      p[-1] != '-' && p[-1] != '/'))
-				return sev[i][1];
-			p += strlen(sev[i][0]);
+					      p[-1] != '-' && p[-1] != '/'))
+				return sev_palette[i].a;
+			p += strlen(sev_palette[i].w);
 		}
 	}
 	return "";
@@ -1133,23 +1039,16 @@ static void add_span(Span *sp, int *n, int so, int se, const char *attr)
  * already covered by the whole-line severity pass */
 static const char *token_attr(const char *s, size_t n)
 {
-	static const struct { const char *w; const char *a; } tok[] = {
-		{ "info",   "\x1b[38;5;110m" },	/* cornflower */
-		{ "notice", "\x1b[38;5;79m" },	/* seafoam */
-		{ "audit",  "\x1b[38;5;146m" },	/* lilac */
-	};
 	if (nocolor || n == 0)
 		return NULL;
-	for (size_t i = 0; i < sizeof tok / sizeof tok[0]; i++)
-		if (strlen(tok[i].w) == n && !strncasecmp(s, tok[i].w, n))
-			return tok[i].a;
+	for (size_t i = 0; i < sizeof token_palette / sizeof token_palette[0]; i++)
+		if (strlen(token_palette[i].w) == n &&
+		    !strncasecmp(s, token_palette[i].w, n))
+			return token_palette[i].a;
 	return NULL;
 }
 
-/* structural tinting for whatever shape the log has: dim the preamble
- * (timestamp/host) and epoch stamps, hue the verbosity token, accent
- * "quoted values" and (parenthesized) context. All guesses; no format
- * is required. */
+/* structural tinting for whatever shape the log has; format-less*/
 static int collect_spans(const Line *L, Span *sp)
 {
 	int n = 0;
@@ -1198,8 +1097,7 @@ static int collect_spans(const Line *L, Span *sp)
 		}
 	}
 
-	/* quoted values: "double" and 'single'. A single-quote may not hug
-	 * letters, so apostrophes (don't, cats') stay plain */
+	/* double and single quotes */
 	int q = 0;
 	for (size_t k = 0; k < L->len && q < 12; k++) {
 		char qc = s[k];
@@ -1216,7 +1114,7 @@ static int collect_spans(const Line *L, Span *sp)
 		if (qc == '\'' && j + 1 < L->len &&
 		    isalnum((unsigned char)s[j + 1]))
 			continue;
-		add_span(sp, &n, (int)k, (int)j + 1, VAL_COLOR);
+		add_span(sp, &n, (int)k, (int)j + 1, QUOTE_COLOR);
 		q++;
 		k = j;
 	}
@@ -1431,12 +1329,10 @@ static void draw_status_bar(void)
 	fputs("\x1b[0m", stdout);
 }
 
-/* command line, vim-style: the filter prompt while editing, transient
- * notices otherwise; reserved for future commands (:...) */
-/* transient notice (bad regex, mode flips, copy confirmations), drawn
- * right-aligned on the input bar row so it never hides behind prompt
- * content: pad from column curcol, then inverse video ending exactly at
- * the right edge. One renderer for both the editing and idle bars. */
+/* input bar: the vim-style filter prompt while editing, transient notices
+ * (bad regex, mode flips, copy confirmations) otherwise. The notice is
+ * right-aligned on this row so it never hides behind prompt content: pad
+ * from column curcol, then inverse video ending at the right edge. */
 static void notice(int curcol)
 {
 	if (!*msg)
@@ -1791,6 +1687,16 @@ static void move_down(void)
 		cur++;
 }
 
+static void page_down(void)
+{
+	cur += page_step();
+}
+
+static void page_up(void)
+{
+	cur = cur > page_step() ? cur - page_step() : 0;
+}
+
 static void apply_edit(void)
 {
 	edit[MAX_QUERY - 1] = 0;
@@ -1891,6 +1797,222 @@ static void usage(FILE *out)
 	print_keys(out);
 }
 
+/* filter prompt editing; Up/Down/PgUp/PgDn stay live to scroll the
+ * results -- terminal wheel scroll arrives as these keys too */
+static void edit_key(int key)
+{
+	size_t elen = strlen(edit);
+
+	switch (key) {
+	case 0x1b:	case '\r': case '\n':
+			editing = 0;
+			break;
+		case K_UP:
+			move_up();
+			break;
+		case K_DOWN:
+			move_down();
+			break;
+		case K_PGDN:
+			page_down();
+			break;
+		case K_PGUP:
+			page_up();
+			break;
+		case K_LEFT: case CTL('b'):
+			if (ecur > 0)
+				ecur = u8_prev(edit, ecur);
+			break;
+		case K_RIGHT: case CTL('f'):
+			if (ecur < elen)
+				ecur = u8_next(edit, ecur, elen);
+			break;
+		case K_HOME: case CTL('a'):
+			ecur = 0;
+			break;
+		case K_END: case CTL('e'):
+			ecur = elen;
+			break;
+		case K_DEL:
+			if (ecur < elen) {
+				size_t n = u8_next(edit, ecur, elen);
+				memmove(edit + ecur, edit + n, elen - n + 1);
+				apply_edit();
+			}
+			break;
+		case 0x7f: case CTL('h'):	/* backspace */
+			if (ecur > 0) {
+				size_t p = u8_prev(edit, ecur);
+				memmove(edit + p, edit + ecur, elen - ecur + 1);
+				ecur = p;
+				apply_edit();
+			}
+			break;
+		case CTL('u'):
+			edit[0] = 0;
+			ecur = 0;
+			apply_edit();
+			break;
+		case CTL('r'):	/* toggle literal/regex filter */
+			re_mode = !re_mode;
+			apply_edit();
+			if (!*msg)	/* bad-regex notice wins over the mode notice */
+				snprintf(msg, sizeof msg, re_mode ? "regex mode"
+							  : "literal mode");
+			break;
+		default:
+			if (key >= 32 && key < 256 && elen < MAX_QUERY - 1) {
+				/* multibyte chars arrive as separate bytes:
+				 * in-order insertion keeps them contiguous
+				 * behind the lead byte */
+				memmove(edit + ecur + 1, edit + ecur,
+					elen - ecur + 1);
+				edit[ecur++] = (char)key;
+				apply_edit();
+			}
+			break;
+	}
+}
+
+/* main-view key actions */
+static void view_action(int act)
+{
+	switch (act) {
+	case A_QUIT:
+		running = 0;
+		break;
+	case A_DOWN:
+		move_down();
+		break;
+	case A_UP:
+		move_up();
+		break;
+	case A_PGDOWN:
+		cur += page_step();
+		break;
+	case A_PGUP:
+		cur = cur > page_step() ? cur - page_step() : 0;
+		break;
+	case A_TOP:
+		cur = 0;
+		break;
+	case A_BOT:
+		cur = nv ? nv - 1 : 0;
+		break;
+	case A_LEFT:
+		hscroll -= 8;
+		if (hscroll < 0)
+			hscroll = 0;
+		break;
+	case A_RIGHT: {
+		size_t max = widest > (size_t)cols
+				   ? widest - (size_t)cols : 0;
+		if ((size_t)hscroll < max)
+			hscroll = (size_t)hscroll + 8 > max
+					  ? (int)max : hscroll + 8;
+		break;
+	}
+	case A_HSTART:
+		hscroll = 0;
+		break;
+	case A_HEND:
+		if (nv) {
+			Line *L = &lines[view[cur]];
+			size_t cw = line_cols(L);
+			hscroll = cw > (size_t)cols
+					  ? (int)(cw - (size_t)cols)
+					  : 0;
+		}
+		break;
+	case A_FILTER:
+		editing = 1;
+		filter_anchor = nv ? view[cur] : 0;
+		filter_row = cur - top;
+		snprintf(edit, sizeof edit, "%s", query);
+		ecur = strlen(edit);
+		break;
+	case A_MARK:
+	case A_UNMARK: {
+		int want = (act == A_MARK);
+		if (nv) {
+			Line *L = &lines[view[cur]];
+			if ((int)L->marked != want) {
+				L->marked = (unsigned char)want;
+				nmarked += want ? 1 : -1;
+			}
+			if (mdir < 0) {
+				if (cur > 0)
+					cur--;
+			} else if (cur + 1 < nv) {
+				cur++;
+			}
+		}
+		break;
+	}
+	case A_CLEAR_FILTER:
+		if (filtered) {
+			edit[0] = 0;
+			update_filter("");
+		}
+		break;
+	case A_CANCEL:
+		if (nmarked) {
+			clear_marks();
+			snprintf(msg, sizeof msg, "marks cleared");
+		} else if (filtered) {
+			edit[0] = 0;
+			update_filter("");
+		}
+		break;
+	case A_WRAP:
+		wrap = !wrap;
+		snprintf(msg, sizeof msg, "wrap %s",
+			 wrap ? "on" : "off");
+		break;
+	case A_COPY:
+		copy_current();
+		break;
+	case A_FOLLOW:
+		follow = !follow;
+		if (!follow) {
+			flush_pending();	/* settle a final partial line */
+			rebuild_view();
+		}
+		snprintf(msg, sizeof msg, "follow %s",
+			 follow ? "on" : "off");
+		break;
+	case A_RELOAD:
+		if (!use_stdin) {
+			reset_lines();
+			if (fd >= 0)
+				close(fd);
+			fd = -1;
+			load_all();
+			rebuild_view();
+			cur = nv ? nv - 1 : 0;
+			ensure_visible();
+			snprintf(msg, sizeof msg, "reloaded");
+		}
+		break;
+	case A_STOP:
+		restore_terminal();
+		signal(SIGTSTP, SIG_DFL);	/* may be inherited as SIG_IGN */
+		/* stop the whole foreground group, like kernel ISIG would:
+		 * under doas/sudo our parent shares the pgrp, and until it
+		 * stops too the waiting shell never regains the prompt */
+		kill(0, SIGTSTP);
+		tty_enter();
+		tcflush(kfd, TCIFLUSH);	/* keys typed while suspended */
+		dirty = 1;
+		break;
+	case A_REPAINT:
+	default:
+		break;
+	}
+}
+
+#ifndef COMB_TEST
+/* tests/selftest.c includes this file and provides its own main() */
 int main(int argc, char **argv)
 {
 	const char *init_re = NULL;
@@ -1974,19 +2096,10 @@ int main(int argc, char **argv)
 			ensure_visible();
 			dirty = 1;
 		}
-		if (follow && !use_stdin) {
+		if (follow && !(use_stdin && stdin_eof)) {
 			int stick = nv > 0 && cur >= nv - 1;
 			size_t old = nlines;
-			if (fd < 0) {
-				/* rotation race lost the file between stat and
-				 * open; retry until it reappears */
-				fd = open(path, O_RDONLY);
-				if (fd >= 0)
-					fsize = 0;
-			}
-			if (fd < 0)
-				continue;
-			int got = append_new();
+			int got = pump_follow();
 			if (got == 2)
 				rebuild_view();	/* rotation: lines[] were rebuilt from scratch */
 			else if (got == 1)
@@ -1996,19 +2109,6 @@ int main(int argc, char **argv)
 					cur = nv ? nv - 1 : 0;
 				ensure_visible();
 				dirty = 1;
-			}
-		} else if (follow && use_stdin && !stdin_eof) {
-			struct pollfd ps = { .fd = STDIN_FILENO, .events = POLLIN };
-			if (poll(&ps, 1, 0) > 0) {
-				int stick = nv > 0 && cur >= nv - 1;
-				size_t old = nlines;
-				if (append_stdin()) {
-					extend_view(old);
-					if (stick)
-						cur = nv ? nv - 1 : 0;
-					ensure_visible();
-					dirty = 1;
-				}
 			}
 		}
 
@@ -2020,15 +2120,11 @@ int main(int argc, char **argv)
 		}
 
 		if (!key_pending()) {
-			struct pollfd pp[2];
-			pp[0].fd = kfd;
-			pp[0].events = POLLIN;
-			int np = 1;
-			if (follow && use_stdin && !stdin_eof) {
-				pp[1].fd = STDIN_FILENO;
-				pp[1].events = POLLIN;
-				np = 2;
-			}
+			struct pollfd pp[2] = {
+				{ .fd = kfd,	.events = POLLIN },
+				{ .fd = STDIN_FILENO,	.events = POLLIN },
+			};
+			int np = follow && use_stdin && !stdin_eof ? 2 : 1;
 			poll(pp, np, 200);
 			/* woke for data (or timed out): lap around; woke for
 			 * a key: fall through and read it */
@@ -2041,232 +2137,10 @@ int main(int argc, char **argv)
 			break;
 		msg[0] = 0;
 
-		if (editing) {
-			size_t elen = strlen(edit);
-			switch (key) {
-			case 0x1b:
-				editing = 0;
-				break;
-			case '\r': case '\n':
-				editing = 0;
-				break;
-			case K_UP:
-			case K_DOWN:
-			case K_PGUP:
-			case K_PGDN: {
-				/* scroll the live results without leaving the
-				 * prompt; terminal wheel scroll arrives as
-				 * these keys too */
-				if (key == K_UP)
-					move_up();
-				else if (key == K_DOWN)
-					move_down();
-				else if (key == K_PGDN)
-					cur += page_step();
-				else
-					cur = cur > page_step() ?
-					      cur - page_step() : 0;
-				break;
-			}
-			case K_LEFT: case CTL('b'):
-				if (ecur > 0)
-					ecur = u8_prev(edit, ecur);
-				break;
-			case K_RIGHT: case CTL('f'):
-				if (ecur < elen)
-					ecur = u8_next(edit, ecur, elen);
-				break;
-			case K_HOME: case CTL('a'):
-				ecur = 0;
-				break;
-			case K_END: case CTL('e'):
-				ecur = elen;
-				break;
-			case K_DEL:
-				if (ecur < elen) {
-					size_t n = u8_next(edit, ecur, elen);
-					memmove(edit + ecur, edit + n,
-						elen - n + 1);
-					apply_edit();
-				}
-				break;
-			case 127: case 8:
-				if (ecur > 0) {
-					size_t p = u8_prev(edit, ecur);
-					memmove(edit + p, edit + ecur,
-						elen - ecur + 1);
-					ecur = p;
-					apply_edit();
-				}
-				break;
-			case 21: /* ctrl-u */
-				edit[0] = 0;
-				ecur = 0;
-				apply_edit();
-				break;
-			case 18: /* ctrl-r: toggle literal/regex filter */
-				re_mode = !re_mode;
-				apply_edit();
-				if (!*msg)	/* bad-regex notice wins over the mode notice */
-					snprintf(msg, sizeof msg, re_mode ? "regex mode"
-									  : "literal mode");
-				break;
-			default:
-				if (key >= 32 && key < 256 && key != 127 &&
-				    elen < MAX_QUERY - 1) {
-					/* multibyte chars arrive as separate
-					 * bytes: in-order insertion keeps them
-					 * contiguous behind the lead byte */
-					memmove(edit + ecur + 1, edit + ecur,
-						elen - ecur + 1);
-					edit[ecur++] = (char)key;
-					apply_edit();
-				}
-				break;
-			}
-			ensure_visible();	/* nav keys above, and narrowing
-						 * queries, both move cur */
-			dirty = 1;
-			continue;
-		}
-
-		int act = key_action(key);
-		switch (act) {
-		case A_QUIT:
-			running = 0;
-			break;
-		case A_DOWN:
-			move_down();
-			break;
-		case A_UP:
-			move_up();
-			break;
-		case A_PGDOWN:
-			cur += page_step();
-			break;
-		case A_PGUP:
-			cur = cur > page_step() ? cur - page_step() : 0;
-			break;
-		case A_TOP:
-			cur = 0;
-			break;
-		case A_BOT:
-			cur = nv ? nv - 1 : 0;
-			break;
-		case A_LEFT:
-			hscroll -= 8;
-			if (hscroll < 0)
-				hscroll = 0;
-			break;
-		case A_RIGHT: {
-			/* stop where content stops: past the widest line is
-			 * blankness that only looks like more log */
-			size_t max = widest > (size_t)cols
-					   ? widest - (size_t)cols : 0;
-			if ((size_t)hscroll < max)
-				hscroll = (size_t)hscroll + 8 > max
-						  ? (int)max : hscroll + 8;
-			break;
-		}
-		case A_HSTART:
-			hscroll = 0;
-			break;
-		case A_HEND:
-			if (nv) {
-				Line *L = &lines[view[cur]];
-				size_t cw = line_cols(L);
-				hscroll = cw > (size_t)cols
-						  ? (int)(cw - (size_t)cols)
-						  : 0;
-			}
-			break;
-		case A_FILTER:
-			editing = 1;
-			filter_anchor = nv ? view[cur] : 0;
-			filter_row = cur - top;
-			snprintf(edit, sizeof edit, "%s", query);
-			ecur = strlen(edit);
-			break;
-		case A_MARK:
-		case A_UNMARK: {
-			int want = (act == A_MARK);
-			if (nv) {
-				Line *L = &lines[view[cur]];
-				if ((int)L->marked != want) {
-					L->marked = (unsigned char)want;
-					nmarked += want ? 1 : -1;
-				}
-				if (mdir < 0) {
-					if (cur > 0)
-						cur--;
-				} else if (cur + 1 < nv) {
-					cur++;
-				}
-			}
-			break;
-		}
-		case A_CLEAR_FILTER:
-			if (filtered) {
-				edit[0] = 0;
-				update_filter("");
-			}
-			break;
-		case A_CANCEL:
-			if (nmarked) {
-				clear_marks();
-				snprintf(msg, sizeof msg, "marks cleared");
-			} else if (filtered) {
-				edit[0] = 0;
-				update_filter("");
-			}
-			break;
-		case A_WRAP:
-			wrap = !wrap;
-			snprintf(msg, sizeof msg, "wrap %s",
-				 wrap ? "on" : "off");
-			break;
-		case A_COPY:
-			copy_current();
-			break;
-		case A_FOLLOW:
-			follow = !follow;
-			if (!follow) {
-				flush_pending();	/* settle a final partial line */
-				rebuild_view();
-			}
-			snprintf(msg, sizeof msg, "follow %s",
-				 follow ? "on" : "off");
-			break;
-		case A_RELOAD:
-			if (!use_stdin) {
-				reset_lines();
-				if (fd >= 0)
-					close(fd);
-				fd = -1;
-				load_all();
-				rebuild_view();
-				cur = nv ? nv - 1 : 0;
-				ensure_visible();
-				snprintf(msg, sizeof msg, "reloaded");
-			}
-			break;
-		case A_STOP:
-			/* hand the tty back for the shell's job control; on
-			 * continue, pick up exactly where we left off */
-			restore_terminal();
-			signal(SIGTSTP, SIG_DFL);	/* may be inherited as SIG_IGN */
-			/* stop the whole foreground group, like kernel ISIG would:
-			 * under doas/sudo our parent shares the pgrp, and until it
-			 * stops too the waiting shell never regains the prompt */
-			kill(0, SIGTSTP);
-			tty_enter();
-			tcflush(kfd, TCIFLUSH);	/* keys typed while suspended */
-			dirty = 1;
-			break;
-		case A_REPAINT:
-		default:
-			break;
-		}
+		if (editing)
+			edit_key(key);
+		else
+			view_action(key_action(key));
 		ensure_visible();
 		dirty = 1;
 	}
@@ -2281,3 +2155,4 @@ int main(int argc, char **argv)
 	}
 	return 0;
 }
+#endif /* COMB_TEST */

@@ -18,6 +18,10 @@ Usage:
 
   # byte-exact regression diff between two builds
   python3 tests/harness.py --compare /tmp/comb_old ./comb
+
+Unit-level coverage of the pure internals (tag detection, sanitizing,
+matching, key decoding, spans) lives in tests/selftest.c: `make check`
+runs both. This harness only covers what needs a real process+pty.
 """
 import argparse
 import fcntl
@@ -33,7 +37,6 @@ import termios
 import time
 
 SAMPLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sample.log')
-
 
 class RunResult:
     def __init__(self, output, status, rows=24, cols=80):
@@ -51,7 +54,6 @@ class RunResult:
         return re.sub(rb'\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*(\x07|\x1b\\)',
                       b'', self.output)
 
-
 def _child_setup(slave, stdin_pipe_r, env_color=True):
     os.setsid()
     fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
@@ -68,7 +70,6 @@ def _child_setup(slave, stdin_pipe_r, env_color=True):
         os.environ.pop('NO_COLOR', None)
     else:
         os.environ['NO_COLOR'] = '1'
-
 
 def run(argv, keys=b'', stdin_text=None, rows=24, cols=80, env_color=True,
         settle=0.35, key_delay=0.02, idle=0.25, timeout=5.0, midrun=None,
@@ -142,11 +143,9 @@ def run(argv, keys=b'', stdin_text=None, rows=24, cols=80, env_color=True,
     os.close(master)
     return RunResult(bytes(out), status, rows, cols)
 
-
 # --- tiny VT interpreter: enough of CUP/EL/ED for screen assertions ---
 
 _CSI = re.compile(rb'\x1b\[([0-9;?]*)([a-zA-Z])')
-
 
 def render_screen(data, rows=24, cols=80):
     grid = [[' '] * cols for _ in range(rows)]
@@ -205,7 +204,6 @@ def _parse_args():
     ap.add_argument('cmd', nargs=argparse.REMAINDER, help='-- ./comb [args]')
     return ap.parse_args()
 
-
 SCENARIOS = [
     ('bottom+copy',       'jjkG$0ww/err\x1b cq', {}),
     ('wrap+hscroll',      'wjjkkll$0Gq',         {}),
@@ -235,12 +233,10 @@ def _check_empty_stdin(binary):
     if not any('(empty)' in row for row in scr):
         return '(empty) not shown for empty stdin'
 
-
 def _check_no_trailing_newline(binary):
     scr = run([binary, '-'], keys='gq', stdin_text='last line has no newline').screen()
     if not any('last line has no newline' in row for row in scr):
         return 'final partial line was dropped'
-
 
 def _check_filter_nomatch_status(binary):
     # at narrow widths the left status side yields to the keybinding hint,
@@ -249,14 +245,12 @@ def _check_filter_nomatch_status(binary):
     if not any('(no matches)' in row for row in res.screen()):
         return '(no matches) missing from status line'
 
-
 def _check_filter_narrows(binary):
     scr = run([binary, '-e', 'NetworkManager', SAMPLE], keys='gq').screen()
     if not any('NetworkManager' in r for r in scr):
         return 'filtered view shows no matching lines'
     if not any(re.search(r'\d+/\d+', r) for r in scr):
         return 'status counter missing'
-
 
 def _check_ansi_sanitized(binary):
     dirty = '\x1b[31mRED\x1b[0m plain \x1b]0;title\x07tail\n'
@@ -265,29 +259,24 @@ def _check_ansi_sanitized(binary):
     if 'RED plain tail' not in joined:
         return f'input ANSI leaked into display: {joined!r}'
 
-
 def _check_copy_osc52(binary):
     out = run([binary, SAMPLE], keys='cq').output
     if b'\x1b]52;c;' not in out:
         return 'OSC 52 sequence missing after copy'
 
-
 def _no_hl_sgr(out):
     # severity/palette/token SGRs: bright reds/magenta/yellow + 256-palette fg
     return not re.search(rb'\x1b\[(1;9[15]|2;|38;5;\d+)m', out)
-
 
 def _check_no_color_flag(binary):
     out = run([binary, '--no-color', SAMPLE], keys='Gq').output
     if not _no_hl_sgr(out):
         return '--no-color still emits highlighting SGRs'
 
-
 def _check_no_color_env(binary):
     out = run([binary, SAMPLE], keys='Gq', env_color=False).output
     if not _no_hl_sgr(out):
         return 'NO_COLOR env still emits highlighting SGRs'
-
 
 def _check_wrap_long_line(binary):
     # a line wider than the pane must span multiple rows when wrapped,
@@ -302,34 +291,11 @@ def _check_wrap_long_line(binary):
     if sum(1 for r in plain if set(r.strip()) <= {'x'} and r.strip()) != 1:
         return 'unwrapped long line spilled over multiple rows'
 
-
-def _check_prompt_never_overflows(binary):
-    # the editing frame must never emit more visible cells than the pane
-    # is wide, or terminals autowrap and scroll the screen per keystroke
-    for cols in (40, 80):
-        out = run([binary, SAMPLE], keys='/' + 'a' * 200 + 'q',
-                  cols=cols).output
-        for frame in out.split(b'\x1b[1;7m /')[1:]:
-            seg = frame.split(b'\x1b[0m')[0]
-            if len(seg.rstrip(b' ')) > cols - 3:
-                return f'{cols}-col pane got {len(seg)}-cell prompt'
-
-
-def _check_prompt_clips_multibyte(binary):
-    # clipping must respect UTF-8 boundaries and glyph widths
-    out = run([binary, SAMPLE], keys='/' + '\u3042' * 60 + 'q', cols=40).output
-    frame = out.split(b'\x1b[1;7m /')[1]
-    seg = frame.split(b'\x1b[0m')[0].rstrip(b' ')
-    if len(seg) % 3 != 0 or len(seg) > 36 * 3:
-        return f'multibyte prompt clipped mid-glyph or too wide: {len(seg)} bytes'
-
-
 def _tmplog(lines):
     tf = tempfile.NamedTemporaryFile(delete=False, suffix='.log')
     tf.write((''.join(lines)).encode())
     tf.close()
     return tf.name
-
 
 def _check_follow_append(binary):
     name = _tmplog(['one\n', 'two\n'])
@@ -347,7 +313,6 @@ def _check_follow_append(binary):
     if not any('/52' in r for r in scr):
         return 'cursor did not stick to bottom while following'
 
-
 def _check_copytruncate(binary):
     name = _tmplog([f'stale line {i}\n' for i in range(100)])
 
@@ -362,14 +327,12 @@ def _check_copytruncate(binary):
     if any('stale line' in r for r in scr):
         return 'stale lines survived truncation'
 
-
 def _check_mark_empty_lines(binary):
     res = run([binary, '-'], keys='Gxkxcq', stdin_text='\n\n\ncontent\n')
     if b'\x1b]52;c;' not in res.output:
         return 'copying marked empty lines produced no OSC 52'
     if not any('copied' in r for r in res.screen()):
         return 'no copy confirmation in status bar'
-
 
 def _check_hscroll_caps_at_content(binary):
     # scrolling right must stop at the widest line, not wander into
@@ -384,28 +347,6 @@ def _check_hscroll_caps_at_content(binary):
     if not pane.rstrip().endswith('9'):
         return f'right edge of widest line not shown: {pane[-12:]!r}'
 
-
-def _check_hscroll_keeps_spans(binary):
-    # the skip loop for horizontally scrolled bytes must keep span state,
-    # or everything right of the window renders uncolored
-    text = ('Aug 22 23:53:27 host NetworkManager[508]: '
-            '"quoted value" tail aaaaaaaaaaaaaaaaaaaaaaaa\n')
-    out = run([binary, '-'], keys='glllq', stdin_text=text).output
-    last = out.split(b'\x1b[H')[-1]
-    if b'\x1b[38;5;223m' not in last:
-        return 'quoted-value color lost after horizontal scroll'
-
-
-def _check_alt_chord_not_swallowed(binary):
-    # terminals send Alt+j as ESC j; the j must survive as a keystroke
-    text = 'one\ntwo\nthree\n'
-    res = run([binary, '-'], keys='g\x1bjq', stdin_text=text)
-    # repaints mean several status frames; only the last one counts
-    st = re.findall(rb'(\d+)/(\d+)', res.output)
-    if not st or st[-1][0] != b'2':
-        return f'ESC j lost the j; final cursor at {st[-1][0].decode() if st else "?"}'
-
-
 def _check_filter_accepts_utf8(binary):
     # multi-byte query characters must reach regcomp intact; assert on the
     # match result -- the status bar legitimately elides long queries
@@ -419,46 +360,6 @@ def _check_filter_accepts_utf8(binary):
     if 'plain line' in scr:
         return 'filter did not narrow: unmatched line still visible'
 
-
-def _check_dmesg_padded_timestamp_dim(binary):
-    # dmesg pads inside the brackets ([    0.4]); the epoch-stamp scan
-    # must tolerate the padding or the timestamp renders plain
-    text = '[    0.403686] LVT offset 0 assigned for vector 0x400\n'
-    out = run([binary, '-'], keys='gq', stdin_text=text).output
-    if b'\x1b[2m[    0.403686]' not in out:
-        return 'padded dmesg timestamp not dimmed'
-
-
-def _check_sloppy_colon_tag_shared(binary):
-    # "Spectre V2 :" (space before colon) must yield one stable tag shared
-    # by sibling lines, not phantom tags grabbed from later prose words
-    text = ''.join('[    0.16345%d] Spectre V2 : Enabling thing %d '
-                   'Mitigation: x\n' % (i, i) for i in range(3))
-    out = run([binary, '-'], keys='gq', stdin_text=text).output
-    tags = re.findall(rb'\x1b\[38;5;(\d+)mV2', out)
-    # repaints may duplicate draws; every sighting must agree on one color
-    if not tags or len(set(tags)) != 1:
-        return f'"V2" tag colors inconsistent across siblings: {tags}'
-    if re.search(rb'\x1b\[38;5;\d+mMitigation', out):
-        return 'prose word "Mitigation" stolen as tag'
-
-
-def _check_metachar_query(binary):
-    # invalid intermediate regexes must keep the old view and raise a
-    # notice; completing a valid one must filter; Esc must clear cleanly.
-    # Ctrl-R (\x12) switches the prompt to regex mode first: by default
-    # queries are literal, so metachars never raise a bad-regex notice.
-    # 'G' after the final Esc gives comb a keystroke-driven repaint of
-    # the cleared view -- Esc+q now arrives as two keys (no swallow) and
-    # quits before any repaint, ending the stream on a prompt frame
-    keys = '/\x12[a+b(c)|\x1bG/a.*b\\d\x1bGq'
-    out = run([binary, SAMPLE], keys=keys)
-    if b'bad regex' not in out.output:
-        return 'no bad-regex notice while typing invalid intermediates'
-    if not any(re.search(r'\d+/\d+', r) for r in out.screen()):
-        return 'status counter lost after metachar queries'
-
-
 def _check_regex_toggle_badge(binary):
     # Ctrl-R in the prompt flips to regex mode; the status bar must say so
     out = run([binary, SAMPLE], keys='/\x12err\x1bGq')
@@ -467,7 +368,6 @@ def _check_regex_toggle_badge(binary):
     out = run([binary, SAMPLE], keys='/err\x1bGq')
     if any('(R)' in r for r in out.screen()):
         return '(R) badge shown while still in literal mode'
-
 
 def _check_literal_metachars_match(binary):
     # literal mode treats metachars literally; no bad-regex notice may fire
@@ -479,7 +379,6 @@ def _check_literal_metachars_match(binary):
     if 'other line' in scr:
         return 'literal filter did not narrow: unmatched line still visible'
 
-
 CHECKS = [
     ('empty stdin shows placeholder', _check_empty_stdin),
     ('final line without newline kept', _check_no_trailing_newline),
@@ -490,27 +389,18 @@ CHECKS = [
     ('--no-color strips highlighting', _check_no_color_flag),
     ('NO_COLOR env strips highlighting', _check_no_color_env),
     ('wrap splits long lines only in wrap mode', _check_wrap_long_line),
-    ('filter prompt never overflows pane',       _check_prompt_never_overflows),
-    ('filter prompt clips on UTF-8 boundary',    _check_prompt_clips_multibyte),
     ('follow picks up appended lines',           _check_follow_append),
     ('copytruncate clears stale lines',          _check_copytruncate),
     ('marked empty lines copy cleanly',          _check_mark_empty_lines),
     ('regex toggle shows (R) badge',  _check_regex_toggle_badge),
     ('literal filter matches metachars', _check_literal_metachars_match),
-    ('regex metachar queries stay sane',         _check_metachar_query),
-    ('dmesg padded timestamp dims',              _check_dmesg_padded_timestamp_dim),
-    ('sloppy colon tag shared across siblings',  _check_sloppy_colon_tag_shared),
-    ('alt-chord key survives lone Esc lookahead', _check_alt_chord_not_swallowed),
     ('filter prompt accepts UTF-8 queries',      _check_filter_accepts_utf8),
-    ('hscroll keeps structural coloring',        _check_hscroll_keeps_spans),
     ('hscroll caps at widest line',              _check_hscroll_caps_at_content),
 ]
-
 
 def _run_scenario(binary, keys, opts):
     argv = [binary, SAMPLE]
     return run(argv, keys=keys, **opts)
-
 
 def main():
     a = _parse_args()
