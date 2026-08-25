@@ -726,26 +726,26 @@ static void lit_update(const char *q, int icase)
 	lit_icase = icase;
 }
 
-/* byte offset of the first hit of pat[0..plen) in s[0..len), or -1;
+/* byte offset of the first hit of pat[0..patlen) in s[0..len), or -1;
  * shared by the filter's and the search's literal matchers */
-static ptrdiff_t pat_find(const char *pat, size_t plen, int bol, int eol,
+static ptrdiff_t pat_find(const char *pat, size_t patlen, int bol, int eol,
 			  int icase, const char *s, size_t len)
 {
 #define PAT_EQ(p) \
-	!(icase ? strncasecmp((p), pat, plen) : memcmp((p), pat, plen))
-	if (plen == 0)
+	!(icase ? strncasecmp((p), pat, patlen) : memcmp((p), pat, patlen))
+	if (patlen == 0)
 		return bol && eol ? (len == 0 ? 0 : -1) : 0;
-	if (len < plen)
+	if (len < patlen)
 		return -1;
-	size_t tail = len - plen;
+	size_t tail = len - patlen;
 	if (bol && eol)
-		return len == plen && PAT_EQ(s) ? 0 : -1;
+		return len == patlen && PAT_EQ(s) ? 0 : -1;
 	if (bol)
 		return PAT_EQ(s) ? 0 : -1;
 	if (eol)
 		return PAT_EQ(s + tail) ? (ptrdiff_t)tail : -1;
 	if (!icase) {
-		const char *h = memmem(s, len, pat, plen);
+		const char *h = memmem(s, len, pat, patlen);
 		return h ? (ptrdiff_t)(h - s) : -1;
 	}
 	/* icase: memchr either case of byte 0 (SIMD), verify folded */
@@ -759,7 +759,7 @@ static ptrdiff_t pat_find(const char *pat, size_t plen, int bol, int eol,
 		const char *hit = !a ? b : !b ? a : (a < b ? a : b);
 		if (!hit)
 			return -1;
-		if ((size_t)(end - hit) >= plen && PAT_EQ(hit))
+		if ((size_t)(end - hit) >= patlen && PAT_EQ(hit))
 			return hit - s;
 		p = hit + 1;
 	}
@@ -2134,21 +2134,24 @@ static void view_action(int act)
 		break;
 	case A_SNEXT:
 	case A_SPREV: {
-		if (!searched || !nlines)
+		if (!searched || !nlines || !nv)
 			break;
 		int dir = act == A_SNEXT ? 1 : -1;
-		size_t li = view[cur];
+		/* walk the visible view[], not the file: srchit is set on every
+		 * line, so scanning lines[] would land on a hit hidden by the
+		 * filter and snap cur to a nearby visible, non-match line. */
+		size_t li = cur;
 		size_t i = li;
 		do
-			i = dir > 0 ? (i + 1 < nlines ? i + 1 : 0)
-				    : (i > 0 ? i - 1 : nlines - 1);
-		while (!lines[i].srchit && i != li);
-		if (lines[i].srchit) {
-			cur = view_floor(i);
+			i = dir > 0 ? (i + 1 < nv ? i + 1 : 0)
+				    : (i > 0 ? i - 1 : nv - 1);
+		while (!lines[view[i]].srchit && i != li);
+		if (lines[view[i]].srchit) {
+			cur = i;
 			/* the hit may sit beyond the right edge: bring its span
 			 * into view, keeping a margin clear of the scrollbar */
 			regmatch_t sm;
-			if (search_match(&lines[i], &sm)) {
+			if (search_match(&lines[view[i]], &sm)) {
 				size_t so = (size_t)sm.rm_so, se = (size_t)sm.rm_eo;
 				size_t maxc = widest_col();
 				size_t max = maxc + 2 > (size_t)cols

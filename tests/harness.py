@@ -411,6 +411,33 @@ def _check_search_next_prev(binary):
     if '200/200' not in '\n'.join(res3.screen()):
         return 'N from top did not wrap around to last match'
 
+def _check_search_next_prev_filtered(binary):
+    # srchit is set on every file line, but navigation must only land on
+    # hits that survive the filter. The buggy version walked lines[] and
+    # stopped on a hit hidden by the filter, snapping cur to the nearest
+    # visible line (a non-match). Build a log whose visible hits are at
+    # file 0 and 4, with hidden hits at 1 and 3 in between; the non-match
+    # at file 2 must never become the cursor.
+    name = _tmplog([
+        'foo alpha NEAR\n',   # file 0: foo + NEAR  -> visible hit
+        'bar NEAR\n',         # file 1: NEAR        -> hidden (no foo)
+        'foo beta plain\n',   # file 2: foo         -> visible non-match
+        'bar NEAR\n',         # file 3: NEAR        -> hidden
+        'foo gamma NEAR\n',   # file 4: foo + NEAR  -> visible hit
+    ])
+    try:
+        # n from the top must land on slot 2 (counter 3/3), never the
+        # non-match at slot 1 (counter 2/3).
+        res = run([binary, '--no-color', name], keys=b'g/foo\n\\NEAR\nnq')
+        if '3/3' not in '\n'.join(res.screen()):
+            return f"n landed on non-match, expected 3/3: {res.screen()!r}"
+        resn = run([binary, '--no-color', name], keys=b'g/foo\n\\NEAR\nnNq')
+        if '1/3' not in '\n'.join(resn.screen()):
+            return f"N did not step back to slot 0: {resn.screen()!r}"
+    finally:
+        os.unlink(name)
+    return None
+
 def _check_mark_empty_lines(binary):
     res = run([binary, '-'], keys='Gxkxcq', stdin_text='\n\n\ncontent\n')
     if b'\x1b]52;c;' not in res.output:
@@ -502,6 +529,7 @@ CHECKS = [
     ('inverted filter keeps cursor anchored',    _check_invert_cursor_continuity),
     ('highlight search without filtering',       _check_highlight_search),
     ('n/N walk search matches',                  _check_search_next_prev),
+    ('n/N skip hidden hits under filter',        _check_search_next_prev_filtered),
     ('marked empty lines copy cleanly',          _check_mark_empty_lines),
     ('regex toggle shows (R) badge',  _check_regex_toggle_badge),
     ('literal filter matches metachars', _check_literal_metachars_match),
