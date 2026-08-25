@@ -118,9 +118,13 @@ static ptrdiff_t pat_find(const char *pat, size_t patlen, int bol, int eol,
 		const char *h = memmem(s, len, pat, patlen);
 		return h ? (ptrdiff_t)(h - s) : -1;
 	}
-	/* icase: scan for either case of byte 0 in one pass, verify folded */
-	unsigned char lo = (unsigned char)tolower((unsigned char)pat[0]);
-	unsigned char hi = (unsigned char)toupper((unsigned char)pat[0]);
+	/* icase: scan for either case of byte 0 in one pass, verify folded.
+	 * Fold by hand: comb stays in the C locale, so glibc's tolower/
+	 * toupper would only add a table-pointer fetch per call -- and this
+	 * runs once per line during scans. */
+	unsigned char c0 = (unsigned char)pat[0];
+	unsigned char lo = c0 >= 'A' && c0 <= 'Z' ? (unsigned char)(c0 | 32) : c0;
+	unsigned char hi = c0 >= 'a' && c0 <= 'z' ? (unsigned char)(c0 & ~32u) : c0;
 	const char *p = s, *end = s + len;
 	while (p < end) {
 		ptrdiff_t off = find_icase_byte(p, (size_t)(end - p), lo, hi);
