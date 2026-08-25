@@ -1,5 +1,6 @@
 comb
 tests/selftest
+tests/loadbench
 *.o
 __pycache__/
 *.pyc

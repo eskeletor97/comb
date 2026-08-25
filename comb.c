@@ -3,6 +3,9 @@
  */
 #define _GNU_SOURCE
 #include "config.h"
+#if defined(__SSE2__) && defined(__GNUC__)
+#include <emmintrin.h>
+#endif
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -20,6 +23,7 @@
 #include <sys/types.h>
 #include <termios.h>
 #include <stddef.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef struct {
@@ -90,6 +94,14 @@ static int tio_saved;
 static volatile sig_atomic_t got_winch;
 static size_t nmarked;
 static int mdir = -1;	/* space/x sweep direction: -1 up, 1 down */
+
+/* While editing a filter/search prompt, keystrokes update the buffer but
+ * defer the expensive per-line recompute until typing idles. After this
+ * many ms of no keys, the pending query is applied once. */
+#define SEARCH_DEBOUNCE_MS 150
+static int pending_update;	/* a query change awaits the debounce */
+static struct timespec debounce_due;	/* deadline for the deferred recompute */
+static int force_render;	/* commit a queued-keys coalescing render */
 
 static void assign_service(Line *L);
 static size_t str_cols(const char *s, size_t n);
@@ -257,13 +269,82 @@ static void push_line(const char *clean, size_t len)
 	nlines++;
 }
 
+/* Does the span hold a tab, CR, or ESC byte (anything sanitize must
+ * rewrite)? Three separate memchr calls scan the line three times; a
+ * single SIMD pass compares all three at once, which matters for the
+ * common case where the file is entirely clean. Falls back to memchr
+ * on non-SSE2 targets. */
+#if defined(__SSE2__) && defined(__GNUC__)
+static int line_has_crlfesc(const char *s, size_t n)
+{
+	const __m128i tab = _mm_set1_epi8('\t');
+	const __m128i cr = _mm_set1_epi8('\r');
+	const __m128i esc = _mm_set1_epi8(0x1b);
+	size_t i = 0;
+	for (; i + 16 <= n; i += 16) {
+		__m128i v = _mm_loadu_si128((const __m128i *)(const void *)(s + i));
+		__m128i hit = _mm_or_si128(_mm_cmpeq_epi8(v, tab),
+				    _mm_or_si128(_mm_cmpeq_epi8(v, cr),
+						 _mm_cmpeq_epi8(v, esc)));
+		if (_mm_movemask_epi8(hit) != 0)
+			return 1;
+	}
+	for (; i < n; i++) {
+		unsigned char c = (unsigned char)s[i];
+		if (c == '\t' || c == '\r' || c == 0x1b)
+			return 1;
+	}
+	return 0;
+}
+#else
+static int line_has_crlfesc(const char *s, size_t n)
+{
+	return memchr(s, '\t', n) || memchr(s, '\r', n) || memchr(s, 0x1b, n);
+}
+#endif
+
+/* earliest offset of a byte equal to lo or hi, or -1; the icase search
+ * probes both case-variants of the pattern's first byte. SSE2 compares
+ * both in one pass; the fallback is two memchr calls. */
+#if defined(__SSE2__) && defined(__GNUC__)
+static ptrdiff_t find_icase_byte(const char *s, size_t n, unsigned char lo,
+				 unsigned char hi)
+{
+	const __m128i vlo = _mm_set1_epi8((char)lo);
+	const __m128i vhi = _mm_set1_epi8((char)hi);
+	size_t i = 0;
+	for (; i + 16 <= n; i += 16) {
+		__m128i v = _mm_loadu_si128((const __m128i *)(const void *)(s + i));
+		__m128i m = _mm_or_si128(_mm_cmpeq_epi8(v, vlo),
+					 _mm_cmpeq_epi8(v, vhi));
+		unsigned mask = (unsigned)_mm_movemask_epi8(m);
+		if (mask)
+			return (ptrdiff_t)(i + __builtin_ctz(mask));
+	}
+	for (; i < n; i++)
+		if ((unsigned char)s[i] == lo || (unsigned char)s[i] == hi)
+			return (ptrdiff_t)i;
+	return -1;
+}
+#else
+static ptrdiff_t find_icase_byte(const char *s, size_t n, unsigned char lo,
+				 unsigned char hi)
+{
+	const char *end = s + n;
+	const char *a = memchr(s, lo, n);
+	const char *b = lo == hi ? NULL : memchr(s, hi, n);
+	const char *hit = !a ? b : !b ? a : (a < b ? a : b);
+	return hit ? (ptrdiff_t)(hit - s) : -1;
+}
+#endif
+
 /* strip ANSI sequences and CRs, expand tabs; returns arena-allocated
  * string. Worst case is tab expansion (+3 bytes each). */
 static char *sanitize(const char *s, size_t n, size_t *outlen)
 {
 	/* fast path: with no tab/CR/ESC there is nothing to expand or strip,
-	 * so just copy the run (memchr is SIMD, beating a scalar byte pass) */
-	if (!memchr(s, '\t', n) && !memchr(s, '\r', n) && !memchr(s, 0x1b, n)) {
+	 * so just copy the run (the SIMD probe beats a scalar byte pass) */
+	if (!line_has_crlfesc(s, n)) {
 		char *o = arena_alloc(n + 1);
 		memcpy(o, s, n);
 		o[n] = 0;
@@ -367,7 +448,7 @@ static void drain_map(void)
 		const char *s = fmap + start;
 		size_t n = k - start;
 		/* SIMD probe for a tab/CR/ESC: if absent the line is clean */
-		if (memchr(s, '\t', n) || memchr(s, '\r', n) || memchr(s, 0x1b, n)) {
+		if (line_has_crlfesc(s, n)) {
 			size_t len;
 			char *clean = sanitize(s, n, &len);
 			push_line(clean, len);
@@ -427,6 +508,19 @@ static size_t nsvc_seen;
  * one stable tag per prefix instead of random prose words. */
 static int tag_span(const char *s, size_t n, int *so, int *eo)
 {
+	/* A tag is the *last* byte of a space-delimited field, so its ':'
+	 * is always followed by a space or end-of-line. Skim for such a
+	 * field-boundary colon and reject lines without one (the common
+	 * case) in a single SIMD pass instead of the scalar walk below. */
+	const char *colon = s, *end = s + n;
+	while ((colon = memchr(colon, ':', (size_t)(end - colon))) != NULL) {
+		if (colon + 1 == end || colon[1] == ' ')
+			break;
+		colon++;
+	}
+	if (colon == NULL)
+		return 0;
+
 	size_t i = 0;
 	int field = 0, saw_digit = 0;
 	size_t pfs = (size_t)-1;	/* start of the previous field */
@@ -436,18 +530,19 @@ static int tag_span(const char *s, size_t n, int *so, int *eo)
 		if (i >= n)
 			break;
 		size_t fs = i;
-		while (i < n && s[i] != ' ')
+		int digit = 0;
+		/* one pass per field: find its end and, until a digit has been
+		 * seen in some field, whether it holds one */
+		while (i < n && s[i] != ' ') {
+			if (!saw_digit && !digit &&
+			    (unsigned char)s[i] >= '0' && (unsigned char)s[i] <= '9')
+				digit = 1;
 			i++;
+		}
 		size_t fe = i;
 		size_t pf = pfs;
 		pfs = fs;
-		int digit = 0;
-		for (size_t k = fs; k < fe; k++)
-			if (s[k] >= '0' && s[k] <= '9') {
-				digit = 1;
-				break;
-			}
-		saw_digit |= digit;
+		saw_digit = saw_digit || digit;
 		if (++field < 2 || !saw_digit)
 			continue;	/* tag needs a timestamp-ish preamble,
 					 * else prose reads as "tag: text" */
@@ -749,13 +844,33 @@ static void lit_parse(const char *q, int icase, LitSpec *ls)
 	ls->icase = icase;
 }
 
+/* case-insensitive byte compare, folding ASCII A-Z to lower. comb never
+ * calls setlocale(), so the process is in the "C" locale where strncasecmp
+ * folds exactly the ASCII letters -- this is equivalent but avoids
+ * strncasecmp_l's per-call locale-table lookups, which dominate the hot
+ * icase search. */
+static int icase_cmp(const char *a, const char *b, size_t n)
+{
+	for (size_t i = 0; i < n; i++) {
+		unsigned char ca = (unsigned char)a[i];
+		unsigned char cb = (unsigned char)b[i];
+		if (ca >= 'A' && ca <= 'Z')
+			ca = (unsigned char)(ca + 32);
+		if (cb >= 'A' && cb <= 'Z')
+			cb = (unsigned char)(cb + 32);
+		if (ca != cb)
+			return (int)ca - (int)cb;
+	}
+	return 0;
+}
+
 /* byte offset of the first hit of pat[0..patlen) in s[0..len), or -1;
  * shared by the filter's and the search's literal matchers */
 static ptrdiff_t pat_find(const char *pat, size_t patlen, int bol, int eol,
 			  int icase, const char *s, size_t len)
 {
 #define PAT_EQ(p) \
-	!(icase ? strncasecmp((p), pat, patlen) : memcmp((p), pat, patlen))
+	!(icase ? icase_cmp((p), pat, patlen) : memcmp((p), pat, patlen))
 	if (patlen == 0)
 		return bol && eol ? (len == 0 ? 0 : -1) : 0;
 	if (len < patlen)
@@ -771,17 +886,15 @@ static ptrdiff_t pat_find(const char *pat, size_t patlen, int bol, int eol,
 		const char *h = memmem(s, len, pat, patlen);
 		return h ? (ptrdiff_t)(h - s) : -1;
 	}
-	/* icase: memchr either case of byte 0 (SIMD), verify folded */
-	char lo = (char)tolower((unsigned char)pat[0]);
-	char hi = (char)toupper((unsigned char)pat[0]);
+	/* icase: scan for either case of byte 0 in one pass, verify folded */
+	unsigned char lo = (unsigned char)tolower((unsigned char)pat[0]);
+	unsigned char hi = (unsigned char)toupper((unsigned char)pat[0]);
 	const char *p = s, *end = s + len;
 	while (p < end) {
-		size_t rem = (size_t)(end - p);
-		const char *a = memchr(p, lo, rem);
-		const char *b = lo == hi ? NULL : memchr(p, hi, rem);
-		const char *hit = !a ? b : !b ? a : (a < b ? a : b);
-		if (!hit)
+		ptrdiff_t off = find_icase_byte(p, (size_t)(end - p), lo, hi);
+		if (off < 0)
 			return -1;
+		const char *hit = p + off;
 		if ((size_t)(end - hit) >= patlen && PAT_EQ(hit))
 			return hit - s;
 		p = hit + 1;
@@ -1854,13 +1967,47 @@ static void page_up(void)
 	cur = cur > pane_rows() ? cur - pane_rows() : 0;
 }
 
+/* schedule the recompute for when typing idles; keeps the live buffered
+ * query but defers the heavy per-line pass so a keystroke burst costs one */
+static void defer_update(void)
+{
+	edit[MAX_QUERY - 1] = 0;
+	pending_update = 1;
+	clock_gettime(CLOCK_MONOTONIC, &debounce_due);
+	debounce_due.tv_nsec += SEARCH_DEBOUNCE_MS * 1000000L;
+	if (debounce_due.tv_nsec >= 1000000000L) {
+		debounce_due.tv_nsec -= 1000000000L;
+		debounce_due.tv_sec++;
+	}
+}
+
 static void apply_edit(void)
 {
 	edit[MAX_QUERY - 1] = 0;
+	pending_update = 0;
 	if (editing_search)
 		update_search(edit);
 	else
 		update_filter(edit);
+	dirty = 1;	/* update_filter doesn't self-mark; a commit must repaint */
+}
+
+static int debounce_elapsed(void)
+{
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return now.tv_sec > debounce_due.tv_sec ||
+	       (now.tv_sec == debounce_due.tv_sec &&
+		now.tv_nsec >= debounce_due.tv_nsec);
+}
+
+static int debounce_ms_left(void)
+{
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	long ms = (debounce_due.tv_sec - now.tv_sec) * 1000L +
+		  (debounce_due.tv_nsec - now.tv_nsec) / 1000000L;
+	return ms > 0 ? (int)ms : 0;
 }
 
 static const char *key_name(int key, char *buf, size_t n)
@@ -1965,6 +2112,9 @@ static void edit_key(int key)
 
 	switch (key) {
 	case 0x1b:	case '\r': case '\n':
+			if (pending_update)	/* commit a still-deferred query */
+				apply_edit();
+			force_render = 1;	/* show the committed result */
 			editing = 0;
 			editing_search = 0;
 			break;
@@ -1998,7 +2148,7 @@ static void edit_key(int key)
 			if (ecur < elen) {
 				size_t n = u8_next(edit, ecur, elen);
 				memmove(edit + ecur, edit + n, elen - n + 1);
-				apply_edit();
+				defer_update();
 			}
 			break;
 		case 0x7f: case CTL('h'):	/* backspace */
@@ -2006,17 +2156,17 @@ static void edit_key(int key)
 				size_t p = u8_prev(edit, ecur);
 				memmove(edit + p, edit + ecur, elen - ecur + 1);
 				ecur = p;
-				apply_edit();
+				defer_update();
 			}
 			break;
 		case CTL('u'):
 			edit[0] = 0;
 			ecur = 0;
-			apply_edit();
+			defer_update();
 			break;
 		case CTL('r'):	/* toggle literal/regex filter */
 			re_mode = !re_mode;
-			apply_edit();
+			defer_update();
 			if (!*msg)	/* bad-regex notice wins over the mode notice */
 				snprintf(msg, sizeof msg, re_mode ? "regex mode"
 							  : "literal mode");
@@ -2025,7 +2175,7 @@ static void edit_key(int key)
 			if (editing_search)
 				break;	/* filter-only toggle */
 			filter_inv = !filter_inv;
-			apply_edit();
+			defer_update();
 			if (!*msg)
 				snprintf(msg, sizeof msg, filter_inv
 							  ? "excluding matches"
@@ -2039,7 +2189,7 @@ static void edit_key(int key)
 				memmove(edit + ecur + 1, edit + ecur,
 					elen - ecur + 1);
 				edit[ecur++] = (char)key;
-				apply_edit();
+				defer_update();
 			}
 			break;
 	}
@@ -2339,11 +2489,18 @@ int main(int argc, char **argv)
 			}
 		}
 
+		/* a deferred filter/search recompute fires once editing idles */
+		if (editing && pending_update && !key_pending() && debounce_elapsed()) {
+			apply_edit();
+		}
+
 		/* paint pending changes before waiting; skipped while
-		 * keystrokes are queued so key repeats coalesce */
-		if (dirty && !key_pending()) {
+		 * keystrokes are queued so key repeats coalesce, unless a
+		 * commit just landed -- that must be shown before the queue */
+		if (dirty && (!key_pending() || force_render)) {
 			render();
 			dirty = 0;
+			force_render = 0;
 		}
 
 		if (!key_pending()) {
@@ -2352,7 +2509,13 @@ int main(int argc, char **argv)
 				{ .fd = STDIN_FILENO,	.events = POLLIN },
 			};
 			int np = follow && use_stdin && !stdin_eof ? 2 : 1;
-			poll(pp, np, 200);
+			int wait = 200;
+			if (editing && pending_update) {
+				int left = debounce_ms_left();
+				if (left < wait)
+					wait = left;
+			}
+			poll(pp, np, wait);
 			/* woke for data (or timed out): lap around; woke for
 			 * a key: fall through and read it */
 			if (!(pp[0].revents & POLLIN))
