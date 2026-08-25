@@ -4,7 +4,10 @@
 #define _GNU_SOURCE
 #include "config.h"
 #if defined(__SSE2__) && defined(__GNUC__)
+#define USE_SSE2 1
 #include <emmintrin.h>
+#else
+#define USE_SSE2 0
 #endif
 #include <ctype.h>
 #include <errno.h>
@@ -23,6 +26,7 @@
 #include <sys/types.h>
 #include <termios.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -100,7 +104,7 @@ static int mdir = -1;	/* space/x sweep direction: -1 up, 1 down */
  * many ms of no keys, the pending query is applied once. */
 #define SEARCH_DEBOUNCE_MS 150
 static int pending_update;	/* a query change awaits the debounce */
-static struct timespec debounce_due;	/* deadline for the deferred recompute */
+static uint64_t debounce_due;	/* deadline for the deferred recompute */
 static int force_render;	/* commit a queued-keys coalescing render */
 
 static void assign_service(Line *L);
@@ -157,6 +161,13 @@ static void *xrealloc(void *p, size_t n)
 	if (!q)
 		die("out of memory");
 	return q;
+}
+
+static uint64_t now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
 static void raw_on(void)
@@ -252,6 +263,135 @@ static size_t plen;
 static int flushed_partial;	/* last pushed line had no trailing newline */
 static int stdin_eof;	/* pipe closed: no more input will ever come */
 
+/* running max of line widths; maintained at push time, see push_line.
+ * reset_lines rewinds it alongside the lines themselves. */
+static size_t wc_max;
+
+/* --- load progress: the only UI painted before the first render.
+ * Big files take tens of seconds to scan; without this comb looks
+ * hung. Regular files know their size, so they draw a percent bar and
+ * tick per PROG_STEP_BYTES scanned; stdin has no total and spins on a
+ * timer instead. Both are silent on small loads, so ordinary files
+ * never flicker, and prog_hide erases everything before the first
+ * render paints the pane. */
+#define PROG_STEP_BYTES ((size_t)32 << 20)
+#define PROG_MIN_FEED  ((size_t)1 << 20)
+static uint64_t prog_t0;	/* set in main, right before load_all() */
+static size_t prog_fed;		/* bytes handed to feed() */
+static size_t prog_mark;	/* file offset of the last bar draw */
+static int prog_shown;
+static int prog_spin;
+static uint64_t prog_due;	/* stdin redraw deadline */
+
+/* compact byte count: 37.3GiB / 743MiB / 12KiB */
+static void human_bytes(char *o, size_t v)
+{
+	if (v >> 30)
+		snprintf(o, 16, "%.1fGiB", v / 1073741824.0);
+	else if (v >> 20)
+		snprintf(o, 16, "%.1fMiB", v / 1048576.0);
+	else if (v >> 10)
+		snprintf(o, 16, "%.0fKiB", v / 1024.0);
+	else
+		snprintf(o, 16, "%zuB", v);
+}
+
+/* decimal with , groups: 272298969 -> 272,298,969 (no locale: comb
+ * never calls setlocale, so %'d is unavailable) */
+static void group_digits(char *o, size_t v)
+{
+	char d[32];
+	int k = 0;
+	do {
+		d[k++] = (char)('0' + v % 10);
+		v /= 10;
+	} while (v);
+	while (k > 0) {
+		*o++ = d[--k];
+		if (k && k % 3 == 0)
+			*o++ = ',';
+	}
+	*o = 0;
+}
+
+static void prog_paint(const char *text)
+{
+	fputs("\x1b[1;1H\x1b[2K", stdout);
+	fputs(text, stdout);
+	fflush(stdout);
+	prog_shown = 1;
+}
+
+static double prog_secs(void)
+{
+	double s = (now_ms() - prog_t0) / 1000.0;
+	return s < 0.001 ? 0.001 : s;
+}
+
+static void prog_file(size_t done)
+{
+	if (done < prog_mark || done - prog_mark < PROG_STEP_BYTES)
+		return;
+	prog_mark = done;
+	char cur[16], tot[16], rt[16];
+	human_bytes(cur, done);
+	human_bytes(tot, fmap_len);
+	human_bytes(rt, (size_t)(done / prog_secs()));
+	char buf[192], bar[26];
+	const char *bars = "";
+	int bw = cols >= 50 ? 22 : cols >= 36 ? 10 : 0;
+	if (bw) {
+		int fill = (int)((uint64_t)done * bw / fmap_len);
+		for (int i = 0; i < bw; i++)
+			bar[i + 1] = i < fill ? '#' : '-';
+		bar[0] = '[';
+		bar[bw + 1] = ']';
+		bar[bw + 2] = 0;
+	}
+	if (!bw)
+		bar[0] = 0;
+	else
+		bars = " ";
+	const char *name = use_stdin ? "(stdin)"
+		: strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
+	size_t room = cols > 66 ? cols - 66 : 0;
+	if (room >= 4)
+		snprintf(buf, sizeof buf,
+			 "loading %.*s%s%s %d%% %s/%s %s/s",
+			 (int)(room > 40 ? 40 : room), name,
+			 bars, bar, (int)(done * 100 / fmap_len),
+			 cur, tot, rt);
+	else
+		snprintf(buf, sizeof buf, "loading %d%% %s/%s %s/s",
+			 (int)(done * 100 / fmap_len), cur, tot, rt);
+	prog_paint(buf);
+}
+
+static void prog_stdin(void)
+{
+	uint64_t now = now_ms();
+	if (now < prog_due || prog_fed < PROG_MIN_FEED)
+		return;
+	prog_due = now + 100;
+	char ln[32], hb[16], rt[16];
+	group_digits(ln, nlines);
+	human_bytes(hb, prog_fed);
+	human_bytes(rt, (size_t)(prog_fed / prog_secs()));
+	char buf[160];
+	snprintf(buf, sizeof buf, "reading stdin %c %s lines %s %s/s",
+		 "|/-\\"[prog_spin++ & 3], ln, hb, rt);
+	prog_paint(buf);
+}
+
+static void prog_hide(void)
+{
+	if (!prog_shown)
+		return;
+	fputs("\x1b[1;1H\x1b[2K", stdout);
+	fflush(stdout);
+	prog_shown = 0;
+}
+
 static void push_line(const char *clean, size_t len)
 {
 	if (nlines == lcap) {
@@ -265,6 +405,12 @@ static void push_line(const char *clean, size_t len)
 	L->marked = 0;
 	L->srchit = (unsigned char)(searched && search_match(L, &sm));
 	L->sev = NULL;
+	/* measure now: the page holding this line passes through the cache
+	 * exactly once, and deferring the width pass made logs bigger than
+	 * the page cache re-read the whole file on the first hscroll */
+	L->wcols = str_cols(L->s, L->len);
+	if (L->wcols > wc_max)
+		wc_max = L->wcols;
 	assign_service(L);
 	nlines++;
 }
@@ -274,7 +420,7 @@ static void push_line(const char *clean, size_t len)
  * single SIMD pass compares all three at once, which matters for the
  * common case where the file is entirely clean. Falls back to memchr
  * on non-SSE2 targets. */
-#if defined(__SSE2__) && defined(__GNUC__)
+#if USE_SSE2
 static int line_has_crlfesc(const char *s, size_t n)
 {
 	const __m128i tab = _mm_set1_epi8('\t');
@@ -306,7 +452,7 @@ static int line_has_crlfesc(const char *s, size_t n)
 /* earliest offset of a byte equal to lo or hi, or -1; the icase search
  * probes both case-variants of the pattern's first byte. SSE2 compares
  * both in one pass; the fallback is two memchr calls. */
-#if defined(__SSE2__) && defined(__GNUC__)
+#if USE_SSE2
 static ptrdiff_t find_icase_byte(const char *s, size_t n, unsigned char lo,
 				 unsigned char hi)
 {
@@ -401,6 +547,7 @@ static void feed(const char *data, size_t n)
 	pend = xrealloc(pend, plen + n);
 	memcpy(pend + plen, data, n);
 	plen += n;
+	prog_fed += n;
 	size_t start = 0;
 	/* If a final partial line was flushed as a line, a leading '\n' merely
 	 * terminates it; don't emit a spurious empty line for it. */
@@ -456,6 +603,7 @@ static void drain_map(void)
 			push_line(s, n);
 		}
 		start = k + 1;
+		prog_file(start);
 	}
 	fmap_pos = start;
 	if (start < fmap_len)
@@ -472,6 +620,7 @@ static int append_stdin(void)
 		ssize_t g = read(STDIN_FILENO, buf, sizeof buf);
 		if (g > 0) {
 			feed(buf, (size_t)g);
+			prog_stdin();
 			continue;
 		}
 		if (g < 0 && errno == EINTR)
@@ -511,7 +660,7 @@ static int tag_span(const char *s, size_t n, int *so, int *eo)
 	/* A tag is the *last* byte of a space-delimited field, so its ':'
 	 * is always followed by a space or end-of-line. Skim for such a
 	 * field-boundary colon and reject lines without one (the common
-	 * case) in a single SIMD pass instead of the scalar walk below. */
+	 * case) with a single memchr walk instead of the field walk below. */
 	const char *colon = s, *end = s + n;
 	while ((colon = memchr(colon, ':', (size_t)(end - colon))) != NULL) {
 		if (colon + 1 == end || colon[1] == ' ')
@@ -582,7 +731,8 @@ static void assign_service(Line *L)
 	L->slot = -1;
 	L->tag_so = -1;
 	L->tag_eo = -1;
-	if (!tag_span(L->s, L->len, &fs, &e))
+	/* tag spans are ints: a single line longer than 2GiB has none */
+	if (L->len > 2147483647 || !tag_span(L->s, L->len, &fs, &e))
 		return;
 	L->tag_so = fs;
 	L->tag_eo = e;
@@ -621,6 +771,8 @@ static void reset_lines(void)
 	nmarked = 0;
 	nv = 0;	/* view entries referenced the freed buffers */
 	nsvc_seen = 0;	/* tag pointers referenced the freed buffers */
+	wc_max = 0;	/* folded widths belonged to the old lines */
+	prog_mark = 0;
 }
 
 static void read_available(int src)
@@ -1160,19 +1312,42 @@ static unsigned u8_decode(const char *s, size_t rem, size_t *cl)
 	return cp;
 }
 
+/* index of the first byte with the high bit set at or after i, else n;
+ * movemask on the raw bytes extracts all eight high bits at once */
+#if USE_SSE2
+static size_t first_wide_byte(const char *s, size_t n, size_t i)
+{
+	for (; i + 16 <= n; i += 16) {
+		unsigned m = (unsigned)_mm_movemask_epi8(
+			_mm_loadu_si128((const __m128i *)(const void *)(s + i)));
+		if (m)
+			return i + (size_t)__builtin_ctz(m);
+	}
+	while (i < n && !((unsigned char)s[i] & 0x80))
+		i++;
+	return i;
+}
+#endif
+
 static size_t str_cols(const char *s, size_t n)
 {
 	size_t w = 0, i = 0;
 	while (i < n) {
+#if USE_SSE2
+		size_t j = first_wide_byte(s, n, i);
+		w += j - i;	/* pure-ASCII run: one cell per byte */
+		i = j;
+#else
 		if ((unsigned char)s[i] < 0x80) {
-			/* run of plain ASCII: one cell per byte; this is
-			 * ~all of most logs, so skip UTF-8 decoding */
 			size_t j = i;
 			while (j < n && (unsigned char)s[j] < 0x80)
 				j++;
 			w += j - i;
 			i = j;
-		} else {
+			continue;
+		}
+#endif
+		if (i < n) {
 			size_t cl;
 			w += (size_t)glyph_width(u8_decode(s + i, n - i, &cl));
 			i += cl;
@@ -1181,25 +1356,16 @@ static size_t str_cols(const char *s, size_t n)
 	return w;
 }
 
-/* widths never change once a line is stored */
-static size_t line_cols(Line *L)
-{
-	if (!L->wcols)
-		L->wcols = str_cols(L->s, L->len);
-	return L->wcols;
-}
-
-/* widest line in the file; measures uncached lines on demand, so the
- * first hscroll-right pays what load no longer does up front */
+/* widths are computed at push time and immutable thereafter; widest_col
+ * just reads the running max kept alongside them */
 static size_t widest_col(void)
 {
-	size_t w = 0;
-	for (size_t i = 0; i < nlines; i++) {
-		size_t cw = line_cols(&lines[i]);
-		if (cw > w)
-			w = cw;
-	}
-	return w;
+	return wc_max;
+}
+
+static size_t line_cols(Line *L)
+{
+	return L->wcols;
 }
 
 static size_t line_rows(Line *L)
@@ -1973,12 +2139,7 @@ static void defer_update(void)
 {
 	edit[MAX_QUERY - 1] = 0;
 	pending_update = 1;
-	clock_gettime(CLOCK_MONOTONIC, &debounce_due);
-	debounce_due.tv_nsec += SEARCH_DEBOUNCE_MS * 1000000L;
-	if (debounce_due.tv_nsec >= 1000000000L) {
-		debounce_due.tv_nsec -= 1000000000L;
-		debounce_due.tv_sec++;
-	}
+	debounce_due = now_ms() + SEARCH_DEBOUNCE_MS;
 }
 
 static void apply_edit(void)
@@ -1994,20 +2155,13 @@ static void apply_edit(void)
 
 static int debounce_elapsed(void)
 {
-	struct timespec now;
-	clock_gettime(CLOCK_MONOTONIC, &now);
-	return now.tv_sec > debounce_due.tv_sec ||
-	       (now.tv_sec == debounce_due.tv_sec &&
-		now.tv_nsec >= debounce_due.tv_nsec);
+	return now_ms() >= debounce_due;
 }
 
 static int debounce_ms_left(void)
 {
-	struct timespec now;
-	clock_gettime(CLOCK_MONOTONIC, &now);
-	long ms = (debounce_due.tv_sec - now.tv_sec) * 1000L +
-		  (debounce_due.tv_nsec - now.tv_nsec) / 1000000L;
-	return ms > 0 ? (int)ms : 0;
+	uint64_t left = debounce_due - now_ms();
+	return left > 0 ? (int)left : 0;
 }
 
 static const char *key_name(int key, char *buf, size_t n)
@@ -2455,8 +2609,27 @@ int main(int argc, char **argv)
 		poll(&pw, 1, -1);
 	}
 	tty_enter();
-
+	prog_t0 = now_ms();
 	load_all();
+	prog_hide();
+	{
+		/* flex a little: how much landed and how fast */
+		char g[32], hb[16];
+		group_digits(g, nlines);
+		human_bytes(hb, fmap_len + prog_fed);
+		double secs = (now_ms() - prog_t0) / 1000.0;
+		if (secs >= 1.0) {
+			char ps[16];
+			human_bytes(ps, (size_t)((fmap_len + prog_fed) / secs));
+			snprintf(msg, sizeof msg,
+				 "loaded %s lines (%s) in %.1fs (%s/s)",
+				 g, hb, secs, ps);
+		} else
+			snprintf(msg, sizeof msg,
+				 "loaded %s lines (%s) in %.0fms",
+				 g, hb, secs * 1000);
+	}
+
 	if (init_re) {
 		re_mode = 1;	/* -e promises a REGEX */
 		update_filter(init_re);

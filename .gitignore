@@ -5,3 +5,4 @@ tests/loadbench
 __pycache__/
 *.pyc
 bgl2
+spirit2
