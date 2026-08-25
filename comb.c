@@ -302,15 +302,17 @@ static int prog_shown;
 static int prog_spin;
 static uint64_t prog_due;	/* stdin redraw deadline */
 
-/* compact byte count: 37.3GiB / 743MiB / 12KiB */
+/* compact byte count: 37.3GiB / 743MiB / 9.5KiB */
 static void human_bytes(char *o, size_t v)
 {
 	if (v >> 30)
 		snprintf(o, 16, "%.1fGiB", v / 1073741824.0);
 	else if (v >> 20)
 		snprintf(o, 16, "%.1fMiB", v / 1048576.0);
-	else if (v >> 10)
+	else if (v >= 10 << 10)
 		snprintf(o, 16, "%.0fKiB", v / 1024.0);
+	else if (v >> 10)
+		snprintf(o, 16, "%.1fKiB", v / 1024.0);
 	else
 		snprintf(o, 16, "%zuB", v);
 }
@@ -1221,6 +1223,7 @@ static int query_match(const Line *L, regmatch_t *m)
  * query and line state it reads cannot change mid-flight. */
 #define PAR_MAX_THREADS 64
 #define PAR_MIN_LINES ((size_t)1 << 16)
+#define PAR_MIN_SPAN ((size_t)1 << 13)
 
 static int par_threads(size_t len)
 {
@@ -1231,8 +1234,10 @@ static int par_threads(size_t len)
 		n = 1;
 	if (n > PAR_MAX_THREADS)
 		n = PAR_MAX_THREADS;
-	if ((size_t)n > len)
-		n = (size_t)len;
+	if ((size_t)n > len / PAR_MIN_SPAN)
+		n = len / PAR_MIN_SPAN;
+	if (n < 1)
+		n = 1;
 	return (int)n;
 }
 
@@ -1274,9 +1279,12 @@ static void par_run(size_t lo, size_t hi, int nthreads, par_work work, void *ctx
 		created[k] = pthread_create(&th[k], NULL, par_spawn, &arg[k]) == 0;
 		start = end;
 	}
-	for (int k = 0; k < nthreads; k++)
+	for (int k = 0; k < nthreads; k++) {
 		if (created[k])
 			pthread_join(th[k], NULL);
+		else
+			arg[k].work(arg[k].lo, arg[k].hi, arg[k].slot, ctx);
+	}
 }
 
 typedef struct {
@@ -1316,20 +1324,6 @@ static void scan_collect(size_t lo, size_t hi, size_t (*pos_line)(size_t),
 			 size_t **arr, size_t *n, size_t *cap)
 {
 	int nthreads = par_threads(hi - lo);
-	if (nthreads <= 1) {
-		regmatch_t m;
-		for (size_t p = lo; p < hi; p++) {
-			size_t li = pos_line(p);
-			if (match(&lines[li], &m) != inv) {
-				if (*n == *cap) {
-					*cap = *cap ? *cap * 2 : 1024;
-					*arr = xrealloc(*arr, *cap * sizeof(**arr));
-				}
-				(*arr)[(*n)++] = li;
-			}
-		}
-		return;
-	}
 	par_list lst[PAR_MAX_THREADS] = {0};
 	col_ctx c = { pos_line, match, inv, lst };
 	par_run(lo, hi, nthreads, col_work, &c);
