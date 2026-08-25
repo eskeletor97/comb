@@ -136,6 +136,7 @@ static int job_inv;	/* captured at start: immune to mid-job inv flips */
 static size_t job_lo, job_pos, job_end;	/* progress over [lo,end) */
 static uint64_t job_t0;	/* job start, for the progress grace period */
 static unsigned job_spin;	/* spinner frame counter */
+static uint64_t job_spin_ms;	/* last spinner draw, throttled by JOB_SPIN_MS */
 static size_t *job_arr;		/* view collector, kept across batches */
 static size_t job_n, job_cap;
 static unsigned char *job_hits;	/* search sweep scratch */
@@ -158,6 +159,7 @@ void job_discard(void)
 {
 	if (!job_active)
 		return;
+	job_spin_ms = 0;	/* a fresh job may redraw its first frame now */
 	if (pending_pat.active && pending_pat.is_re)
 		regfree(&pending_pat.re);
 	pending_pat.active = 0;
@@ -321,16 +323,21 @@ void step_job(void)
 			     query_match, job_inv, &job_arr, &job_n, &job_cap);
 	}
 	job_pos = hi;
-	if (rows >= 2 && now_ms() - job_t0 >= JOB_PROG_MS) {
-		static const char frames[] = "|/-\\";
-		const char *what = job_kind == K_SEARCH ? "searching" : "filtering";
-		int pct = (int)((job_pos - job_lo) * 100 /
-				(job_end - job_lo ? job_end - job_lo : 1));
-		char buf[80];
-		snprintf(buf, sizeof buf, "%c %s %d%%  esc bails",
-			 frames[job_spin++ & 3], what, pct);
-		printf("\x1b[%d;1H\x1b[K\x1b[1;7m %s \x1b[0m", rows, buf);
-		fflush(stdout);
+	{
+		uint64_t now = now_ms();
+		if (rows >= 2 && now - job_t0 >= JOB_PROG_MS &&
+		    now - job_spin_ms >= JOB_SPIN_MS) {
+			job_spin_ms = now;
+			static const char frames[] = "|/-\\";
+			const char *what = job_kind == K_SEARCH ? "searching" : "filtering";
+			int pct = (int)((job_pos - job_lo) * 100 /
+					(job_end - job_lo ? job_end - job_lo : 1));
+			char buf[80];
+			snprintf(buf, sizeof buf, "%c %s %d%%  esc bails",
+				 frames[job_spin++ & 3], what, pct);
+			printf("\x1b[%d;1H\x1b[K\x1b[1;7m %s \x1b[0m", rows, buf);
+			fflush(stdout);
+		}
 	}
 	if (job_pos >= job_end)
 		job_finish(1);

@@ -265,7 +265,8 @@ static void test_collect_spans(void)
 
 	/* <info> token hue after the service tag */
 	L = mkline("Aug 22 23:53:27 host foo[1]: <info> hello");
-	assign_service(&L);
+	detect_tag(&L);
+	commit_slot(&L);
 	n = collect_spans(&L, sp);
 	const char *tok = "\x1b[38;5;110m";	/* cornflower, matches token_attr */
 	const Span *t = find_attr(sp, n, tok);

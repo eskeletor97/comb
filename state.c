@@ -4,6 +4,8 @@
 #define _GNU_SOURCE
 #include "comb.h"
 
+#include <unistd.h>
+
 Line *lines;
 size_t nlines, lcap;
 
@@ -64,6 +66,23 @@ size_t nmarked;
 int pending_update;	/* a query change awaits the debounce */
 uint64_t debounce_due;	/* deadline for the deferred recompute */
 int force_render;	/* commit a queued-keys coalescing render */
+
+int max_threads;	/* runtime -t/--threads; 0 = auto */
+
+/* Worker count: the -t override, else nproc-2 (leaving a couple of cores
+ * for the UI/main loop), clamped to [1, MAX_THREADS]. */
+int effective_threads(void)
+{
+	if (max_threads > 0)
+		return max_threads;
+	long n = sysconf(_SC_NPROCESSORS_ONLN);
+	if (n < 1)
+		n = 1;
+	n = n > 2 ? n - 2 : 1;
+	if (n > MAX_THREADS)
+		n = MAX_THREADS;
+	return (int)n;
+}
 
 uint64_t prog_t0;	/* set in main, right before load_all() */
 size_t prog_fed;	/* bytes handed to feed() */

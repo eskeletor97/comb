@@ -220,7 +220,7 @@ static void print_keys(FILE *out)
 
 void usage(FILE *out)
 {
-	fputs(
+	fprintf(	out,
 "usage: comb [-e REGEX] [--no-color] [FILE]\n"
 "\n"
 "View, filter and copy log files. Reads FILE, or stdin when piped.\n"
@@ -229,9 +229,11 @@ void usage(FILE *out)
 "options:\n"
 "  -e REGEX               start with REGEX as the filter\n"
 "  --no-color, -C         disable syntax coloring (also honors NO_COLOR)\n"
+"  -t, --threads N        worker threads for load/filter/search\n"
+"                         (default: online CPUs - 2, min 1, max %d)\n"
 "  -h, --help             show this help\n"
 "\n"
-"keys:\n", out);
+"keys:\n", MAX_THREADS);
 	print_keys(out);
 }
 

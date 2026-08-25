@@ -315,7 +315,7 @@ int search_match(const Line *L, regmatch_t *m)
  * PAR_MIN_LINES: below that, spawn/join would cost more than the scan.
  * The main thread is blocked in par_run until every worker joins, so the
  * query and line state it reads cannot change mid-flight. */
-#define PAR_MAX_THREADS 64
+#define PAR_MAX_THREADS MAX_THREADS
 #define PAR_MIN_LINES ((size_t)1 << 16)
 #define PAR_MIN_SPAN ((size_t)1 << 13)
 
@@ -323,11 +323,7 @@ int par_threads(size_t len)
 {
 	if (len < PAR_MIN_LINES)
 		return 1;
-	long n = sysconf(_SC_NPROCESSORS_ONLN);
-	if (n < 1)
-		n = 1;
-	if (n > PAR_MAX_THREADS)
-		n = PAR_MAX_THREADS;
+	long n = effective_threads();
 	if ((size_t)n > len / PAR_MIN_SPAN)
 		n = len / PAR_MIN_SPAN;
 	if (n < 1)

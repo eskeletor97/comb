@@ -2,9 +2,17 @@
 
 #define MAX_QUERY 256
 
+/* upper bound on the parse/filter/load worker threads; the actual count is
+ * runtime (-t/--threads), defaulting to nproc-2 clamped to [1, MAX_THREADS] */
+#define MAX_THREADS 64
+
 /* show the filter/search job spinner only after a scan has run this long;
  * fast scans finish inside a batch or two and shouldn't flash it */
 #define JOB_PROG_MS 1000
+
+/* ms between spinner redraws once it is shown; a batch is only a few ms,
+ * so without a cap a fast scan would repaint it every batch */
+#define JOB_SPIN_MS 100
 
 #define TTY_ENTER "\x1b[?1049h\x1b[?25l\x1b[2J"
 #define TTY_LEAVE "\x1b[0m\x1b[?25h\x1b[?1049l"

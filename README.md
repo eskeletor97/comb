@@ -42,7 +42,12 @@ A small terminal log viewer in plain C (libc only, no ncurses).
 
 ## Usage
 
-    comb [-e REGEX] [--no-color] [FILE]
+    comb [-e REGEX] [-t N] [--no-color] [FILE]
+
+`-t` / `--threads N` sets the worker-thread count used for parallel file
+loading and for parallel filter/search scans. Defaults to `online CPUs - 2`,
+clamped to a minimum of 1; `-t 1` disables threading (single-threaded load
+and scan).
 
 `--no-color` (or `-C`, or the `NO_COLOR` env var) strips syntax coloring but keeps inverse-video cursor/marks.
 

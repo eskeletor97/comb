@@ -120,6 +120,11 @@ extern struct termios saved_tio;
 extern int tio_saved;
 extern volatile sig_atomic_t got_winch;
 
+/* Worker threads for filter/search scans and parallel file loading. 0 means
+ * "auto": effective_threads() falls back to nproc-2 clamped to [1,MAX]. */
+extern int max_threads;
+int effective_threads(void);
+
 /* While editing a filter/search prompt, keystrokes update the buffer but
  * defer the expensive per-line recompute until typing idles. After this
  * many ms of no keys, the pending query is applied once. */

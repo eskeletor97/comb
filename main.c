@@ -10,6 +10,20 @@
 #include <string.h>
 #include <unistd.h>
 
+/* parse a thread count into *out, clamping to [1, MAX_THREADS]. Rejects
+ * anything that isn't a clean integer (so -t bogus errors, -t 0 clamps to 1). */
+static int parse_threads(const char *s, int *out)
+{
+	char *end;
+	long v = strtol(s, &end, 10);
+	if (end == s || *end)
+		return 0;
+	if (v < 1)
+		v = 1;
+	*out = v > MAX_THREADS ? MAX_THREADS : (int)v;
+	return 1;
+}
+
 int main(int argc, char **argv)
 {
 	const char *init_re = NULL;
@@ -28,6 +42,17 @@ int main(int argc, char **argv)
 		} else if (!endopts &&
 			   (!strcmp(argv[i], "--no-color") || !strcmp(argv[i], "-C"))) {
 			nocolor = 1;
+		} else if (!endopts &&
+			   (!strcmp(argv[i], "-t") || !strcmp(argv[i], "--threads"))) {
+			if (i + 1 >= argc || !parse_threads(argv[++i], &max_threads)) {
+				usage(stderr);
+				return 1;
+			}
+		} else if (!endopts && !strncmp(argv[i], "--threads=", 10)) {
+			if (!parse_threads(argv[i] + 10, &max_threads)) {
+				usage(stderr);
+				return 1;
+			}
 		} else if (!endopts && !strcmp(argv[i], "-")) {
 			use_stdin = 1;
 		} else if (argv[i][0] == '-') {
@@ -152,9 +177,23 @@ int main(int argc, char **argv)
 			apply_edit();
 		}
 
-		/* long scans run in batches so typing and the bail key stay live */
-		if (job_active)
-			step_job();
+		/* Long scans run in batches so typing and the bail key stay live.
+		 * A batch is only a few ms of threaded work, so pausing a full poll
+		 * after every batch idles the machine ~90% of the time and caps the
+		 * parallel scan's speedup at ~1.5x (on a 12-core box it pegged at
+		 * roughly one core's worth of CPU). Keep feeding batches while no
+		 * key is ready, polling the keyboard non-blockingly between batches
+		 * so Esc still bails out promptly -- but always run at least one
+		 * batch per lap, so a small scan finishes before a pending key is
+		 * served (read_key's Esc lookahead may buffer the next key). */
+		if (job_active) {
+			struct pollfd kp = { .fd = kfd, .events = POLLIN };
+			do {
+				step_job();
+				if (!job_active || key_pending() || got_winch)
+					break;
+			} while (poll(&kp, 1, 0) == 0);
+		}
 
 		/* paint pending changes before waiting; skipped while
 		 * keystrokes are queued so key repeats coalesce, unless a
