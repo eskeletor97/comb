@@ -427,7 +427,9 @@ void update_filter(const char *q)
 	snprintf(pending_pat.text, sizeof pending_pat.text, "%s", q);
 
 	job_kind = narrow ? K_VIEW_NARROW : K_VIEW_REPLACE;
-	job_inv = filter_inv;
+	/* a clearing job must collect every line: inversion belonged to the
+	 * filter being removed, and match-all against inv=1 would keep nothing */
+	job_inv = clearing ? 0 : filter_inv;
 	job_lo = 0;
 	job_pos = 0;
 	job_end = narrow ? nv : nlines;

@@ -352,6 +352,25 @@ static void test_job_cancel(void)
 	CHECK(!filter_pat.active && nv == 2);
 }
 
+static void test_clear_inverted_filter(void)
+{
+	/* self-contained: earlier tests leave lines in the shared array,
+	 * so anchor expectations on the current line count */
+	size_t base = nlines;
+	filter_pat.active = filter_pat.is_re = 0;
+	re_mode = 0;
+	push_line("zqxj marker", 11);
+
+	filter_inv = 1;
+	update_filter("zqxj");		/* inverted: every prior line stays */
+	job_flush();
+	CHECK(filter_pat.active && nv == base);
+
+	update_filter("");		/* clear must resurrect our line too */
+	job_flush();
+	CHECK(!filter_pat.active && !filter_inv && nv == base + 1);
+}
+
 static void test_alt(void)
 {
 	AltSpec as;
@@ -410,6 +429,7 @@ int main(void)
 	test_b64enc();
 	test_update_filter_state();
 	test_job_cancel();
+	test_clear_inverted_filter();
 	test_alt();
 
 	if (fails) {

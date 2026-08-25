@@ -839,6 +839,9 @@ static void try_map(void)
 		       MAP_PRIVATE, fd, 0);
 	if (p == MAP_FAILED)
 		return;
+	/* scans only ever run forward; ignore errors (old kernels on
+	 * exotic maps may not honor it) */
+	madvise(p, (size_t)st.st_size, MADV_SEQUENTIAL);
 	fmap = p;
 	fmap_len = (size_t)st.st_size;
 	drain_map();
