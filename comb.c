@@ -261,6 +261,15 @@ static void push_line(const char *clean, size_t len)
  * string. Worst case is tab expansion (+3 bytes each). */
 static char *sanitize(const char *s, size_t n, size_t *outlen)
 {
+	/* fast path: with no tab/CR/ESC there is nothing to expand or strip,
+	 * so just copy the run (memchr is SIMD, beating a scalar byte pass) */
+	if (!memchr(s, '\t', n) && !memchr(s, '\r', n) && !memchr(s, 0x1b, n)) {
+		char *o = arena_alloc(n + 1);
+		memcpy(o, s, n);
+		o[n] = 0;
+		*outlen = n;
+		return o;
+	}
 	size_t extra = 0;
 	for (size_t i = 0; i < n; i++)
 		if (s[i] == '\t')
@@ -317,13 +326,16 @@ static void feed(const char *data, size_t n)
 	if (flushed_partial && plen > 0 && pend[0] == '\n')
 		start = 1;
 	flushed_partial = 0;
-	for (size_t i = start; i < plen; i++) {
-		if (pend[i] == '\n') {
-			size_t len;
-			char *clean = sanitize(pend + start, i - start, &len);
-			push_line(clean, len);
-			start = i + 1;
-		}
+	/* memchr skips straight between newlines instead of byte-wise */
+	for (;;) {
+		const char *nl = memchr(pend + start, '\n', plen - start);
+		if (!nl)
+			break;
+		size_t k = (size_t)(nl - pend);
+		size_t len;
+		char *clean = sanitize(pend + start, k - start, &len);
+		push_line(clean, len);
+		start = k + 1;
 	}
 	memmove(pend, pend + start, plen - start);
 	plen -= start;
@@ -347,25 +359,22 @@ static void flush_pending(void)
 static void drain_map(void)
 {
 	size_t start = fmap_pos;
-	for (size_t i = start; i < fmap_len; i++) {
-		if (fmap[i] != '\n')
-			continue;
+	for (;;) {
+		const char *nl = memchr(fmap + start, '\n', fmap_len - start);
+		if (!nl)
+			break;
+		size_t k = (size_t)(nl - fmap);
 		const char *s = fmap + start;
-		size_t n = i - start;
-		size_t j;
-		for (j = 0; j < n; j++) {
-			unsigned char c = (unsigned char)s[j];
-			if (c == '\t' || c == '\r' || c == 0x1b)
-				break;
-		}
-		if (j < n) {	/* needs rewriting: arena copy */
+		size_t n = k - start;
+		/* SIMD probe for a tab/CR/ESC: if absent the line is clean */
+		if (memchr(s, '\t', n) || memchr(s, '\r', n) || memchr(s, 0x1b, n)) {
 			size_t len;
 			char *clean = sanitize(s, n, &len);
 			push_line(clean, len);
 		} else {
 			push_line(s, n);
 		}
-		start = i + 1;
+		start = k + 1;
 	}
 	fmap_pos = start;
 	if (start < fmap_len)
