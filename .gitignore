@@ -4,3 +4,4 @@ tests/loadbench
 *.o
 __pycache__/
 *.pyc
+bgl2

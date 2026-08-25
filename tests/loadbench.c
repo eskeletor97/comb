@@ -1,7 +1,7 @@
 #define COMB_TEST
 #pragma GCC diagnostic ignored "-Wunused-function"
 #pragma GCC diagnostic ignored "-Wunused-variable"
-#include "comb.c"
+#include "../comb.c"
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
     snprintf(path, sizeof path, "%s", argv[1]);
