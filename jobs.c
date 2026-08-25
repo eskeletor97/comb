@@ -246,6 +246,7 @@ void job_finish(int commit)
 				vcap = nc;
 				view = xrealloc(view, vcap * sizeof(*view));
 			}
+            if (job_n)   /* zero matches leaves both buffers NULL: skip */
 			memcpy(view + nv, job_arr, job_n * sizeof(*view));
 			nv += job_n;
 		} else {
@@ -299,6 +300,7 @@ void job_finish(int commit)
 				vcap = nc;
 				view = xrealloc(view, vcap * sizeof(*view));
 			}
+			if (job_n)   /* zero matches leaves both buffers NULL: skip */
 			memcpy(view, job_arr, job_n * sizeof(*view));
 			nv = job_n;
 			/* cursor anchoring, identical to the blocking path:
