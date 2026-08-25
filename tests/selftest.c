@@ -311,6 +311,7 @@ static void test_update_filter_state(void)
 	re_mode = 1;
 
 	update_filter("a.*[0-9]+");	/* valid regex */
+	job_flush();
 	CHECK(filtered && filtered_re);
 
 	msg[0] = 0;
@@ -319,7 +320,32 @@ static void test_update_filter_state(void)
 	CHECK(filtered && filtered_re && !strcmp(query, "a.*[0-9]+"));
 
 	update_filter("");		/* clear */
+	job_flush();
 	CHECK(!filtered && !filtered_re);
+}
+
+static void test_job_cancel(void)
+{
+	filtered = filtered_re = 0;
+	re_mode = 1;
+	push_line("abc here", 8);
+	push_line("nothing", 7);
+
+	update_filter("a.c");		/* true regex: not alt-parseable */
+	job_flush();
+	size_t nv_before = nv;
+	CHECK(nv_before == 1);
+
+	update_filter("x.z");		/* a new scan is in flight */
+	CHECK(job_active);
+	job_finish(0);			/* bail before commit */
+	CHECK(!job_active);
+	CHECK(filtered_re && !strcmp(query, "a.c")); /* old pattern kept */
+	CHECK(nv == nv_before);		/* old view kept */
+
+	update_filter("");
+	job_flush();
+	CHECK(!filtered && nv == 2);
 }
 
 static void test_alt(void)
@@ -379,6 +405,7 @@ int main(void)
 	test_severity();
 	test_b64enc();
 	test_update_filter_state();
+	test_job_cancel();
 	test_alt();
 
 	if (fails) {

@@ -98,6 +98,21 @@ static int filtered_alt;	/* live filter is an alternation of literals */
 static AltSpec salt;
 static int searched_alt;	/* search is an alternation of literals */
 
+/* pending patterns for in-flight scans: the UI keeps serving the last
+ * committed view/pattern until the job lands (see step_job), so Esc can
+ * drop a mistyped query wholesale. Workers test the pending specs; n/N,
+ * push_line marking and the status bar stay on the committed ones. */
+static regex_t jfre, jsre;
+static LitSpec jflit, jslit;
+static AltSpec jfalt, jsalt;
+static int jf_on,	jf_all,	jf_re,	jf_alt;	/* pending filter pattern */
+static int js_on,	js_active,	js_re,	js_alt;	/* pending search pattern */
+static int js_extend;		/* search extends a literal prefix */
+static int jf_clearing, jf_was_filtered;	/* commit-time cursor anchoring */
+static size_t jf_was, jf_was_row;
+static char jf_q[MAX_QUERY], js_q[MAX_QUERY];
+static char search_prev[MAX_QUERY];	/* last committed search text */
+
 static int follow = 1;
 static int wrap;
 static int nocolor;
@@ -1204,7 +1219,13 @@ static int pattern_match(const Line *L, int is_re, int is_alt,
 /* active-filter test; on match fills m with the highlight span */
 static int query_match(const Line *L, regmatch_t *m)
 {
+	if (jf_on) {	/* a scan is testing a candidate pattern */
+		if (jf_all)	/* clearing: every line matches again */
+			goto empty;
+		return pattern_match(L, jf_re, jf_alt, &jfre, &jflit, &jfalt, m);
+	}
 	if (!filtered) {
+empty:
 		m->rm_so = m->rm_eo = 0;	/* empty span: nothing to highlight */
 		return 1;
 	}
@@ -1351,15 +1372,288 @@ static void scan_collect(size_t lo, size_t hi, size_t (*pos_line)(size_t),
 static size_t pos_ident(size_t p) { return p; }
 static size_t pos_view(size_t p) { return view[p]; }
 
-/* Narrow an extended query in place: appending chars can only shrink
- * the match set, so survivors must already be in view[]. */
-static void refilter_narrow(void)
+/* --- long-scan jobs -------------------------------------------------
+ * On a 200M-line log a mistyped regex costs minutes, so filter and
+ * search rescans don't run as one blocking pass: each main-loop lap
+ * steps one batch through the thread pool, then control returns so keys
+ * are read (Esc bails between batches) and a spinner is painted.
+ *
+ * The visible state -- view[], srchit flags, committed patterns -- is
+ * untouched until commit: results accumulate in scratch buffers and the
+ * new pattern waits in the pending specs above. Cancelling therefore
+ * means just freeing scratch; small files still finish inside their
+ * first lap, indistinguishable from the old blocking pass. */
+#define JOB_BATCH ((size_t)1 << 21)	/* lines scanned per lap */
+enum { K_VIEW_REPLACE, K_VIEW_NARROW, K_VIEW_EXTEND, K_SEARCH };
+static int job_active;
+static int job_kind;
+static int job_inv;	/* captured at start: immune to mid-job inv flips */
+static size_t job_lo, job_pos, job_end;	/* progress over [lo,end) */
+static unsigned job_spin;	/* spinner frame counter */
+static size_t *job_arr;		/* view collector, kept across batches */
+static size_t job_n, job_cap;
+static unsigned char *job_hits;	/* search sweep scratch */
+static size_t pend_ext_from;	/* follow append deferred past the job */
+static int pend_ext;
+
+static void extend_view(size_t from);
+
+/* put the prompt text back to the last committed query: a cancelled
+ * attempt must not leave its rejected input in the buffer */
+static void job_restore_edit(void)
 {
-	size_t *tmp = NULL, n = 0, cap = 0;
-	scan_collect(0, nv, pos_view, query_match, filter_inv, &tmp, &n, &cap);
-	memcpy(view, tmp, n * sizeof(*view));
-	free(tmp);
-	nv = n;
+	if (!editing)
+		return;
+	snprintf(edit, sizeof edit, "%s", editing_search ? search : query);
+	ecur = strlen(edit);
+	pending_update = 0;
+}
+
+/* drop an in-flight scan without touching anything visible */
+static void job_discard(void)
+{
+	if (!job_active)
+		return;
+	if (jf_on && jf_re)
+		regfree(&jfre);
+	if (js_on && js_re)
+		regfree(&jsre);
+	jf_on = js_on = 0;
+	job_active = 0;
+	free(job_arr);
+	job_arr = NULL;
+	job_n = job_cap = 0;
+	free(job_hits);
+	job_hits = NULL;
+}
+
+/* per-line half of the highlight-search sweep: results land in hits[]
+ * and reach lines[].srchit only at commit. Extending a literal can only
+ * turn hits off, so lines already marked false skip the match test. */
+typedef struct {
+	unsigned char *hits;
+	int on, extend;
+} sjob_ctx;
+
+static void search_job_work(size_t lo, size_t hi, int slot, void *ctx)
+{
+	sjob_ctx *c = ctx;
+	(void)slot;
+	regmatch_t sm;
+	for (size_t i = lo; i < hi; i++) {
+		unsigned char v = 0;
+		if (c->on && !(c->extend && !lines[i].srchit))
+			v = (unsigned char)!!search_match(&lines[i], &sm);
+		c->hits[i] = v;
+	}
+}
+
+/* apply a finished scan (commit) or drop it (cancel). Everything swaps
+ * in atomically here, which is what makes mid-job cancel cheap. */
+static void job_finish(int commit)
+{
+	int kind = job_kind;
+	size_t i;
+	job_active = 0;
+	jf_on = js_on = 0;	/* matchers fall back to committed patterns */
+	if (kind == K_SEARCH) {
+		if (commit) {
+			if (js_re) {
+				regex_t old;
+				if (searched_re) {
+					old = sre;
+					sre = jsre;
+					regfree(&old);
+				} else {
+					sre = jsre;
+				}
+				searched_re = 1;
+				searched_alt = 0;
+			} else if (js_alt) {
+				if (searched_re)
+					regfree(&sre);
+				salt = jsalt;
+				searched_alt = 1;
+				searched_re = 0;
+			} else {
+				if (searched_re)
+					regfree(&sre);
+				slit = jslit;
+				searched_re = searched_alt = 0;
+			}
+			searched = js_active;
+			snprintf(search, sizeof search, "%s", js_q);
+			snprintf(search_prev, sizeof search_prev, "%s", js_q);
+			for (i = 0; i < job_end && i < nlines; i++)
+				lines[i].srchit = job_hits[i];
+		} else {
+			/* lines pushed while the job ran were marked with the
+			 * pending pattern; re-mark them under the restored one */
+			for (i = job_end; i < nlines; i++) {
+				regmatch_t sm;
+				lines[i].srchit = (unsigned char)
+					(searched && search_match(&lines[i], &sm));
+			}
+			job_restore_edit();
+		}
+	} else if (kind == K_VIEW_EXTEND) {
+		if (commit) {
+			if (nv + job_n > vcap) {
+				size_t nc = vcap ? vcap : 1024;
+				while (nc < nv + job_n)
+					nc *= 2;
+				vcap = nc;
+				view = xrealloc(view, vcap * sizeof(*view));
+			}
+			memcpy(view + nv, job_arr, job_n * sizeof(*view));
+			nv += job_n;
+		} else {
+			job_restore_edit();
+		}
+	} else {	/* K_VIEW_REPLACE / K_VIEW_NARROW */
+		if (commit) {
+			if (kind == K_VIEW_REPLACE) {
+				if (jf_all) {	/* clearing: back to unfiltered */
+					if (filtered && filtered_re)
+						regfree(&re);
+					filtered_re = 0;
+					filtered_alt = 0;
+					filtered = 0;
+					filter_inv = 0;
+					query[0] = 0;
+					lit.len = 0;
+				} else {
+					if (jf_re) {
+						regex_t old;
+						if (filtered && filtered_re) {
+							old = re;
+							re = jfre;
+							regfree(&old);
+						} else {
+							re = jfre;
+						}
+						filtered_re = 1;
+						filtered_alt = 0;
+					} else if (jf_alt) {
+						if (filtered && filtered_re)
+							regfree(&re);
+						alt = jfalt;
+						filtered_alt = 1;
+						filtered_re = 0;
+					} else {
+						if (filtered && filtered_re)
+							regfree(&re);
+						lit = jflit;
+						filtered_re = 0;
+						filtered_alt = 0;
+					}
+					filtered = 1;
+					snprintf(query, sizeof query, "%s", jf_q);
+				}
+			}
+			if (vcap < job_n) {
+				size_t nc = vcap ? vcap : 1024;
+				while (nc < job_n)
+					nc *= 2;
+				vcap = nc;
+				view = xrealloc(view, vcap * sizeof(*view));
+			}
+			memcpy(view, job_arr, job_n * sizeof(*view));
+			nv = job_n;
+			/* cursor anchoring, identical to the blocking path:
+			 * clear returns to the pre-filter selection, edits
+			 * re-anchor to the nearest line in file order */
+			if (jf_clearing && jf_was_filtered &&
+			    filter_anchor < nlines) {
+				size_t lo = view_floor(filter_anchor);
+				if (lo < nv && view[lo] == filter_anchor) {
+					cur = lo;
+					size_t vis = pane_rows();
+					size_t max_top = nv > vis ? nv - vis : 0;
+					top = lo > filter_row ? lo - filter_row : 0;
+					if (top > max_top)
+						top = max_top;
+				}
+			} else if (!jf_clearing) {
+				cur = view_floor(jf_was);
+				size_t vis = pane_rows();
+				size_t max_top = nv > vis ? nv - vis : 0;
+				top = cur > jf_was_row ? cur - jf_was_row : 0;
+				if (top > max_top)
+					top = max_top;
+			}
+			ensure_visible();
+		} else {
+			job_restore_edit();
+		}
+	}
+	free(job_arr);
+	job_arr = NULL;
+	job_n = job_cap = 0;
+	free(job_hits);
+	job_hits = NULL;
+	if (pend_ext) {	/* tail appended during the scan: pick it up now */
+		pend_ext = 0;
+		if (pend_ext_from < nlines)
+			extend_view(pend_ext_from);
+	}
+	dirty = 1;
+}
+
+/* run one batch through the thread pool; paints the spinner and commits
+ * when the range ends */
+static void step_job(void)
+{
+	size_t hi = job_end - job_pos > JOB_BATCH
+			    ? job_pos + JOB_BATCH : job_end;
+	if (job_kind == K_SEARCH) {
+		sjob_ctx c = { job_hits, js_on && js_active, js_extend };
+		par_run(job_pos, hi, par_threads(hi - job_pos),
+			search_job_work, &c);
+	} else {
+		scan_collect(job_pos, hi,
+			     job_kind == K_VIEW_NARROW ? pos_view : pos_ident,
+			     query_match, job_inv, &job_arr, &job_n, &job_cap);
+	}
+	job_pos = hi;
+	if (rows >= 2) {
+		static const char frames[] = "|/-\\";
+		const char *what = job_kind == K_SEARCH ? "searching" : "filtering";
+		int pct = (int)((job_pos - job_lo) * 100 /
+				(job_end - job_lo ? job_end - job_lo : 1));
+		char buf[80];
+		snprintf(buf, sizeof buf, "%c %s %d%%  esc bails",
+			 frames[job_spin++ & 3], what, pct);
+		printf("\x1b[%d;1H\x1b[K\x1b[1;7m %s \x1b[0m", rows, buf);
+		fflush(stdout);
+	}
+	if (job_pos >= job_end)
+		job_finish(1);
+}
+
+/* synchronous completion for callers outside the event loop (init,
+ * tests): run batches back-to-back until the job lands */
+static void job_flush(void)
+{
+	while (job_active)
+		step_job();
+}
+
+/* follow pushed new lines while filtered: collect their membership as a
+ * job too, so a huge tail can't stall the loop */
+static void start_extend_view(size_t from)
+{
+	if (from >= nlines)
+		return;
+	job_discard();
+	jf_on = 0;		/* workers test the committed pattern */
+	job_kind = K_VIEW_EXTEND;
+	job_inv = filter_inv;
+	job_lo = from;
+	job_pos = from;
+	job_end = nlines;
+	job_n = 0;
+	job_active = 1;
 }
 
 static void update_filter(const char *q)
@@ -1371,81 +1665,50 @@ static void update_filter(const char *q)
 	size_t was = nv ? view[cur] : 0;
 	size_t was_row = cur - top;
 	msg[0] = 0;
+
+	job_discard();	/* any in-flight scan just went obsolete */
+
+	jf_on = jf_all = jf_re = jf_alt = 0;
 	if (clearing) {
-		if (filtered && filtered_re)
-			regfree(&re);
-		filtered_re = 0;
-		filtered_alt = 0;
-		filtered = 0;
-		filter_inv = 0;
-		query[0] = 0;
-		lit.len = 0;
+		jf_on = jf_all = 1;	/* pending: every line matches again */
 	} else {
 		int icase = smart_case(q);
-		int is_alt = re_mode && alt_parse(q, icase, &alt);
-		regex_t nr;
-		int is_re = 0;
+		int is_alt = re_mode && alt_parse(q, icase, &jfalt);
 		if (re_mode && !is_alt) {
-			if (regcomp(&nr, q, REG_EXTENDED | (icase ? REG_ICASE : 0))) {
+			if (regcomp(&jfre, q, REG_EXTENDED | (icase ? REG_ICASE : 0))) {
 				snprintf(msg, sizeof msg, "bad regex: %.100s", q);
 				return;
 			}
-			is_re = 1;
+			jf_re = 1;
+		} else if (is_alt) {
+			jf_alt = 1;
+		} else {
+			lit_parse(q, icase, &jflit);
 		}
-		/* compile before freeing: a bad regex must keep the old view */
-		if (filtered && filtered_re)
-			regfree(&re);
-		filtered_re = 0;
-		filtered_alt = 0;
-		if (is_alt)
-			filtered_alt = 1;
-		else if (is_re) {
-			re = nr;
-			filtered_re = 1;
-		}
-		else
-			lit_parse(q, icase, &lit);
-		filtered = 1;
-		snprintf(query, sizeof query, "%s", q);
+		jf_on = 1;
 	}
+
 	/* query grew by appended chars: old matches are a superset, so
 	 * re-testing just view[] suffices -- but only while including.
 	 * Inverted, shrinking matches make outside lines eligible. */
 	size_t prevlen = strlen(prev);
-	if (was_literal && !re_mode && !clearing && !filter_inv && prevlen &&
-	    strlen(q) > prevlen && !memcmp(q, prev, prevlen))
-		refilter_narrow();
-	else
-		rebuild_view();
-	if (clearing && was_filtered && filter_anchor < nlines) {
-		/* return to the line selected before filtering began; it is a
-		 * binary search away since view[] is sorted. If it left with
-		 * a rotation/reload, keep the clamped position instead. */
-		size_t lo = view_floor(filter_anchor);
-		if (lo < nv && view[lo] == filter_anchor) {
-			cur = lo;
-			/* re-window so the line lands on the row it occupied
-			 * before filtering; ensure_visible() keeps this as-is */
-			size_t vis = pane_rows();
-			size_t max_top = nv > vis ? nv - vis : 0;
-			top = lo > filter_row ? lo - filter_row : 0;
-			if (top > max_top)
-				top = max_top;
-		}
-	} else if (!clearing) {
-		/* membership reshuffled (mode flip, exclude-mode edits): a
-		 * numeric cur would point at an arbitrary line, so re-anchor
-		 * to the nearest line in file order instead */
-		cur = view_floor(was);
-		/* window the landed line back onto its old screen row,
-		 * clamped like the clear-path restore below */
-		size_t vis = pane_rows();
-		size_t max_top = nv > vis ? nv - vis : 0;
-		top = cur > was_row ? cur - was_row : 0;
-		if (top > max_top)
-			top = max_top;
-	}
-	ensure_visible();
+	int narrow = was_literal && !re_mode && !clearing && !filter_inv && prevlen &&
+	    strlen(q) > prevlen && !memcmp(q, prev, prevlen);
+
+	/* commit-time cursor anchoring data (see job_finish) */
+	jf_clearing = clearing;
+	jf_was_filtered = was_filtered;
+	jf_was = was;
+	jf_was_row = was_row;
+	snprintf(jf_q, sizeof jf_q, "%s", q);
+
+	job_kind = narrow ? K_VIEW_NARROW : K_VIEW_REPLACE;
+	job_inv = filter_inv;
+	job_lo = 0;
+	job_pos = 0;
+	job_end = narrow ? nv : nlines;
+	job_n = 0;
+	job_active = 1;
 }
 
 static void extend_view(size_t from)
@@ -1456,81 +1719,87 @@ static void extend_view(size_t from)
 
 static void rebuild_view(void)
 {
+	job_discard();	/* a reload/rotation invalidates scratch refs */
 	nv = 0;
 	extend_view(0);
 	ensure_visible();
 }
 
-/* does the highlight-search pattern hit this line? fills m with the span */
+/* does the highlight-search pattern hit this line? fills m with the span.
+ * While a search job is in flight the pending pattern answers: workers
+ * must test the new query while n/N and the scrollbar keep serving the
+ * previous results until commit. */
 static int search_match(const Line *L, regmatch_t *m)
 {
-	if (!searched)
+	int on, is_re, is_alt;
+	const regex_t *rep;
+	const LitSpec *lp;
+	const AltSpec *ap;
+	if (js_on) {
+		on = js_active;
+		is_re = js_re;
+		is_alt = js_alt;
+		rep = &jsre;
+		lp = &jslit;
+		ap = &jsalt;
+	} else {
+		on = searched;
+		is_re = searched_re;
+		is_alt = searched_alt;
+		rep = &sre;
+		lp = &slit;
+		ap = &salt;
+	}
+	if (!on)
 		return 0;
 	/* a zero-width regex match is not a hit: n/N and the scrollbar need
 	 * a real span to land on */
-	return pattern_match(L, searched_re, searched_alt, &sre, &slit, &salt, m) &&
-	       (!searched_re || m->rm_eo > m->rm_so);
+	return pattern_match(L, is_re, is_alt, rep, lp, ap, m) &&
+	       (!is_re || m->rm_eo > m->rm_so);
 }
 
-/* per-line half of update_search, run across N threads */
-typedef struct { int extend; } search_ctx;
-
-static void search_work(size_t lo, size_t hi, int slot, void *ctx)
-{
-	search_ctx *c = ctx;
-	(void)slot;
-	for (size_t i = lo; i < hi; i++) {
-		if (!searched) {
-			lines[i].srchit = 0;
-			continue;
-		}
-		if (c->extend && !lines[i].srchit)
-			continue;
-		regmatch_t sm;
-		lines[i].srchit = (unsigned char)search_match(&lines[i], &sm);
-	}
-}
-
-/* commit a highlight-search pattern: validate, then mark every line.
- * Extending a literal pattern can only turn hits off, so lines already
- * marked false are skipped -- typing stays cheap on huge files. */
+/* commit a highlight-search pattern: validate, then scan as a batched
+ * job (see step_job). Extending a literal pattern can only turn hits
+ * off, so lines already marked false are skipped -- typing stays cheap
+ * on huge files. */
 static void update_search(const char *q)
 {
-	static char prev[MAX_QUERY];
 	int icase = smart_case(q);
-	size_t prevlen = strlen(prev);
+	size_t prevlen = strlen(search_prev);
 	int extend = searched && !searched_re && !re_mode && prevlen &&
-		     strlen(q) > prevlen && !memcmp(q, prev, prevlen);
-	searched_alt = 0;
+		     strlen(q) > prevlen && !memcmp(q, search_prev, prevlen);
+	msg[0] = 0;
+
+	job_discard();	/* any in-flight sweep just went obsolete */
+
+	js_on = 1;
+	js_active = !!*q;
+	js_extend = extend;
+	js_re = js_alt = 0;
 	if (*q && re_mode) {
-		if (alt_parse(q, icase, &salt)) {
-			searched_alt = 1;
-			if (searched_re)
-				regfree(&sre);
-			searched_re = 0;
+		if (alt_parse(q, icase, &jsalt)) {
+			js_alt = 1;	/* compile before swapping: a bad regex
+					 must keep the old search */
+		} else if (regcomp(&jsre, q,
+				   REG_EXTENDED | (icase ? REG_ICASE : 0))) {
+			snprintf(msg, sizeof msg, "bad regex: %.100s", q);
+			js_on = 0;
+			return;	/* keep the old search */
 		} else {
-			regex_t nr;
-			if (regcomp(&nr, q, REG_EXTENDED | (icase ? REG_ICASE : 0))) {
-				snprintf(msg, sizeof msg, "bad regex: %.100s", q);
-				return;	/* keep the old search */
-			}
-			if (searched_re)
-				regfree(&sre);
-			sre = nr;
-			searched_re = 1;
+			js_re = 1;
 		}
 	} else if (*q) {
-		lit_parse(q, icase, &slit);
-		searched_re = 0;
+		lit_parse(q, icase, &jslit);
 	}
-	snprintf(search, sizeof search, "%s", q);
-	searched = !!*q;
-	{
-		search_ctx c = { extend };
-		par_run(0, nlines, par_threads(nlines), search_work, &c);
-	}
-	snprintf(prev, sizeof prev, "%s", q);
-	dirty = 1;
+	snprintf(js_q, sizeof js_q, "%s", q);
+
+	free(job_hits);
+	job_hits = xrealloc(NULL, nlines ? nlines : 1);
+	job_kind = K_SEARCH;
+	job_lo = 0;
+	job_pos = 0;
+	job_end = nlines;
+	job_active = 1;
 }
 
 static size_t u8len(unsigned char c)
@@ -2427,6 +2696,7 @@ static void page_up(void)
 static void defer_update(void)
 {
 	edit[MAX_QUERY - 1] = 0;
+	job_discard();	/* keystrokes obsolete any in-flight scan */
 	pending_update = 1;
 	debounce_due = now_ms() + SEARCH_DEBOUNCE_MS;
 }
@@ -2922,6 +3192,7 @@ int main(int argc, char **argv)
 	if (init_re) {
 		re_mode = 1;	/* -e promises a REGEX */
 		update_filter(init_re);
+		job_flush();
 	} else
 		rebuild_view();
 	cur = nv ? nv - 1 : 0;
@@ -2939,10 +3210,23 @@ int main(int argc, char **argv)
 			int stick = nv > 0 && cur >= nv - 1;
 			size_t old = nlines;
 			int got = pump_follow();
-			if (got == 2)
-				rebuild_view();	/* rotation: lines[] were rebuilt from scratch */
-			else if (got == 1)
-				extend_view(old);
+			if (got == 2) {
+				job_discard(); /* rotation: lines[] were rebuilt from scratch */
+				if (filtered)
+					update_filter(query);	/* rescan as a job */
+				else
+					rebuild_view();
+			} else if (got == 1) {
+				if (job_active) {
+					if (!pend_ext || old < pend_ext_from)
+						pend_ext_from = old;
+					pend_ext = 1;
+				} else if (filtered && nlines - old > JOB_BATCH) {
+					start_extend_view(old);	/* big tail: batch it */
+				} else {
+					extend_view(old);
+				}
+			}
 			if (got) {
 				if (stick)
 					cur = nv ? nv - 1 : 0;
@@ -2955,6 +3239,10 @@ int main(int argc, char **argv)
 		if (editing && pending_update && !key_pending() && debounce_elapsed()) {
 			apply_edit();
 		}
+
+		/* long scans run in batches so typing and the bail key stay live */
+		if (job_active)
+			step_job();
 
 		/* paint pending changes before waiting; skipped while
 		 * keystrokes are queued so key repeats coalesce, unless a
@@ -2971,7 +3259,7 @@ int main(int argc, char **argv)
 				{ .fd = STDIN_FILENO,	.events = POLLIN },
 			};
 			int np = follow && use_stdin && !stdin_eof ? 2 : 1;
-			int wait = 200;
+			int wait = job_active ? 100 : 200;
 			if (editing && pending_update) {
 				int left = debounce_ms_left();
 				if (left < wait)
@@ -2988,6 +3276,17 @@ int main(int argc, char **argv)
 		if (key == K_EOF)
 			break;
 		msg[0] = 0;
+
+		/* Esc bails out of an in-flight scan first: on huge files it is
+		 * the only way back to the last good view */
+		if (job_active && key == 0x1b) {
+			job_finish(0);
+			snprintf(msg, sizeof msg, "cancelled");
+			editing = 0;
+			editing_search = 0;
+			force_render = 1;
+			continue;
+		}
 
 		if (editing)
 			edit_key(key);

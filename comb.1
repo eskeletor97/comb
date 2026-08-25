@@ -100,7 +100,9 @@ clear the highlight search
 clear the filter
 .TP
 .B Esc
-close the prompt; otherwise clear marks if any, else clear the filter
+close the prompt; otherwise clear marks if any, else clear the filter.
+While a filter or search is still scanning (the spinner in the bottom
+row shows progress), Esc bails out and restores the previous view
 .TP
 .BR Space ", " x
 mark / unmark the current line and sweep in the direction of the last
