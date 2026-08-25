@@ -16,7 +16,9 @@ A small terminal log viewer in plain C (libc only, no ncurses).
   (lowercase = case-insensitive); `^`/`$` anchor to line start/end.
   Ctrl-R in the prompt switches to POSIX ERE; Ctrl-V excludes matching
   lines instead (grep -v). The status bar shows (R)/(!) while regex
-  mode is on or matches are excluded
+  mode is on or matches are excluded. In regex mode, simple alternations
+  of plain literals (`error|warn`, `^foo`) run on the SIMD literal path
+  and stay fast; anything fancier uses the libc engine
 - highlight-only search: `\\` colors matches in place without narrowing;
   `n`/`N` jump between them (shifting the view to reveal off-screen
   matches), `|` clears, and the right-edge scrollbar marks hit rows

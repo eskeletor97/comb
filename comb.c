@@ -29,6 +29,7 @@
 #include <stdint.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
 
 typedef struct {
 	const char *s;
@@ -48,6 +49,20 @@ typedef struct {
 	size_t len;		/* 0: degenerate pattern, matches everywhere */
 	int bol, eol, icase;
 } LitSpec;
+
+/* alternation of literals: a "regex" that is really just a few literal
+ * needles (error|panic, ^sshd, foo$). Each piece is a plain byte string
+ * with its own ^/$ anchors; matched with the SIMD literal path instead of
+ * glibc regexec. Set up by alt_parse, selected by alt_match. */
+#define ALT_MAX 32
+typedef struct {
+	char buf[MAX_QUERY];		/* decoded literal bytes, one run per piece */
+	size_t off[ALT_MAX];		/* start of each piece in buf */
+	size_t len[ALT_MAX];		/* piece byte length */
+	unsigned char bol[ALT_MAX], eol[ALT_MAX];
+	int n;				/* number of pieces */
+	unsigned char icase;
+} AltSpec;
 
 static Line *lines;
 static size_t nlines, lcap;
@@ -78,6 +93,10 @@ static int editing_search;	/* prompt currently edits search, not filter */
 static regex_t sre;
 static int searched_re;
 static LitSpec slit;
+static AltSpec alt;
+static int filtered_alt;	/* live filter is an alternation of literals */
+static AltSpec salt;
+static int searched_alt;	/* search is an alternation of literals */
 
 static int follow = 1;
 static int wrap;
@@ -891,15 +910,6 @@ static size_t pane_rows(void)
 
 static size_t line_rows(Line *L);
 
-static void push_view(size_t i)
-{
-	if (nv == vcap) {
-		vcap = vcap ? vcap * 2 : 1024;
-		view = xrealloc(view, vcap * sizeof(*view));
-	}
-	view[nv++] = i;
-}
-
 static void ensure_visible(void)
 {
 	size_t vis = pane_rows();
@@ -1055,12 +1065,126 @@ static ptrdiff_t pat_find(const char *pat, size_t patlen, int bol, int eol,
 	return -1;
 }
 
+/* Try to read q as flat alternation of literals, the common log regex:
+ * one or more `^?literal$?` pieces joined by `|`. When it parses we skip
+ * glibc regexec entirely -- pat_find's SIMD/memmem path is far faster per
+ * line and needs no per-call regex state. Returns 1 to use the alternate
+ * matcher; 0 means fall back to the compiled regex. Any regex-feature
+ * (classes, groups, quantifiers, .*, interior anchors) rejects it. */
+/* is the byte at pos escaped (an odd run of backslashes before it)?  So
+ * `\$` is a literal dollar, not an anchor, and `\|` is a literal pipe,
+ * not a separator. `s` is the branch start; backslashes can't be escaped
+ * across a `|` boundary. */
+static int is_escaped(const char *s, const char *pos)
+{
+	int n = 0;
+	while (pos > s && pos[-1] == '\\') {
+		pos--;
+		n++;
+	}
+	return n & 1;
+}
+
+static int alt_parse(const char *q, int icase, AltSpec *as)
+{
+	as->n = 0;
+	as->icase = (unsigned char)icase;
+	size_t bp = 0;
+	const char *p = q;
+	if (!*p)
+		return 0;
+	while (*p) {
+		if (as->n >= ALT_MAX)
+			return 0;
+		int bol = 0, eol = 0;
+		if (*p == '^')
+			{ bol = 1; p++; }
+		/* find the branch end, honoring escapes so `\|` isn't a split */
+		const char *bend = p;
+		while (*bend && *bend != '|') {
+			if (*bend == '\\' && bend[1])
+				bend++;	/* skip the escaped byte */
+			bend++;
+		}
+		const char *sep = bend;	/* separator (or end) before any anchor strip */
+		if (bend > p && bend[-1] == '$' && !is_escaped(p, bend - 1)) {
+			eol = 1;
+			bend--;
+		}
+		size_t so = bp;
+		int empty = 1;
+		while (p < bend) {
+			unsigned char c = (unsigned char)*p++;
+			if (c == '\\') {
+				if (p >= bend)
+					return 0;	/* dangling backslash */
+				unsigned char e = (unsigned char)*p++;
+				if (!strchr("\\.*+?[]()|^${}", e))
+					return 0;	/* perl-class / unknown escape */
+				c = e;
+			} else if (c == '.' || c == '[' || c == ']' ||
+				   c == '(' || c == ')' || c == '*' ||
+				   c == '+' || c == '?' || c == '{' ||
+				   c == '}' || c == '^' || c == '$') {
+				return 0;	/* unsupported regex syntax */
+			}
+			if (bp >= MAX_QUERY)
+				return 0;
+			as->buf[bp++] = (char)c;
+			empty = 0;
+		}
+		if (empty)
+			return 0;	/* empty alternative */
+		as->off[as->n] = so;
+		as->len[as->n] = (size_t)(bp - so);
+		as->bol[as->n] = (unsigned char)bol;
+		as->eol[as->n] = (unsigned char)eol;
+		as->n++;
+		if (*sep == '|') {
+			p = sep + 1;
+			if (!*p || *p == '|')
+				return 0;	/* empty alternative */
+		} else {
+			break;
+		}
+	}
+	return 1;
+}
+
+/* best literal match across the alternation. Each piece finds its own
+ * leftmost hit; the winner is the leftmost, breaking ties by longest
+ * (approximating POSIX leftmost-longest for disjoint literal pieces). */
+static int alt_match(const AltSpec *as, const Line *L, regmatch_t *m)
+{
+	ptrdiff_t best = -1, best_len = -1;
+	for (int i = 0; i < as->n; i++) {
+		ptrdiff_t off = pat_find(as->buf + as->off[i], as->len[i],
+					as->bol[i], as->eol[i], as->icase,
+					L->s, L->len);
+		if (off < 0)
+			continue;
+		if (best == -1 || off < best ||
+		    (off == best && (ptrdiff_t)as->len[i] > best_len)) {
+			best = off;
+			best_len = (ptrdiff_t)as->len[i];
+		}
+	}
+	if (best < 0)
+		return 0;
+	m->rm_so = (regoff_t)best;
+	m->rm_eo = (regoff_t)(best + best_len);
+	return 1;
+}
+
 /* shared matcher for the filter and the highlight search: dispatch a
  * literal LitSpec or a compiled regex against one line, filling m with
  * the match (highlight) span */
-static int pattern_match(const Line *L, int is_re, const regex_t *re,
-			 const LitSpec *ls, regmatch_t *m)
+static int pattern_match(const Line *L, int is_re, int is_alt,
+			 const regex_t *re, const LitSpec *ls,
+			 const AltSpec *alt, regmatch_t *m)
 {
+	if (is_alt)
+		return alt_match(alt, L, m);
 	if (is_re) {
 		m->rm_so = 0;
 		m->rm_eo = (regoff_t)L->len;	/* REG_STARTEND: no NUL needed */
@@ -1084,24 +1208,170 @@ static int query_match(const Line *L, regmatch_t *m)
 	}
 	/* no zero-width guard here: the return decides view membership, and
 	 * a pattern like a* matching empty must keep lines visible */
-	return pattern_match(L, filtered_re, &re, &lit, m);
+	return pattern_match(L, filtered_re, filtered_alt, &re, &lit, &alt, m);
 }
+
+/* --- parallel scan --------------------------------------------------
+ * Filtering and the highlight-search sweep walk every line. Each line's
+ * match test is independent and reads only the immutable pattern plus the
+ * line text, so the range splits cleanly across a few pthreads and the
+ * ordered results reassemble in slot order. Engaged only above
+ * PAR_MIN_LINES: below that, spawn/join would cost more than the scan.
+ * The main thread is blocked in par_run until every worker joins, so the
+ * query and line state it reads cannot change mid-flight. */
+#define PAR_MAX_THREADS 64
+#define PAR_MIN_LINES ((size_t)1 << 16)
+
+static int par_threads(size_t len)
+{
+	if (len < PAR_MIN_LINES)
+		return 1;
+	long n = sysconf(_SC_NPROCESSORS_ONLN);
+	if (n < 1)
+		n = 1;
+	if (n > PAR_MAX_THREADS)
+		n = PAR_MAX_THREADS;
+	if ((size_t)n > len)
+		n = (size_t)len;
+	return (int)n;
+}
+
+typedef void (*par_work)(size_t lo, size_t hi, int slot, void *ctx);
+typedef struct {
+	par_work work;
+	void *ctx;
+	size_t lo, hi;
+	int slot;
+} par_arg;
+
+static void *par_spawn(void *p)
+{
+	par_arg *a = p;
+	a->work(a->lo, a->hi, a->slot, a->ctx);
+	return NULL;
+}
+
+/* run work() over [lo,hi) split into nthreads contiguous slices. A failed
+ * pthread_create runs that slice inline; par_run always joins everything
+ * it created before returning. */
+static void par_run(size_t lo, size_t hi, int nthreads, par_work work, void *ctx)
+{
+	size_t len = hi - lo;
+	if ((size_t)nthreads > len)
+		nthreads = (int)len;
+	if (nthreads <= 1) {
+		work(lo, hi, 0, ctx);
+		return;
+	}
+	par_arg arg[PAR_MAX_THREADS];
+	pthread_t th[PAR_MAX_THREADS];
+	int created[PAR_MAX_THREADS];
+	size_t span = len / (size_t)nthreads;
+	size_t start = lo;
+	for (int k = 0; k < nthreads; k++) {
+		size_t end = (k == nthreads - 1) ? hi : start + span;
+		arg[k] = (par_arg){ work, ctx, start, end, k };
+		created[k] = pthread_create(&th[k], NULL, par_spawn, &arg[k]) == 0;
+		start = end;
+	}
+	for (int k = 0; k < nthreads; k++)
+		if (created[k])
+			pthread_join(th[k], NULL);
+}
+
+typedef struct {
+	size_t *a;
+	size_t n, cap;
+} par_list;
+
+typedef struct {
+	size_t (*pos_line)(size_t p);	/* position -> line index */
+	int (*match)(const Line *L, regmatch_t *m);
+	int inv;
+	par_list *lst;			/* per-slot match collectors */
+} col_ctx;
+
+static void col_work(size_t lo, size_t hi, int slot, void *ctx)
+{
+	col_ctx *c = ctx;
+	par_list *b = &c->lst[slot];
+	regmatch_t m;
+	for (size_t p = lo; p < hi; p++) {
+		size_t li = c->pos_line(p);
+		if (c->match(&lines[li], &m) != c->inv) {
+			if (b->n == b->cap) {
+				b->cap = b->cap ? b->cap * 2 : 512;
+				b->a = xrealloc(b->a, b->cap * sizeof(*b->a));
+			}
+			b->a[b->n++] = li;
+		}
+	}
+}
+
+/* Append to *arr every position p in [lo,hi) whose line
+ * match(lines[pos_line(p)]) != inv, preserving position order. Each
+ * pthread builds one slice; the slices concatenate in slot order. */
+static void scan_collect(size_t lo, size_t hi, size_t (*pos_line)(size_t),
+			 int (*match)(const Line *L, regmatch_t *m), int inv,
+			 size_t **arr, size_t *n, size_t *cap)
+{
+	int nthreads = par_threads(hi - lo);
+	if (nthreads <= 1) {
+		regmatch_t m;
+		for (size_t p = lo; p < hi; p++) {
+			size_t li = pos_line(p);
+			if (match(&lines[li], &m) != inv) {
+				if (*n == *cap) {
+					*cap = *cap ? *cap * 2 : 1024;
+					*arr = xrealloc(*arr, *cap * sizeof(**arr));
+				}
+				(*arr)[(*n)++] = li;
+			}
+		}
+		return;
+	}
+	par_list lst[PAR_MAX_THREADS] = {0};
+	col_ctx c = { pos_line, match, inv, lst };
+	par_run(lo, hi, nthreads, col_work, &c);
+	size_t tot = 0;
+	for (int k = 0; k < nthreads; k++)
+		tot += lst[k].n;
+	if (*n + tot > *cap) {
+		size_t want = *n + tot;
+		size_t nc = *cap ? *cap : 1024;
+		while (nc < want)
+			nc *= 2;
+		*cap = nc;
+		*arr = xrealloc(*arr, *cap * sizeof(**arr));
+	}
+	size_t out = *n;
+	for (int k = 0; k < nthreads; k++) {
+		if (lst[k].n)
+			memcpy(*arr + out, lst[k].a, lst[k].n * sizeof(**arr));
+		out += lst[k].n;
+		free(lst[k].a);
+	}
+	*n = out;
+}
+
+static size_t pos_ident(size_t p) { return p; }
+static size_t pos_view(size_t p) { return view[p]; }
 
 /* Narrow an extended query in place: appending chars can only shrink
  * the match set, so survivors must already be in view[]. */
 static void refilter_narrow(void)
 {
-	regmatch_t m;
-	size_t k = 0;
-	for (size_t i = 0; i < nv; i++)
-		if (query_match(&lines[view[i]], &m) != filter_inv)
-			view[k++] = view[i];
-	nv = k;
+	size_t *tmp = NULL, n = 0, cap = 0;
+	scan_collect(0, nv, pos_view, query_match, filter_inv, &tmp, &n, &cap);
+	memcpy(view, tmp, n * sizeof(*view));
+	free(tmp);
+	nv = n;
 }
 
 static void update_filter(const char *q)
 {
 	int was_filtered = filtered, clearing = !*q;
+	int was_literal = filtered && !filtered_re && !filtered_alt;
 	char prev[sizeof query];
 	snprintf(prev, sizeof prev, "%s", query);
 	size_t was = nv ? view[cur] : 0;
@@ -1111,30 +1381,36 @@ static void update_filter(const char *q)
 		if (filtered && filtered_re)
 			regfree(&re);
 		filtered_re = 0;
+		filtered_alt = 0;
 		filtered = 0;
 		filter_inv = 0;
 		query[0] = 0;
 		lit.len = 0;
 	} else {
 		int icase = smart_case(q);
+		int is_alt = re_mode && alt_parse(q, icase, &alt);
 		regex_t nr;
-		if (re_mode) {
-			int flags = REG_EXTENDED | (icase ? REG_ICASE : 0);
-			if (regcomp(&nr, q, flags) != 0) {
+		int is_re = 0;
+		if (re_mode && !is_alt) {
+			if (regcomp(&nr, q, REG_EXTENDED | (icase ? REG_ICASE : 0))) {
 				snprintf(msg, sizeof msg, "bad regex: %.100s", q);
 				return;
 			}
+			is_re = 1;
 		}
 		/* compile before freeing: a bad regex must keep the old view */
 		if (filtered && filtered_re)
 			regfree(&re);
 		filtered_re = 0;
-		if (re_mode) {
+		filtered_alt = 0;
+		if (is_alt)
+			filtered_alt = 1;
+		else if (is_re) {
 			re = nr;
 			filtered_re = 1;
-		} else {
-			lit_parse(q, icase, &lit);
 		}
+		else
+			lit_parse(q, icase, &lit);
 		filtered = 1;
 		snprintf(query, sizeof query, "%s", q);
 	}
@@ -1142,7 +1418,7 @@ static void update_filter(const char *q)
 	 * re-testing just view[] suffices -- but only while including.
 	 * Inverted, shrinking matches make outside lines eligible. */
 	size_t prevlen = strlen(prev);
-	if (was_filtered && !clearing && !filter_inv && prevlen &&
+	if (was_literal && !re_mode && !clearing && !filter_inv && prevlen &&
 	    strlen(q) > prevlen && !memcmp(q, prev, prevlen))
 		refilter_narrow();
 	else
@@ -1180,10 +1456,8 @@ static void update_filter(const char *q)
 
 static void extend_view(size_t from)
 {
-	regmatch_t m;
-	for (size_t i = from; i < nlines; i++)
-		if (query_match(&lines[i], &m) != filter_inv)
-			push_view(i);
+	scan_collect(from, nlines, pos_ident, query_match, filter_inv,
+		     &view, &nv, &vcap);
 }
 
 static void rebuild_view(void)
@@ -1200,8 +1474,27 @@ static int search_match(const Line *L, regmatch_t *m)
 		return 0;
 	/* a zero-width regex match is not a hit: n/N and the scrollbar need
 	 * a real span to land on */
-	return pattern_match(L, searched_re, &sre, &slit, m) &&
+	return pattern_match(L, searched_re, searched_alt, &sre, &slit, &salt, m) &&
 	       (!searched_re || m->rm_eo > m->rm_so);
+}
+
+/* per-line half of update_search, run across N threads */
+typedef struct { int extend; } search_ctx;
+
+static void search_work(size_t lo, size_t hi, int slot, void *ctx)
+{
+	search_ctx *c = ctx;
+	(void)slot;
+	for (size_t i = lo; i < hi; i++) {
+		if (!searched) {
+			lines[i].srchit = 0;
+			continue;
+		}
+		if (c->extend && !lines[i].srchit)
+			continue;
+		regmatch_t sm;
+		lines[i].srchit = (unsigned char)search_match(&lines[i], &sm);
+	}
 }
 
 /* commit a highlight-search pattern: validate, then mark every line.
@@ -1214,31 +1507,33 @@ static void update_search(const char *q)
 	size_t prevlen = strlen(prev);
 	int extend = searched && !searched_re && !re_mode && prevlen &&
 		     strlen(q) > prevlen && !memcmp(q, prev, prevlen);
+	searched_alt = 0;
 	if (*q && re_mode) {
-		regex_t nr;
-		if (regcomp(&nr, q, REG_EXTENDED | (icase ? REG_ICASE : 0))) {
-			snprintf(msg, sizeof msg, "bad regex: %.100s", q);
-			return;	/* keep the old search */
+		if (alt_parse(q, icase, &salt)) {
+			searched_alt = 1;
+			if (searched_re)
+				regfree(&sre);
+			searched_re = 0;
+		} else {
+			regex_t nr;
+			if (regcomp(&nr, q, REG_EXTENDED | (icase ? REG_ICASE : 0))) {
+				snprintf(msg, sizeof msg, "bad regex: %.100s", q);
+				return;	/* keep the old search */
+			}
+			if (searched_re)
+				regfree(&sre);
+			sre = nr;
+			searched_re = 1;
 		}
-		if (searched_re)
-			regfree(&sre);
-		sre = nr;
-		searched_re = 1;
 	} else if (*q) {
 		lit_parse(q, icase, &slit);
 		searched_re = 0;
 	}
 	snprintf(search, sizeof search, "%s", q);
 	searched = !!*q;
-	for (size_t i = 0; i < nlines; i++) {
-		if (!searched) {
-			lines[i].srchit = 0;
-			continue;
-		}
-		if (extend && !lines[i].srchit)
-			continue;
-		regmatch_t sm;
-		lines[i].srchit = (unsigned char)search_match(&lines[i], &sm);
+	{
+		search_ctx c = { extend };
+		par_run(0, nlines, par_threads(nlines), search_work, &c);
 	}
 	snprintf(prev, sizeof prev, "%s", q);
 	dirty = 1;

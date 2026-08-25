@@ -322,6 +322,51 @@ static void test_update_filter_state(void)
 	CHECK(!filtered && !filtered_re);
 }
 
+static void test_alt(void)
+{
+	AltSpec as;
+	Line L;
+	regmatch_t m;
+
+	/* alternation-of-literals is recognized */
+	CHECK(alt_parse("error|warn|panic", 1, &as) == 1 && as.n == 3 && as.icase == 1);
+	CHECK(alt_parse("^foo|bar$", 1, &as) == 1 && as.n == 2 &&
+	      as.bol[0] == 1 && as.eol[1] == 1);
+	CHECK(alt_parse("^error$", 1, &as) == 1 && as.n == 1 &&
+	      as.bol[0] && as.eol[0]);
+	CHECK(alt_parse("a\\|b", 1, &as) == 1 && as.n == 1 && as.len[0] == 3);
+
+	/* anything with real regex features falls back to glibc */
+	CHECK(alt_parse("[0-9]+", 1, &as) == 0);
+	CHECK(alt_parse("a.b", 1, &as) == 0);
+	CHECK(alt_parse("(a|b)", 1, &as) == 0);
+	CHECK(alt_parse("a|", 1, &as) == 0);
+	CHECK(alt_parse("^$", 1, &as) == 0);
+	CHECK(alt_parse("a\\d", 1, &as) == 0);
+	CHECK(alt_parse("error.*|warn", 1, &as) == 0);
+
+	/* a match lands on the leftmost literal and reports its span */
+	CHECK(alt_parse("error|warn", 1, &as) == 1);
+	L.s = "something error happened";
+	L.len = strlen(L.s);
+	CHECK(alt_match(&as, &L, &m) == 1 && m.rm_so == 10 && m.rm_eo == 15);
+
+	/* ties at the same start go to the longest (POSIX-ish) */
+	CHECK(alt_parse("error|errorx", 1, &as) == 1);
+	L.s = "errorx";
+	L.len = strlen(L.s);
+	CHECK(alt_match(&as, &L, &m) == 1 && m.rm_eo == 6);
+
+	/* per-piece anchors hold */
+	CHECK(alt_parse("^sshd", 1, &as) == 1 && as.bol[0]);
+	L.s = "xsshd";
+	L.len = strlen(L.s);
+	CHECK(alt_match(&as, &L, &m) == 0);
+	L.s = "sshd ok";
+	L.len = strlen(L.s);
+	CHECK(alt_match(&as, &L, &m) == 1 && m.rm_so == 0);
+}
+
 int main(void)
 {
 	test_tag_span();
@@ -334,6 +379,7 @@ int main(void)
 	test_severity();
 	test_b64enc();
 	test_update_filter_state();
+	test_alt();
 
 	if (fails) {
 		printf("%d failure(s)\n", fails);

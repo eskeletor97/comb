@@ -1,13 +1,17 @@
 CC ?= cc
 CFLAGS ?= -O2 -Wall -Wextra
+THREADS ?= -pthread
 
 PREFIX ?= /usr/local
 
 comb: comb.c config.h
-	$(CC) $(CFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) $(THREADS) -o $@ $<
 
 tests/selftest: tests/selftest.c comb.c config.h
-	$(CC) $(CFLAGS) -o $@ tests/selftest.c
+	$(CC) $(CFLAGS) $(THREADS) -o $@ tests/selftest.c
+
+tests/loadbench: tests/loadbench.c comb.c config.h
+	$(CC) $(CFLAGS) $(THREADS) -o $@ tests/loadbench.c
 
 check: comb tests/selftest
 	./tests/selftest
@@ -22,6 +26,6 @@ uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/comb.1
 
 clean:
-	rm -f comb tests/selftest
+	rm -f comb tests/selftest tests/loadbench
 
 .PHONY: check clean install uninstall
