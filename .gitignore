@@ -1,4 +1,5 @@
 comb
+tests/selftest
 *.o
 __pycache__/
 *.pyc

@@ -33,6 +33,14 @@ typedef struct {
 	const char *sev;	/* severity SGR cache, NULL = unscanned */
 } Line;
 
+/* parsed literal pattern, shared shape for the filter's and search's
+ * matchers: buffer + ^/$ anchors + smart-case flag */
+typedef struct {
+	char buf[MAX_QUERY];
+	size_t len;		/* 0: degenerate pattern, matches everywhere */
+	int bol, eol, icase;
+} LitSpec;
+
 static Line *lines;
 static size_t nlines, lcap;
 
@@ -61,9 +69,7 @@ static int searched;
 static int editing_search;	/* prompt currently edits search, not filter */
 static regex_t sre;
 static int searched_re;
-static char slit_buf[MAX_QUERY];
-static size_t slit_len;
-static int slit_bol, slit_eol, slit_icase;
+static LitSpec slit;
 
 static int follow = 1;
 static int wrap;
@@ -708,22 +714,30 @@ static void rebuild_view(void);
  * orders of magnitude over millions of lines. The pattern is a plain
  * substring; leading ^ / trailing $ anchor to line start/end. Ctrl-R
  * in the prompt flips to POSIX ERE mode instead. */
-static char lit_buf[MAX_QUERY];
-static size_t lit_len;		/* 0: degenerate pattern, matches everywhere */
-static int lit_bol, lit_eol, lit_icase;
+static LitSpec lit;
 
-static void lit_update(const char *q, int icase)
+/* lowercase query matches case-insensitively; any uppercase flips exact */
+static int smart_case(const char *q)
 {
-	lit_len = 0;
-	lit_bol = (*q == '^');
-	const char *p = q + lit_bol;
+	for (const char *p = q; *p; p++)
+		if (isupper((unsigned char)*p))
+			return 0;
+	return 1;
+}
+
+/* shared parse for the filter's and the highlight-search literal machines */
+static void lit_parse(const char *q, int icase, LitSpec *ls)
+{
+	ls->len = 0;
+	ls->bol = (*q == '^');
+	const char *p = q + ls->bol;
 	size_t n = strlen(p);
-	lit_eol = n > 0 && p[n - 1] == '$';
-	if (lit_eol)
+	ls->eol = n > 0 && p[n - 1] == '$';
+	if (ls->eol)
 		n--;
-	memcpy(lit_buf, p, n);
-	lit_len = n;
-	lit_icase = icase;
+	memcpy(ls->buf, p, n);
+	ls->len = n;
+	ls->icase = icase;
 }
 
 /* byte offset of the first hit of pat[0..patlen) in s[0..len), or -1;
@@ -770,7 +784,7 @@ static ptrdiff_t pat_find(const char *pat, size_t patlen, int bol, int eol,
 /* byte offset of the first literal filter hit in s[0..len), or -1 */
 static ptrdiff_t lit_find(const char *s, size_t len)
 {
-	return pat_find(lit_buf, lit_len, lit_bol, lit_eol, lit_icase, s, len);
+	return pat_find(lit.buf, lit.len, lit.bol, lit.eol, lit.icase, s, len);
 }
 
 /* active-filter test; on match fills m with the highlight span */
@@ -785,7 +799,7 @@ static int query_match(const Line *L, regmatch_t *m)
 		if (off < 0)
 			return 0;
 		m->rm_so = (regoff_t)off;
-		m->rm_eo = (regoff_t)(off + lit_len);
+		m->rm_eo = (regoff_t)(off + lit.len);
 		return 1;
 	}
 	m->rm_so = 0;
@@ -822,14 +836,9 @@ static void update_filter(const char *q)
 		filtered = 0;
 		filter_inv = 0;
 		query[0] = 0;
-		lit_len = 0;
+		lit.len = 0;
 	} else {
-		int icase = 1;
-		for (const char *p = q; *p; p++)
-			if (isupper((unsigned char)*p)) {
-				icase = 0;
-				break;
-			}
+		int icase = smart_case(q);
 		regex_t nr;
 		if (re_mode) {
 			int flags = REG_EXTENDED | (icase ? REG_ICASE : 0);
@@ -846,7 +855,7 @@ static void update_filter(const char *q)
 			re = nr;
 			filtered_re = 1;
 		} else {
-			lit_update(q, icase);
+			lit_parse(q, icase, &lit);
 		}
 		filtered = 1;
 		snprintf(query, sizeof query, "%s", q);
@@ -916,12 +925,12 @@ static int search_match(const Line *L, regmatch_t *m)
 	if (searched_re)
 		return regexec(&sre, L->s, 1, m, REG_STARTEND) == 0 &&
 		       m->rm_eo > m->rm_so;
-	ptrdiff_t off = pat_find(slit_buf, slit_len, slit_bol, slit_eol,
-				 slit_icase, L->s, L->len);
+	ptrdiff_t off = pat_find(slit.buf, slit.len, slit.bol, slit.eol,
+				 slit.icase, L->s, L->len);
 	if (off < 0)
 		return 0;
 	m->rm_so = (regoff_t)off;
-	m->rm_eo = (regoff_t)(off + (ptrdiff_t)slit_len);
+	m->rm_eo = (regoff_t)(off + (ptrdiff_t)slit.len);
 	return 1;
 }
 
@@ -931,12 +940,7 @@ static int search_match(const Line *L, regmatch_t *m)
 static void update_search(const char *q)
 {
 	static char prev[MAX_QUERY];
-	int icase = 1;
-	for (const char *p = q; *p; p++)
-		if (isupper((unsigned char)*p)) {
-			icase = 0;
-			break;
-		}
+	int icase = smart_case(q);
 	size_t prevlen = strlen(prev);
 	int extend = searched && !searched_re && !re_mode && prevlen &&
 		     strlen(q) > prevlen && !memcmp(q, prev, prevlen);
@@ -951,15 +955,7 @@ static void update_search(const char *q)
 		sre = nr;
 		searched_re = 1;
 	} else if (*q) {
-		slit_bol = (*q == '^');
-		const char *p = q + slit_bol;
-		size_t n = strlen(p);
-		slit_eol = n > 0 && p[n - 1] == '$';
-		if (slit_eol)
-			n--;
-		memcpy(slit_buf, p, n);
-		slit_len = n;
-		slit_icase = icase;
+		lit_parse(q, icase, &slit);
 		searched_re = 0;
 	}
 	snprintf(search, sizeof search, "%s", q);

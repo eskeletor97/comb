@@ -96,27 +96,27 @@ static void test_lit_find(void)
 	memset(big, 'x', sizeof big - 1);
 	big[sizeof big - 1] = 0;
 
-	lit_update("", 0);
-	CHECK(lit_len == 0);
+	lit_parse("", 0, &lit);
+	CHECK(lit.len == 0);
 	CHECK(lit_find("anything", 8) == 0);
 
-	lit_update("^err", 0);
+	lit_parse("^err", 0, &lit);
 	CHECK(lit_find("error", 5) == 0);
 	CHECK(lit_find("xerror", 6) == -1);
 
-	lit_update("err$", 0);
+	lit_parse("err$", 0, &lit);
 	CHECK(lit_find("xerr", 4) == 1);
 	CHECK(lit_find("xerra", 5) == -1);
 
-	lit_update("^err$", 0);
+	lit_parse("^err$", 0, &lit);
 	CHECK(lit_find("err", 3) == 0);
 	CHECK(lit_find("errs", 4) == -1);
 
-	lit_update("Ab", 1);
+	lit_parse("Ab", 1, &lit);
 	CHECK(lit_find("zabc", 4) == 1);
 	CHECK(lit_find("ZABC", 4) == 1);
 
-	lit_update("needle", 0);
+	lit_parse("needle", 0, &lit);
 	snprintf(big, sizeof big, "%s needle", big + 290);
 	CHECK(lit_find(big, strlen(big)) > 0);
 }
