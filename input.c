@@ -3,25 +3,9 @@
 #define _GNU_SOURCE
 #include "comb.h"
 
-#include <ctype.h>
-#include <errno.h>
-#include <fcntl.h>
 #include <poll.h>
-#include <regex.h>
-#include <signal.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <strings.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <termios.h>
-#include <time.h>
 #include <unistd.h>
-#include <pthread.h>
 
 static int mdir = -1;	/* space/x sweep direction: -1 up, 1 down */
 
@@ -397,7 +381,7 @@ void view_action(int act)
 		editing_search = 0;
 		filter_anchor = nv ? view[cur] : 0;
 		filter_row = cur - top;
-		snprintf(edit, sizeof edit, "%s", query);
+		snprintf(edit, sizeof edit, "%s", filter_pat.text);
 		ecur = strlen(edit);
 		break;
 	case A_MARK:
@@ -419,7 +403,7 @@ void view_action(int act)
 		break;
 	}
 	case A_CLEAR_FILTER:
-		if (filtered) {
+		if (filter_pat.active) {
 			edit[0] = 0;
 			update_filter("");
 		}
@@ -427,12 +411,12 @@ void view_action(int act)
 	case A_SEARCH:
 		editing = 1;
 		editing_search = 1;
-		snprintf(edit, sizeof edit, "%s", search);
+		snprintf(edit, sizeof edit, "%s", search_pat.text);
 		ecur = strlen(edit);
 		break;
 	case A_SNEXT:
 	case A_SPREV: {
-		if (!searched || !nlines || !nv)
+		if (!search_pat.active || !nlines || !nv)
 			break;
 		int dir = act == A_SNEXT ? 1 : -1;
 		/* walk the visible view[], not the file: srchit is set on every
@@ -469,7 +453,7 @@ void view_action(int act)
 		break;
 	}
 	case A_CLEAR_SEARCH:
-		if (searched) {
+		if (search_pat.active) {
 			update_search("");
 			snprintf(msg, sizeof msg, "search cleared");
 		}
@@ -478,7 +462,7 @@ void view_action(int act)
 		if (nmarked) {
 			clear_marks();
 			snprintf(msg, sizeof msg, "marks cleared");
-		} else if (filtered) {
+		} else if (filter_pat.active) {
 			edit[0] = 0;
 			update_filter("");
 		}

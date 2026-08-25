@@ -91,41 +91,42 @@ static void test_sanitize(void)
 	CHECK(n == 3 && !strcmp(o, "axb"));
 }
 
-static ptrdiff_t lf(const char *s, size_t n)
+static ptrdiff_t lf(LitSpec *ls, const char *s, size_t n)
 {
-	return pat_find(lit.buf, lit.len, lit.bol, lit.eol, lit.icase, s, n);
+	return pat_find(ls->buf, ls->len, ls->bol, ls->eol, ls->icase, s, n);
 }
 
 static void test_lit_find(void)
 {
 	char big[300];
+	LitSpec lit;
 
 	memset(big, 'x', sizeof big - 1);
 	big[sizeof big - 1] = 0;
 
 	lit_parse("", 0, &lit);
 	CHECK(lit.len == 0);
-	CHECK(lf("anything", 8) == 0);
+	CHECK(lf(&lit, "anything", 8) == 0);
 
 	lit_parse("^err", 0, &lit);
-	CHECK(lf("error", 5) == 0);
-	CHECK(lf("xerror", 6) == -1);
+	CHECK(lf(&lit, "error", 5) == 0);
+	CHECK(lf(&lit, "xerror", 6) == -1);
 
 	lit_parse("err$", 0, &lit);
-	CHECK(lf("xerr", 4) == 1);
-	CHECK(lf("xerra", 5) == -1);
+	CHECK(lf(&lit, "xerr", 4) == 1);
+	CHECK(lf(&lit, "xerra", 5) == -1);
 
 	lit_parse("^err$", 0, &lit);
-	CHECK(lf("err", 3) == 0);
-	CHECK(lf("errs", 4) == -1);
+	CHECK(lf(&lit, "err", 3) == 0);
+	CHECK(lf(&lit, "errs", 4) == -1);
 
 	lit_parse("Ab", 1, &lit);
-	CHECK(lf("zabc", 4) == 1);
-	CHECK(lf("ZABC", 4) == 1);
+	CHECK(lf(&lit, "zabc", 4) == 1);
+	CHECK(lf(&lit, "ZABC", 4) == 1);
 
 	lit_parse("needle", 0, &lit);
 	snprintf(big, sizeof big, "%s needle", big + 290);
-	CHECK(lf(big, strlen(big)) > 0);
+	CHECK(lf(&lit, big, strlen(big)) > 0);
 }
 
 static void test_widths(void)
@@ -309,26 +310,26 @@ static void test_b64enc(void)
 
 static void test_update_filter_state(void)
 {
-	filtered = filtered_re = 0;
+	filter_pat.active = filter_pat.is_re = 0;
 	re_mode = 1;
 
 	update_filter("a.*[0-9]+");	/* valid regex */
 	job_flush();
-	CHECK(filtered && filtered_re);
+	CHECK(filter_pat.active && filter_pat.is_re);
 
 	msg[0] = 0;
 	update_filter("[a+b(c)|");	/* bad regex keeps the old view */
 	CHECK(strstr(msg, "bad regex"));
-	CHECK(filtered && filtered_re && !strcmp(query, "a.*[0-9]+"));
+	CHECK(filter_pat.active && filter_pat.is_re && !strcmp(filter_pat.text, "a.*[0-9]+"));
 
 	update_filter("");		/* clear */
 	job_flush();
-	CHECK(!filtered && !filtered_re);
+	CHECK(!filter_pat.active && !filter_pat.is_re);
 }
 
 static void test_job_cancel(void)
 {
-	filtered = filtered_re = 0;
+	filter_pat.active = filter_pat.is_re = 0;
 	re_mode = 1;
 	push_line("abc here", 8);
 	push_line("nothing", 7);
@@ -342,12 +343,12 @@ static void test_job_cancel(void)
 	CHECK(job_active);
 	job_finish(0);			/* bail before commit */
 	CHECK(!job_active);
-	CHECK(filtered_re && !strcmp(query, "a.c")); /* old pattern kept */
+	CHECK(filter_pat.is_re && !strcmp(filter_pat.text, "a.c")); /* old pattern kept */
 	CHECK(nv == nv_before);		/* old view kept */
 
 	update_filter("");
 	job_flush();
-	CHECK(!filtered && nv == 2);
+	CHECK(!filter_pat.active && nv == 2);
 }
 
 static void test_alt(void)

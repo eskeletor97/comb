@@ -5,23 +5,9 @@
 #include "comb.h"
 
 #include <ctype.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <regex.h>
-#include <signal.h>
-#include <stdarg.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <termios.h>
-#include <time.h>
-#include <unistd.h>
 #include <pthread.h>
 
 #if defined(__SSE2__) && defined(__GNUC__)
@@ -260,45 +246,65 @@ static int alt_match(const AltSpec *as, const Line *L, regmatch_t *m)
 	return 1;
 }
 
-/* shared matcher for the filter and the highlight search: dispatch a
- * literal LitSpec or a compiled regex against one line, filling m with
- * the match (highlight) span */
-int pattern_match(const Line *L, int is_re, int is_alt,
-			 const regex_t *re, const LitSpec *ls,
-			 const AltSpec *alt, regmatch_t *m)
+/* shared matcher for one Pat spec: dispatch its literal, literal
+ * alternation or compiled regex against one line, filling m with the
+ * match (highlight) span */
+static int pattern_match(const Line *L, const Pat *p, regmatch_t *m)
 {
-	if (is_alt)
-		return alt_match(alt, L, m);
-	if (is_re) {
+	if (p->is_alt)
+		return alt_match(&p->alt, L, m);
+	if (p->is_re) {
 		m->rm_so = 0;
 		m->rm_eo = (regoff_t)L->len;	/* REG_STARTEND: no NUL needed */
-		return regexec(re, L->s, 1, m, REG_STARTEND) == 0;
+		return regexec(&p->re, L->s, 1, m, REG_STARTEND) == 0;
 	}
-	ptrdiff_t off = pat_find(ls->buf, ls->len, ls->bol, ls->eol,
-				 ls->icase, L->s, L->len);
+	ptrdiff_t off = pat_find(p->lit.buf, p->lit.len, p->lit.bol, p->lit.eol,
+				 p->lit.icase, L->s, L->len);
 	if (off < 0)
 		return 0;
 	m->rm_so = (regoff_t)off;
-	m->rm_eo = (regoff_t)(off + (ptrdiff_t)ls->len);
+	m->rm_eo = (regoff_t)(off + (ptrdiff_t)p->lit.len);
 	return 1;
 }
 
 /* active-filter test; on match fills m with the highlight span */
 int query_match(const Line *L, regmatch_t *m)
 {
-	if (jf_on) {	/* a scan is testing a candidate pattern */
-		if (jf_all)	/* clearing: every line matches again */
-			goto empty;
-		return pattern_match(L, jf_re, jf_alt, &jfre, &jflit, &jfalt, m);
+	if (pending_pat.active) {	/* a scan is testing a candidate pattern */
+		/* an empty candidate text is a pending clear: the empty literal
+		 * matches every line again, with an empty highlight span */
+		return pattern_match(L, &pending_pat, m);
 	}
-	if (!filtered) {
-empty:
+	if (!filter_pat.active) {
 		m->rm_so = m->rm_eo = 0;	/* empty span: nothing to highlight */
 		return 1;
 	}
 	/* no zero-width guard here: the return decides view membership, and
 	 * a pattern like a* matching empty must keep lines visible */
-	return pattern_match(L, filtered_re, filtered_alt, &re, &lit, &alt, m);
+	return pattern_match(L, &filter_pat, m);
+}
+
+/* does the highlight-search pattern hit this line? fills m with the span.
+ * While a search job is in flight the pending pattern answers: workers
+ * must test the new query while n/N and the scrollbar keep serving the
+ * previous results until commit. An empty candidate query must answer
+ * "no hits" rather than falling back to the committed search -- lines
+ * pushed mid-sweep are never rewritten at commit (see job_finish). */
+int search_match(const Line *L, regmatch_t *m)
+{
+	const Pat *p = pending_pat.active ? &pending_pat : &search_pat;
+	int on = p->active && (p != &pending_pat || p->enable_on_commit);
+	regmatch_t mm;
+	if (!on)
+		return 0;
+	if (!pattern_match(L, p, &mm))
+		return 0;
+	/* a zero-width regex match is not a hit: n/N and the scrollbar need
+	 * a real span to land on */
+	if (p->is_re && mm.rm_eo == mm.rm_so)
+		return 0;
+	*m = mm;
+	return 1;
 }
 
 /* --- parallel scan --------------------------------------------------

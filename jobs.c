@@ -4,32 +4,33 @@
 #define _GNU_SOURCE
 #include "comb.h"
 
-#include <ctype.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <regex.h>
-#include <signal.h>
-#include <stdarg.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <termios.h>
-#include <time.h>
-#include <unistd.h>
-#include <pthread.h>
 
 /* jobs-private bookkeeping: the pending-pattern details nobody else reads */
 static int js_extend;		/* search extends a literal prefix */
 static int jf_clearing, jf_was_filtered;	/* commit-time cursor anchoring */
 static size_t jf_was, jf_was_row;
-static char jf_q[MAX_QUERY], js_q[MAX_QUERY];
 static char search_prev[MAX_QUERY];	/* last committed search text */
+
+/* swap a finished candidate into its committed slot. Ownership of src->re
+ * moves to dst; clearing src->is_re marks that so no later regfree of the
+ * pending spec can ever touch the same regex twice. */
+static void install_pattern(Pat *dst, Pat *src)
+{
+	if (dst->is_re)
+		regfree(&dst->re);
+	dst->is_re = src->is_re;
+	dst->is_alt = src->is_alt;
+	if (src->is_re)
+		dst->re = src->re;
+	else if (src->is_alt)
+		dst->alt = src->alt;
+	else
+		dst->lit = src->lit;
+	src->is_re = src->is_alt = 0;
+	snprintf(dst->text, sizeof dst->text, "%s", src->text);
+}
 
 /* layout: log pane, then status bar (source/position/keys), then the
  * command line -- everything worth looking at sits at the bottom, near
@@ -145,7 +146,8 @@ static void job_restore_edit(void)
 {
 	if (!editing)
 		return;
-	snprintf(edit, sizeof edit, "%s", editing_search ? search : query);
+	snprintf(edit, sizeof edit, "%s",
+		 editing_search ? search_pat.text : filter_pat.text);
 	ecur = strlen(edit);
 	pending_update = 0;
 }
@@ -155,11 +157,9 @@ void job_discard(void)
 {
 	if (!job_active)
 		return;
-	if (jf_on && jf_re)
-		regfree(&jfre);
-	if (js_on && js_re)
-		regfree(&jsre);
-	jf_on = js_on = 0;
+	if (pending_pat.active && pending_pat.is_re)
+		regfree(&pending_pat.re);
+	pending_pat.active = 0;
 	job_active = 0;
 	free(job_arr);
 	job_arr = NULL;
@@ -196,35 +196,17 @@ void job_finish(int commit)
 	int kind = job_kind;
 	size_t i;
 	job_active = 0;
-	jf_on = js_on = 0;	/* matchers fall back to committed patterns */
+	pending_pat.active = 0;		/* matchers fall back to committed specs */
+	if (!commit && pending_pat.is_re) {	/* cancelled candidate: unowned now */
+		regfree(&pending_pat.re);
+		pending_pat.is_re = 0;
+	}
 	if (kind == K_SEARCH) {
 		if (commit) {
-			if (js_re) {
-				regex_t old;
-				if (searched_re) {
-					old = sre;
-					sre = jsre;
-					regfree(&old);
-				} else {
-					sre = jsre;
-				}
-				searched_re = 1;
-				searched_alt = 0;
-			} else if (js_alt) {
-				if (searched_re)
-					regfree(&sre);
-				salt = jsalt;
-				searched_alt = 1;
-				searched_re = 0;
-			} else {
-				if (searched_re)
-					regfree(&sre);
-				slit = jslit;
-				searched_re = searched_alt = 0;
-			}
-			searched = js_active;
-			snprintf(search, sizeof search, "%s", js_q);
-			snprintf(search_prev, sizeof search_prev, "%s", js_q);
+			install_pattern(&search_pat, &pending_pat);
+			search_pat.active = pending_pat.enable_on_commit;
+			snprintf(search_prev, sizeof search_prev, "%s",
+				 pending_pat.text);
 			for (i = 0; i < job_end && i < nlines; i++)
 				lines[i].srchit = job_hits[i];
 		} else {
@@ -233,7 +215,7 @@ void job_finish(int commit)
 			for (i = job_end; i < nlines; i++) {
 				regmatch_t sm;
 				lines[i].srchit = (unsigned char)
-					(searched && search_match(&lines[i], &sm));
+					search_match(&lines[i], &sm);
 			}
 			job_restore_edit();
 		}
@@ -256,42 +238,16 @@ void job_finish(int commit)
 	} else {	/* K_VIEW_REPLACE / K_VIEW_NARROW */
 		if (commit) {
 			if (kind == K_VIEW_REPLACE) {
-				if (jf_all) {	/* clearing: back to unfiltered */
-					if (filtered && filtered_re)
-						regfree(&re);
-					filtered_re = 0;
-					filtered_alt = 0;
-					filtered = 0;
+				if (!*pending_pat.text) {	/* clearing: unfiltered */
+					if (filter_pat.is_re)
+						regfree(&filter_pat.re);
+					memset(&filter_pat, 0,
+					       sizeof filter_pat);
 					filter_inv = 0;
-					query[0] = 0;
-					lit.len = 0;
 				} else {
-					if (jf_re) {
-						regex_t old;
-						if (filtered && filtered_re) {
-							old = re;
-							re = jfre;
-							regfree(&old);
-						} else {
-							re = jfre;
-						}
-						filtered_re = 1;
-						filtered_alt = 0;
-					} else if (jf_alt) {
-						if (filtered && filtered_re)
-							regfree(&re);
-						alt = jfalt;
-						filtered_alt = 1;
-						filtered_re = 0;
-					} else {
-						if (filtered && filtered_re)
-							regfree(&re);
-						lit = jflit;
-						filtered_re = 0;
-						filtered_alt = 0;
-					}
-					filtered = 1;
-					snprintf(query, sizeof query, "%s", jf_q);
+					install_pattern(&filter_pat,
+							&pending_pat);
+					filter_pat.active = 1;
 				}
 			}
 			if (vcap < job_n) {
@@ -351,7 +307,8 @@ void step_job(void)
 	size_t hi = job_end - job_pos > JOB_BATCH
 			    ? job_pos + JOB_BATCH : job_end;
 	if (job_kind == K_SEARCH) {
-		sjob_ctx c = { job_hits, js_on && js_active, js_extend };
+		sjob_ctx c = { job_hits, pending_pat.active &&
+				       pending_pat.enable_on_commit, js_extend };
 		par_run(job_pos, hi, par_threads(hi - job_pos),
 			search_job_work, &c);
 	} else {
@@ -390,7 +347,7 @@ void start_extend_view(size_t from)
 	if (from >= nlines)
 		return;
 	job_discard();
-	jf_on = 0;		/* workers test the committed pattern */
+	pending_pat.active = 0;		/* workers test the committed pattern */
 	job_kind = K_VIEW_EXTEND;
 	job_inv = filter_inv;
 	job_lo = from;
@@ -402,35 +359,42 @@ void start_extend_view(size_t from)
 
 void update_filter(const char *q)
 {
-	int was_filtered = filtered, clearing = !*q;
-	int was_literal = filtered && !filtered_re && !filtered_alt;
-	char prev[sizeof query];
-	snprintf(prev, sizeof prev, "%s", query);
+	int was_filtered = filter_pat.active, clearing = !*q;
+	int was_literal = filter_pat.active && !filter_pat.is_re &&
+			  !filter_pat.is_alt;
+	char prev[sizeof filter_pat.text];
+	snprintf(prev, sizeof prev, "%s", filter_pat.text);
 	size_t was = nv ? view[cur] : 0;
 	size_t was_row = cur - top;
 	msg[0] = 0;
 
 	job_discard();	/* any in-flight scan just went obsolete */
 
-	jf_on = jf_all = jf_re = jf_alt = 0;
-	if (clearing) {
-		jf_on = jf_all = 1;	/* pending: every line matches again */
-	} else {
+	pending_pat.active = pending_pat.enable_on_commit = 0;
+	pending_pat.is_re = pending_pat.is_alt = 0;
+	if (!clearing) {
 		int icase = smart_case(q);
-		int is_alt = re_mode && alt_parse(q, icase, &jfalt);
+		int is_alt = re_mode && alt_parse(q, icase, &pending_pat.alt);
 		if (re_mode && !is_alt) {
-			if (regcomp(&jfre, q, REG_EXTENDED | (icase ? REG_ICASE : 0))) {
+			if (regcomp(&pending_pat.re, q,
+					    REG_EXTENDED | (icase ? REG_ICASE : 0))) {
 				snprintf(msg, sizeof msg, "bad regex: %.100s", q);
 				return;
 			}
-			jf_re = 1;
+			pending_pat.is_re = 1;
 		} else if (is_alt) {
-			jf_alt = 1;
+			pending_pat.is_alt = 1;
 		} else {
-			lit_parse(q, icase, &jflit);
+			lit_parse(q, icase, &pending_pat.lit);
 		}
-		jf_on = 1;
 	}
+	/* a clearing job parses the empty query as an empty literal: every
+	 * line matches again with an empty highlight span, exactly like the
+	 * committed no-filter state answers */
+	else
+		lit_parse("", 1, &pending_pat.lit);
+	pending_pat.active = 1;
+	snprintf(pending_pat.text, sizeof pending_pat.text, "%s", q);
 
 	/* query grew by appended chars: old matches are a superset, so
 	 * re-testing just view[] suffices -- but only while including.
@@ -444,7 +408,7 @@ void update_filter(const char *q)
 	jf_was_filtered = was_filtered;
 	jf_was = was;
 	jf_was_row = was_row;
-	snprintf(jf_q, sizeof jf_q, "%s", q);
+	snprintf(pending_pat.text, sizeof pending_pat.text, "%s", q);
 
 	job_kind = narrow ? K_VIEW_NARROW : K_VIEW_REPLACE;
 	job_inv = filter_inv;
@@ -469,39 +433,6 @@ void rebuild_view(void)
 	ensure_visible();
 }
 
-/* does the highlight-search pattern hit this line? fills m with the span.
- * While a search job is in flight the pending pattern answers: workers
- * must test the new query while n/N and the scrollbar keep serving the
- * previous results until commit. */
-int search_match(const Line *L, regmatch_t *m)
-{
-	int on, is_re, is_alt;
-	const regex_t *rep;
-	const LitSpec *lp;
-	const AltSpec *ap;
-	if (js_on) {
-		on = js_active;
-		is_re = js_re;
-		is_alt = js_alt;
-		rep = &jsre;
-		lp = &jslit;
-		ap = &jsalt;
-	} else {
-		on = searched;
-		is_re = searched_re;
-		is_alt = searched_alt;
-		rep = &sre;
-		lp = &slit;
-		ap = &salt;
-	}
-	if (!on)
-		return 0;
-	/* a zero-width regex match is not a hit: n/N and the scrollbar need
-	 * a real span to land on */
-	return pattern_match(L, is_re, is_alt, rep, lp, ap, m) &&
-	       (!is_re || m->rm_eo > m->rm_so);
-}
-
 /* commit a highlight-search pattern: validate, then scan as a batched
  * job (see step_job). Extending a literal pattern can only turn hits
  * off, so lines already marked false are skipped -- typing stays cheap
@@ -510,32 +441,32 @@ void update_search(const char *q)
 {
 	int icase = smart_case(q);
 	size_t prevlen = strlen(search_prev);
-	int extend = searched && !searched_re && !re_mode && prevlen &&
-		     strlen(q) > prevlen && !memcmp(q, search_prev, prevlen);
+	int extend = search_pat.active && !search_pat.is_re && !re_mode &&
+		     prevlen && strlen(q) > prevlen && !memcmp(q, search_prev, prevlen);
 	msg[0] = 0;
 
 	job_discard();	/* any in-flight sweep just went obsolete */
 
-	js_on = 1;
-	js_active = !!*q;
-	js_extend = extend;
-	js_re = js_alt = 0;
+	pending_pat.active = pending_pat.enable_on_commit = 0;
+	pending_pat.is_re = pending_pat.is_alt = 0;
 	if (*q && re_mode) {
-		if (alt_parse(q, icase, &jsalt)) {
-			js_alt = 1;	/* compile before swapping: a bad regex
-					 must keep the old search */
-		} else if (regcomp(&jsre, q,
+		if (alt_parse(q, icase, &pending_pat.alt)) {
+			pending_pat.is_alt = 1;	/* compile before swapping: a bad regex
+						 * must keep the old search */
+		} else if (regcomp(&pending_pat.re, q,
 				   REG_EXTENDED | (icase ? REG_ICASE : 0))) {
 			snprintf(msg, sizeof msg, "bad regex: %.100s", q);
-			js_on = 0;
 			return;	/* keep the old search */
 		} else {
-			js_re = 1;
+			pending_pat.is_re = 1;
 		}
 	} else if (*q) {
-		lit_parse(q, icase, &jslit);
+		lit_parse(q, icase, &pending_pat.lit);
 	}
-	snprintf(js_q, sizeof js_q, "%s", q);
+	pending_pat.active = 1;		/* workers route here while flying */
+	pending_pat.enable_on_commit = !!*q;
+	js_extend = extend;
+	snprintf(pending_pat.text, sizeof pending_pat.text, "%s", q);
 
 	free(job_hits);
 	job_hits = xrealloc(NULL, nlines ? nlines : 1);
@@ -546,8 +477,6 @@ void update_search(const char *q)
 	job_active = 1;
 }
 
-/* schedule the recompute for when typing idles; keeps the live buffered
- * query but defers the heavy per-line pass so a keystroke burst costs one */
 void defer_update(void)
 {
 	edit[MAX_QUERY - 1] = 0;

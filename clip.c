@@ -3,25 +3,10 @@
 #define _GNU_SOURCE
 #include "comb.h"
 
-#include <ctype.h>
-#include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
-#include <regex.h>
-#include <signal.h>
-#include <stdarg.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <termios.h>
-#include <time.h>
 #include <unistd.h>
-#include <pthread.h>
 
 static size_t b64enc(const char *d, size_t n, char *o)
 {

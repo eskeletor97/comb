@@ -74,39 +74,34 @@ extern size_t fmap_len, fmap_pos;
  * reset_lines rewinds it alongside the lines themselves. */
 extern size_t wc_max;
 
-/* filter (narrows view[]) */
-extern regex_t re;
-extern int filtered;
-extern int re_mode;		/* UI toggle for the next filter: literal vs ERE */
-extern int filtered_re;		/* the live filter is a compiled regex */
-extern int filtered_alt;	/* the live filter is an alternation of literals */
+/* One pattern, in one of three roles. Lifecycle: update_filter /
+ * update_search parse a query into pending_pat (workers test it while a
+ * scan job flies); on commit install_pattern() swaps it wholesale into
+ * the committed instance, so a cancelled attempt costs nothing. */
+typedef struct {
+	char text[MAX_QUERY];	/* the query this spec was parsed from */
+	LitSpec lit;		/* plain literal, when neither is_re nor is_alt */
+	AltSpec alt;		/* alternation of literals */
+	regex_t re;		/* compiled ERE, owned iff is_re */
+	unsigned char active;	/* matchers consult this spec */
+	unsigned char is_re, is_alt;
+	unsigned char enable_on_commit;	/* pending search only: text non-empty,
+					 * i.e. the commit leaves the search on */
+} Pat;
+
+extern Pat filter_pat;		/* committed filter: narrows view[] */
+extern Pat search_pat;		/* highlight-only search: marks srchit */
+
+/* candidate pattern for in-flight scans; at most one job (filter scan or
+ * search sweep) flies at a time, so a single slot serves both roles */
+extern Pat pending_pat;
+
+extern int re_mode;	/* UI toggle for the next filter: literal vs ERE */
 extern int filter_inv;		/* live filter excludes matching lines */
-extern LitSpec lit;
-extern AltSpec alt;
-extern char query[MAX_QUERY];
 extern char edit[MAX_QUERY];
 extern int editing;
 extern size_t ecur;	/* insertion point: byte offset into edit[] */
-
-/* highlight-only search: marks lines but never narrows view[] */
-extern char search[MAX_QUERY];
-extern int searched;
 extern int editing_search;	/* prompt currently edits search, not filter */
-extern regex_t sre;
-extern int searched_re;
-extern LitSpec slit;
-extern AltSpec salt;
-extern int searched_alt;	/* search is an alternation of literals */
-
-/* pending patterns for in-flight scans: the UI keeps serving the last
- * committed view/pattern until the job lands (see step_job), so Esc can
- * drop a mistyped query wholesale. Workers test the pending specs; n/N,
- * push_line marking and the status bar stay on the committed ones. */
-extern regex_t jfre, jsre;
-extern LitSpec jflit, jslit;
-extern AltSpec jfalt, jsalt;
-extern int jf_on, jf_all, jf_re, jf_alt;	/* pending filter pattern */
-extern int js_on, js_active, js_re, js_alt;	/* pending search pattern */
 
 /* viewport / UI state */
 extern size_t cur, top;
@@ -167,9 +162,6 @@ void prog_hide(void);
 int smart_case(const char *q);
 void lit_parse(const char *q, int icase, LitSpec *ls);
 int alt_parse(const char *q, int icase, AltSpec *as);
-int pattern_match(const Line *L, int is_re, int is_alt,
-		  const regex_t *re, const LitSpec *ls,
-		  const AltSpec *alt, regmatch_t *m);
 int query_match(const Line *L, regmatch_t *m);
 int search_match(const Line *L, regmatch_t *m);
 int par_threads(size_t len);

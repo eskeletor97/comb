@@ -4,24 +4,8 @@
 #include "comb.h"
 
 #include <ctype.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <regex.h>
-#include <signal.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <termios.h>
-#include <time.h>
-#include <unistd.h>
-#include <pthread.h>
 
 #if defined(__SSE2__) && defined(__GNUC__)
 #define USE_SSE2 1
@@ -471,12 +455,12 @@ static void draw_status_bar(void)
 	if (nmarked)
 		snprintf(mk, sizeof mk,
 			 budget >= 16 ? "  %zu marked" : " *%zu", nmarked);
-	size_t sl = strlen(src), ql = filtered ? strlen(query) : 0;
+	size_t sl = strlen(src), ql = filter_pat.active ? strlen(filter_pat.text) : 0;
 	for (;;) {
 		snprintf(left, sizeof left, " %.*s  %s%s%s%s%s%s%.*s%s",
 			 (int)sl, src, where, mk, flw, rmk, imk,
-			 filtered ? "  /" : "", (int)ql, query,
-			 (nv == 0 && filtered) ? "  (no matches)" : "");
+			 filter_pat.active ? "  /" : "", (int)ql, filter_pat.text,
+			 (nv == 0 && filter_pat.active) ? "  (no matches)" : "");
 		if ((int)strlen(left) <= budget)
 			break;
 		if (sl) {	/* path yields first; position and marks stay */
@@ -485,7 +469,7 @@ static void draw_status_bar(void)
 				sl--;
 		} else if (ql > 4) {
 			ql -= ql / 4 + 1;
-			while (ql && ((unsigned char)query[ql] & 0xC0) == 0x80)
+			while (ql && ((unsigned char)filter_pat.text[ql] & 0xC0) == 0x80)
 				ql--;
 		} else if (*flw) {
 			flw = "";
@@ -610,14 +594,14 @@ void render(void)
 		r += draw_line(view[i], i == cur, r, vis);
 	if (r < vis) {
 		printf("\x1b[%zu;1H", r + 1);
-		if (nv == 0 && !filtered)
+		if (nv == 0 && !filter_pat.active)
 			fputs("(empty)", stdout);
 		fputs("\x1b[J", stdout);
 	}
 	/* scrollbar: right-edge rail over the full line count; '|' is the
 	 * window thumb (always visible), '-' dashes the track, '#' marks
 	 * track rows holding search hits outside the window */
-	if (cols > 1 && (searched || nv > vis) && nv > 0) {
+	if (cols > 1 && (search_pat.active || nv > vis) && nv > 0) {
 		size_t drew = i - top;
 		size_t tlo = nv > vis ? top * vis / nv : 0;
 		size_t thi = nv > vis ? (top + drew) * vis / nv : vis;
@@ -626,7 +610,7 @@ void render(void)
 		fputs("\x1b[0m", stdout);
 		for (size_t sr = 0; sr < vis; sr++) {
 			int hit = 0;
-			if (searched) {
+			if (search_pat.active) {
 				size_t lo = sr * nv / vis;
 				size_t hi2 = (sr + 1) * nv / vis;
 				if (hi2 <= lo)

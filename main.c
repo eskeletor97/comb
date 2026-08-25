@@ -4,25 +4,11 @@
 #define _GNU_SOURCE
 #include "comb.h"
 
-#include <ctype.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
-#include <regex.h>
-#include <signal.h>
-#include <stdarg.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <termios.h>
-#include <time.h>
 #include <unistd.h>
-#include <pthread.h>
 
 int main(int argc, char **argv)
 {
@@ -138,8 +124,8 @@ int main(int argc, char **argv)
 			int got = pump_follow();
 			if (got == 2) {
 				job_discard(); /* rotation: lines[] were rebuilt from scratch */
-				if (filtered)
-					update_filter(query);	/* rescan as a job */
+				if (filter_pat.active)
+					update_filter(filter_pat.text);	/* rescan as a job */
 				else
 					rebuild_view();
 			} else if (got == 1) {
@@ -147,7 +133,7 @@ int main(int argc, char **argv)
 					if (!pend_ext || old < pend_ext_from)
 						pend_ext_from = old;
 					pend_ext = 1;
-				} else if (filtered && nlines - old > JOB_BATCH) {
+				} else if (filter_pat.active && nlines - old > JOB_BATCH) {
 					start_extend_view(old);	/* big tail: batch it */
 				} else {
 					extend_view(old);

@@ -4,8 +4,6 @@
 #define _GNU_SOURCE
 #include "comb.h"
 
-#include <stdint.h>
-
 Line *lines;
 size_t nlines, lcap;
 
@@ -28,38 +26,21 @@ size_t fmap_len, fmap_pos;
  * reset_lines rewinds it alongside the lines themselves. */
 size_t wc_max;
 
-regex_t re;
-int filtered;
+Pat filter_pat;
+Pat search_pat;
+
+/* candidate for in-flight scans; the UI keeps serving the last committed
+ * view/pattern until the job lands (see step_job), so Esc can drop a
+ * mistyped query wholesale. Workers test the pending spec; n/N,
+ * push_line marking and the status bar stay on the committed ones. */
+Pat pending_pat;
+
 int re_mode;		/* UI toggle for the next filter: literal vs ERE */
-int filtered_re;	/* the live filter is a compiled regex */
-int filtered_alt;	/* the live filter is an alternation of literals */
 int filter_inv;		/* live filter excludes matching lines */
-LitSpec lit;
-AltSpec alt;
-char query[MAX_QUERY];
 char edit[MAX_QUERY];
 int editing;
 size_t ecur;	/* insertion point: byte offset into edit[] */
-
-/* highlight-only search: marks lines but never narrows view[] */
-char search[MAX_QUERY];
-int searched;
 int editing_search;	/* prompt currently edits search, not filter */
-regex_t sre;
-int searched_re;
-LitSpec slit;
-AltSpec salt;
-int searched_alt;	/* search is an alternation of literals */
-
-/* pending patterns for in-flight scans: the UI keeps serving the last
- * committed view/pattern until the job lands (see step_job), so Esc can
- * drop a mistyped query wholesale. Workers test the pending specs; n/N,
- * push_line marking and the status bar stay on the committed ones. */
-regex_t jfre, jsre;
-LitSpec jflit, jslit;
-AltSpec jfalt, jsalt;
-int jf_on,	jf_all,	jf_re,	jf_alt;		/* pending filter pattern */
-int js_on,	js_active,	js_re,	js_alt;	/* pending search pattern */
 
 int follow = 1;
 int wrap;

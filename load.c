@@ -4,25 +4,14 @@
 #define _GNU_SOURCE
 #include "comb.h"
 
-#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
-#include <regex.h>
-#include <signal.h>
-#include <stdarg.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
-#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <sys/types.h>
-#include <termios.h>
-#include <time.h>
 #include <unistd.h>
-#include <pthread.h>
 
 #if defined(__SSE2__) && defined(__GNUC__)
 #define USE_SSE2 1
@@ -208,7 +197,7 @@ static void push_line(const char *clean, size_t len)
 	L->len = len;
 	regmatch_t sm;
 	L->marked = 0;
-	L->srchit = (unsigned char)(searched && search_match(L, &sm));
+	L->srchit = (unsigned char)search_match(L, &sm);
 	L->sev = NULL;
 	/* measure now: the page holding this line passes through the cache
 	 * exactly once, and deferring the width pass made logs bigger than

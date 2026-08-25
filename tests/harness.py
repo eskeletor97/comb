@@ -75,6 +75,13 @@ def run(argv, keys=b'', stdin_text=None, rows=24, cols=80, env_color=True,
         settle=0.35, key_delay=0.02, idle=0.25, timeout=5.0, midrun=None,
         resizes=None):
     """Spawn comb, send keys, return RunResult. argv excludes keys."""
+    # fail fast BEFORE forking: execvp failure would kill the child while
+    # it's still a python3 copy, which under a non-reaping PID 1 lingers
+    # as a zombie per failed run (the 2024-11 zombie-flood incident)
+    if not os.access(argv[0], os.X_OK):
+        raise FileNotFoundError(
+            f'cannot execute {argv[0]!r} -- stale or broken build? '
+            'run make first')
     stdin_r = None
     # os.pipe() fds are non-inheritable (PEP 446): at execvp the child's
     # copy of stdin_w vanishes, which is what delivers EOF to comb.
