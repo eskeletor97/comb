@@ -89,6 +89,11 @@ static void test_sanitize(void)
 	CHECK(n == 3 && !strcmp(o, "axb"));
 }
 
+static ptrdiff_t lf(const char *s, size_t n)
+{
+	return pat_find(lit.buf, lit.len, lit.bol, lit.eol, lit.icase, s, n);
+}
+
 static void test_lit_find(void)
 {
 	char big[300];
@@ -98,27 +103,27 @@ static void test_lit_find(void)
 
 	lit_parse("", 0, &lit);
 	CHECK(lit.len == 0);
-	CHECK(lit_find("anything", 8) == 0);
+	CHECK(lf("anything", 8) == 0);
 
 	lit_parse("^err", 0, &lit);
-	CHECK(lit_find("error", 5) == 0);
-	CHECK(lit_find("xerror", 6) == -1);
+	CHECK(lf("error", 5) == 0);
+	CHECK(lf("xerror", 6) == -1);
 
 	lit_parse("err$", 0, &lit);
-	CHECK(lit_find("xerr", 4) == 1);
-	CHECK(lit_find("xerra", 5) == -1);
+	CHECK(lf("xerr", 4) == 1);
+	CHECK(lf("xerra", 5) == -1);
 
 	lit_parse("^err$", 0, &lit);
-	CHECK(lit_find("err", 3) == 0);
-	CHECK(lit_find("errs", 4) == -1);
+	CHECK(lf("err", 3) == 0);
+	CHECK(lf("errs", 4) == -1);
 
 	lit_parse("Ab", 1, &lit);
-	CHECK(lit_find("zabc", 4) == 1);
-	CHECK(lit_find("ZABC", 4) == 1);
+	CHECK(lf("zabc", 4) == 1);
+	CHECK(lf("ZABC", 4) == 1);
 
 	lit_parse("needle", 0, &lit);
 	snprintf(big, sizeof big, "%s needle", big + 290);
-	CHECK(lit_find(big, strlen(big)) > 0);
+	CHECK(lf(big, strlen(big)) > 0);
 }
 
 static void test_widths(void)

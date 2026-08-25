@@ -781,10 +781,24 @@ static ptrdiff_t pat_find(const char *pat, size_t patlen, int bol, int eol,
 	return -1;
 }
 
-/* byte offset of the first literal filter hit in s[0..len), or -1 */
-static ptrdiff_t lit_find(const char *s, size_t len)
+/* shared matcher for the filter and the highlight search: dispatch a
+ * literal LitSpec or a compiled regex against one line, filling m with
+ * the match (highlight) span */
+static int pattern_match(const Line *L, int is_re, const regex_t *re,
+			 const LitSpec *ls, regmatch_t *m)
 {
-	return pat_find(lit.buf, lit.len, lit.bol, lit.eol, lit.icase, s, len);
+	if (is_re) {
+		m->rm_so = 0;
+		m->rm_eo = (regoff_t)L->len;	/* REG_STARTEND: no NUL needed */
+		return regexec(re, L->s, 1, m, REG_STARTEND) == 0;
+	}
+	ptrdiff_t off = pat_find(ls->buf, ls->len, ls->bol, ls->eol,
+				 ls->icase, L->s, L->len);
+	if (off < 0)
+		return 0;
+	m->rm_so = (regoff_t)off;
+	m->rm_eo = (regoff_t)(off + (ptrdiff_t)ls->len);
+	return 1;
 }
 
 /* active-filter test; on match fills m with the highlight span */
@@ -794,19 +808,9 @@ static int query_match(const Line *L, regmatch_t *m)
 		m->rm_so = m->rm_eo = 0;	/* empty span: nothing to highlight */
 		return 1;
 	}
-	if (!filtered_re) {
-		ptrdiff_t off = lit_find(L->s, L->len);
-		if (off < 0)
-			return 0;
-		m->rm_so = (regoff_t)off;
-		m->rm_eo = (regoff_t)(off + lit.len);
-		return 1;
-	}
-	m->rm_so = 0;
-	m->rm_eo = (regoff_t)L->len;	/* REG_STARTEND: no NUL needed */
 	/* no zero-width guard here: the return decides view membership, and
 	 * a pattern like a* matching empty must keep lines visible */
-	return regexec(&re, L->s, 1, m, REG_STARTEND) == 0;
+	return pattern_match(L, filtered_re, &re, &lit, m);
 }
 
 /* Narrow an extended query in place: appending chars can only shrink
@@ -920,18 +924,10 @@ static int search_match(const Line *L, regmatch_t *m)
 {
 	if (!searched)
 		return 0;
-	m->rm_so = 0;
-	m->rm_eo = (regoff_t)L->len;
-	if (searched_re)
-		return regexec(&sre, L->s, 1, m, REG_STARTEND) == 0 &&
-		       m->rm_eo > m->rm_so;
-	ptrdiff_t off = pat_find(slit.buf, slit.len, slit.bol, slit.eol,
-				 slit.icase, L->s, L->len);
-	if (off < 0)
-		return 0;
-	m->rm_so = (regoff_t)off;
-	m->rm_eo = (regoff_t)(off + (ptrdiff_t)slit.len);
-	return 1;
+	/* a zero-width regex match is not a hit: n/N and the scrollbar need
+	 * a real span to land on */
+	return pattern_match(L, searched_re, &sre, &slit, m) &&
+	       (!searched_re || m->rm_eo > m->rm_so);
 }
 
 /* commit a highlight-search pattern: validate, then mark every line.
