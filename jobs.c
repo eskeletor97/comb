@@ -162,7 +162,11 @@ void job_discard(void)
 	job_spin_ms = 0;	/* a fresh job may redraw its first frame now */
 	if (pending_pat.active && pending_pat.is_re)
 		regfree(&pending_pat.re);
+	/* clear ownership alongside active: job_finish(0) regfrees on is_re
+	 * alone, so a stale flag here would double-free the same regex_t */
 	pending_pat.active = 0;
+	pending_pat.is_re = 0;
+	pending_pat.is_alt = 0;
 	job_active = 0;
 	free(job_arr);
 	job_arr = NULL;
@@ -306,8 +310,8 @@ void job_finish(int commit)
 	dirty = 1;
 }
 
-/* run one batch through the thread pool; paints the spinner and commits
- * when the range ends */
+/* run one batch through the thread pool; paints the spinner (not while
+ * the prompt row is in use) and commits when the range ends */
 void step_job(void)
 {
 	size_t hi = job_end - job_pos > JOB_BATCH
@@ -325,7 +329,7 @@ void step_job(void)
 	job_pos = hi;
 	{
 		uint64_t now = now_ms();
-		if (rows >= 2 && now - job_t0 >= JOB_PROG_MS &&
+		if (rows >= 2 && !editing && now - job_t0 >= JOB_PROG_MS &&
 		    now - job_spin_ms >= JOB_SPIN_MS) {
 			job_spin_ms = now;
 			static const char frames[] = "|/-\\";
@@ -406,7 +410,6 @@ void update_filter(const char *q)
 	else
 		lit_parse("", 1, &pending_pat.lit);
 	pending_pat.active = 1;
-	snprintf(pending_pat.text, sizeof pending_pat.text, "%s", q);
 
 	/* query grew by appended chars: old matches are a superset, so
 	 * re-testing just view[] suffices -- but only while including.

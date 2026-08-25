@@ -416,6 +416,29 @@ static void test_alt(void)
 	CHECK(alt_match(&as, &L, &m) == 1 && m.rm_so == 0);
 }
 
+static void test_job_discard_ownership(void)
+{
+	/* job_discard() frees a pending regex but used to leave is_re set;
+	 * a later job_finish(0) would regfree() the same regex_t again */
+	filter_pat.active = filter_pat.is_re = 0;
+	re_mode = 1;
+
+	update_filter("a.c");		/* regex candidate scan in flight */
+	CHECK(job_active && pending_pat.is_re && pending_pat.active);
+	defer_update();			/* keystroke mid-scan discards it */
+	CHECK(!job_active);
+	CHECK(!pending_pat.is_re && !pending_pat.is_alt && !pending_pat.active);
+
+	start_extend_view(0);		/* extend job flies with stale-free state */
+	CHECK(job_active);
+	job_finish(0);			/* Esc: must not touch the freed regex */
+	CHECK(!job_active);
+
+	update_filter("");
+	job_flush();
+	re_mode = 0;
+}
+
 int main(void)
 {
 	test_tag_span();
@@ -429,6 +452,7 @@ int main(void)
 	test_b64enc();
 	test_update_filter_state();
 	test_job_cancel();
+	test_job_discard_ownership();
 	test_clear_inverted_filter();
 	test_alt();
 
