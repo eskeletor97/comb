@@ -510,6 +510,44 @@ def _check_regex_toggle_badge(binary):
     if any('(R)' in r for r in out.screen()):
         return '(R) badge shown while still in literal mode'
 
+def _check_filter_extend_past_eol_anchor(binary):
+    # extending a $-anchored literal flips the trailing '$' into a literal,
+    # so matches can RESUME on lines the old view never held. The
+    # superset-narrowing fast path must not be trusted here.
+    text = 'line ending err\nhello err$or world\nanother err$or here\n'
+    res = run([binary, '--no-color', '-'], keys=b'g/err$\r/o\rq',
+              stdin_text=text)
+    scr = '\n'.join(res.screen())
+    if 'hello err$or world' not in scr or 'another err$or here' not in scr:
+        return f'resumed matches missing after $ extension: {scr!r}'
+    if 'line ending err' in scr:
+        return f'stale match survived $ extension: {scr!r}'
+
+
+def _check_search_extend_past_eol_anchor(binary):
+    # same edge on the highlight-only path: the extended literal must
+    # highlight err$o, not just the old EOL-anchored err
+    text = 'line ending err\nhello err$or world\nanother err$or here\n'
+    res = run([binary, '-'], keys=b'g\\err$\r\\o\rq', stdin_text=text)
+    if not re.search(rb'\x1b\[7merr\$o\x1b\[0m', res.output):
+        return f'extended search did not highlight err$o: {res.screen()!r}'
+
+
+def _check_filter_status_tracks_incremental_typing(binary):
+    # typing a literal slowly fires the debounce per keystroke, so each
+    # prefix commits through K_VIEW_NARROW. That fast path must re-install
+    # the extended literal into filter_pat, or the status query and
+    # highlight spans freeze at the first full-scan commit.
+    text = 'line one\nline two needle\n'
+    res = run([binary, '-'], keys='g/nee\rGq', stdin_text=text,
+              key_delay=0.20, timeout=3.0)
+    scr = '\n'.join(res.screen())
+    if '1/1' not in scr:
+        return f'status counter wrong after incremental filter: {scr!r}'
+    if '/nee' not in scr:
+        return f'status query did not track latest literal: {scr!r}'
+
+
 def _check_literal_metachars_match(binary):
     # literal mode treats metachars literally; no bad-regex notice may fire
     text = 'a.c [x] literal\nother line\n'
@@ -543,6 +581,9 @@ CHECKS = [
     ('filter prompt accepts UTF-8 queries',      _check_filter_accepts_utf8),
     ('Ctrl-V inverted filter',                   _check_filter_invert),
     ('hscroll caps at widest line',              _check_hscroll_caps_at_content),
+    ('filter extending past $ anchor',           _check_filter_extend_past_eol_anchor),
+    ('search extending past $ anchor',           _check_search_extend_past_eol_anchor),
+    ('filter status tracks incremental typing',  _check_filter_status_tracks_incremental_typing),
 ]
 
 def _run_scenario(binary, keys, opts):

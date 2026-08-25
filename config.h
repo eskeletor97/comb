@@ -2,6 +2,10 @@
 
 #define MAX_QUERY 256
 
+/* show the filter/search job spinner only after a scan has run this long;
+ * fast scans finish inside a batch or two and shouldn't flash it */
+#define JOB_PROG_MS 1000
+
 #define TTY_ENTER "\x1b[?1049h\x1b[?25l\x1b[2J"
 #define TTY_LEAVE "\x1b[0m\x1b[?25h\x1b[?1049l"
 

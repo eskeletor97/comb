@@ -134,6 +134,7 @@ enum { K_VIEW_REPLACE, K_VIEW_NARROW, K_VIEW_EXTEND, K_SEARCH };
 static int job_kind;
 static int job_inv;	/* captured at start: immune to mid-job inv flips */
 static size_t job_lo, job_pos, job_end;	/* progress over [lo,end) */
+static uint64_t job_t0;	/* job start, for the progress grace period */
 static unsigned job_spin;	/* spinner frame counter */
 static size_t *job_arr;		/* view collector, kept across batches */
 static size_t job_n, job_cap;
@@ -237,18 +238,21 @@ void job_finish(int commit)
 		}
 	} else {	/* K_VIEW_REPLACE / K_VIEW_NARROW */
 		if (commit) {
-			if (kind == K_VIEW_REPLACE) {
-				if (!*pending_pat.text) {	/* clearing: unfiltered */
-					if (filter_pat.is_re)
-						regfree(&filter_pat.re);
-					memset(&filter_pat, 0,
-					       sizeof filter_pat);
-					filter_inv = 0;
-				} else {
-					install_pattern(&filter_pat,
-							&pending_pat);
-					filter_pat.active = 1;
-				}
+			if (!*pending_pat.text) {	/* clearing: unfiltered */
+				if (filter_pat.is_re)
+					regfree(&filter_pat.re);
+				memset(&filter_pat, 0,
+				       sizeof filter_pat);
+				filter_inv = 0;
+			} else {
+				/* K_VIEW_NARROW must install the pattern too:
+				 * its literal extends the committed one, and leaving
+				 * filter_pat at the earlier full-scan commit would
+				 * desync the status query, highlight spans and
+				 * follow-extend against the narrowed view. */
+				install_pattern(&filter_pat,
+						&pending_pat);
+				filter_pat.active = 1;
 			}
 			if (vcap < job_n) {
 				size_t nc = vcap ? vcap : 1024;
@@ -317,7 +321,7 @@ void step_job(void)
 			     query_match, job_inv, &job_arr, &job_n, &job_cap);
 	}
 	job_pos = hi;
-	if (rows >= 2) {
+	if (rows >= 2 && now_ms() - job_t0 >= JOB_PROG_MS) {
 		static const char frames[] = "|/-\\";
 		const char *what = job_kind == K_SEARCH ? "searching" : "filtering";
 		int pct = (int)((job_pos - job_lo) * 100 /
@@ -354,6 +358,7 @@ void start_extend_view(size_t from)
 	job_pos = from;
 	job_end = nlines;
 	job_n = 0;
+	job_t0 = now_ms();
 	job_active = 1;
 }
 
@@ -398,9 +403,13 @@ void update_filter(const char *q)
 
 	/* query grew by appended chars: old matches are a superset, so
 	 * re-testing just view[] suffices -- but only while including.
-	 * Inverted, shrinking matches make outside lines eligible. */
+	 * Inverted, shrinking matches make outside lines eligible.
+	 * A trailing '$' breaks the superset rule: "err$" anchors to EOL,
+	 * appending flips that '$' to a literal, so lines that never matched
+	 * the old view can now match. Re-scan everything in that case. */
 	size_t prevlen = strlen(prev);
-	int narrow = was_literal && !re_mode && !clearing && !filter_inv && prevlen &&
+	int narrow = was_literal && !re_mode && !clearing && !filter_inv &&
+	    !filter_pat.lit.eol && prevlen &&
 	    strlen(q) > prevlen && !memcmp(q, prev, prevlen);
 
 	/* commit-time cursor anchoring data (see job_finish) */
@@ -416,6 +425,7 @@ void update_filter(const char *q)
 	job_pos = 0;
 	job_end = narrow ? nv : nlines;
 	job_n = 0;
+	job_t0 = now_ms();
 	job_active = 1;
 }
 
@@ -441,8 +451,12 @@ void update_search(const char *q)
 {
 	int icase = smart_case(q);
 	size_t prevlen = strlen(search_prev);
+	/* same superset caveat as update_filter: a trailing '$' in the prior
+	 * literal would turn literal on append and add new hits, which the
+	 * skip-already-false shortcut would wrongly drop. */
 	int extend = search_pat.active && !search_pat.is_re && !re_mode &&
-		     prevlen && strlen(q) > prevlen && !memcmp(q, search_prev, prevlen);
+		     !search_pat.lit.eol && prevlen &&
+		     strlen(q) > prevlen && !memcmp(q, search_prev, prevlen);
 	msg[0] = 0;
 
 	job_discard();	/* any in-flight sweep just went obsolete */
@@ -474,6 +488,7 @@ void update_search(const char *q)
 	job_lo = 0;
 	job_pos = 0;
 	job_end = nlines;
+	job_t0 = now_ms();
 	job_active = 1;
 }
 
