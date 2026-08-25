@@ -99,8 +99,9 @@ int main(int argc, char **argv)
 	signal(SIGINT, on_sigexit);
 	/* A privileged feeder (doas/sudo dmesg -w | comb) prompts for its
 	 * password on this very tty; stay in cooked mode until the pipe
-	 * produces its first byte or closes, so the prompt works. */
-	if (use_stdin) {
+	 * produces its first byte or closes, so the prompt works. A tty on
+	 * stdin has no feeder prompt to wait for. */
+	if (use_stdin && !isatty(STDIN_FILENO)) {
 		struct pollfd pw = { .fd = STDIN_FILENO, .events = POLLIN };
 		poll(&pw, 1, -1);
 	}

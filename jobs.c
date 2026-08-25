@@ -308,6 +308,7 @@ void job_finish(int commit)
 			extend_view(pend_ext_from);
 	}
 	dirty = 1;
+	view_epoch++;	/* view membership / srchit just changed */
 }
 
 /* run one batch through the thread pool; paints the spinner (not while
@@ -445,6 +446,7 @@ void extend_view(size_t from)
 {
 	scan_collect(from, nlines, pos_ident, query_match, filter_inv,
 		     &view, &nv, &vcap);
+	view_epoch++;
 }
 
 void rebuild_view(void)

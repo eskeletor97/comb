@@ -120,6 +120,10 @@ extern struct termios saved_tio;
 extern int tio_saved;
 extern volatile sig_atomic_t got_winch;
 
+/* bumped whenever view[] membership or lines[].srchit change (filter/
+ * search commit, follow extend, reload); render caches derive from it */
+extern uint64_t view_epoch;
+
 /* Worker threads for filter/search scans and parallel file loading. 0 means
  * "auto": effective_threads() falls back to nproc-2 clamped to [1,MAX]. */
 extern int max_threads;
