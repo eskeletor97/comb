@@ -1,4 +1,4 @@
-/* comb.c config */
+/* comb config */
 
 #define MAX_QUERY 256
 

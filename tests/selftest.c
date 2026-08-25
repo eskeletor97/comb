@@ -1,22 +1,24 @@
 /* Unit tests for comb's internals.
  *
- * Includes the implementation directly, so every static is reachable
- * without header surgery; comb.c is built with COMB_TEST to drop its
- * main(). These cover the pure logic -- tag detection, sanitizing,
- * literal matching, widths, key decoding, span collection, severity
- * boundaries -- which needs no terminal and runs in microseconds.
- * Screen-level behavior lives in tests/harness.py (--check/--compare).
+ * Includes the implementation modules directly, so every static is
+ * reachable without header surgery. These cover the pure logic -- tag
+ * detection, sanitizing, literal matching, widths, key decoding, span
+ * collection, severity boundaries -- which needs no terminal and runs in
+ * microseconds. Screen-level behavior lives in tests/harness.py
+ * (--check/--compare).
  *
  *   make check      (or: cc -O2 -Wall -o tests/selftest tests/selftest.c)
  */
-#define COMB_TEST
-
-/* comb.c's main() is compiled out here, so its helpers go unreferenced;
- * the noise is expected and says nothing about the code under test.
- * Pragmas must precede the include to cover its parse. */
 #pragma GCC diagnostic ignored "-Wunused-function"
 #pragma GCC diagnostic ignored "-Wunused-variable"
-#include "../comb.c"
+#include "../base.c"
+#include "../state.c"
+#include "../load.c"
+#include "../match.c"
+#include "../jobs.c"
+#include "../render.c"
+#include "../clip.c"
+#include "../input.c"
 
 static int fails;
 

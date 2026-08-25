@@ -78,7 +78,7 @@ For those, pipe: `journalctl -o short-precise | comb`, `zcat error.log.gz | comb
 | r                | reload file                               |
 | q, Ctrl-c        | quit                                      |
 
-Change controls in the `keymap[]` table near the top of `comb.c`.
+Change controls in the `keymap[]` table in `config.h`.
 
 ## License
 

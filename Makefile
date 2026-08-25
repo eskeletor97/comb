@@ -1,16 +1,25 @@
 CC ?= cc
 CFLAGS ?= -O2 -Wall -Wextra
+# config.h's static palettes/keymap are unused in some modules; that is fine.
+CFLAGS += -Wno-unused-const-variable
 THREADS ?= -pthread
 
 PREFIX ?= /usr/local
 
-comb: comb.c config.h
-	$(CC) $(CFLAGS) $(THREADS) -o $@ $<
+MODS := base state load match jobs render clip input
 
-tests/selftest: tests/selftest.c comb.c config.h
+comb: $(addsuffix .o,$(MODS)) main.o config.h
+	$(CC) $(CFLAGS) $(THREADS) -o $@ $(addsuffix .o,$(MODS)) main.o
+
+%.o: %.c comb.h config.h
+	$(CC) $(CFLAGS) $(THREADS) -c $< -o $@
+
+TEST_SRCS := base.c state.c load.c match.c jobs.c render.c clip.c input.c
+
+tests/selftest: tests/selftest.c $(TEST_SRCS) comb.h config.h
 	$(CC) $(CFLAGS) $(THREADS) -o $@ tests/selftest.c
 
-tests/loadbench: tests/loadbench.c comb.c config.h
+tests/loadbench: tests/loadbench.c $(TEST_SRCS) comb.h config.h
 	$(CC) $(CFLAGS) $(THREADS) -o $@ tests/loadbench.c
 
 check: comb tests/selftest
@@ -26,6 +35,6 @@ uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/comb.1
 
 clean:
-	rm -f comb tests/selftest tests/loadbench
+	rm -f comb *.o tests/selftest tests/loadbench
 
 .PHONY: check clean install uninstall
