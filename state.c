@@ -76,7 +76,7 @@ uint64_t debounce_due;	/* deadline for the deferred recompute */
 int force_render;	/* commit a queued-keys coalescing render */
 
 int max_threads;	/* runtime -t/--threads; 0 = auto */
-uint64_t view_epoch;	/* bumped on view[]/srchit changes; see comb.h */
+uint64_t view_epoch;	/* bumped on view[]/hit-bit changes; see comb.h */
 
 /* Worker count: the -t override, else nproc-2 (leaving a couple of cores
  * for the UI/main loop), clamped to [1, MAX_THREADS]. */

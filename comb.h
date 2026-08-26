@@ -117,7 +117,7 @@ typedef struct {
 } Pat;
 
 extern Pat filter_pat;		/* committed filter: narrows view[] */
-extern Pat search_pat;		/* highlight-only search: marks srchit */
+extern Pat search_pat;		/* highlight-only search: marks hit_bit */
 
 /* candidate pattern for in-flight scans; at most one job (filter scan or
  * search sweep) flies at a time, so a single slot serves both roles */
@@ -147,8 +147,9 @@ extern struct termios saved_tio;
 extern int tio_saved;
 extern volatile sig_atomic_t got_winch;
 
-/* bumped whenever view[] membership or lines[].srchit change (filter/
- * search commit, follow extend, reload); render caches derive from it */
+/* bumped whenever view[] membership or the search-hit bits change
+ * (filter/search commit, follow extend, reload); render caches derive
+ * from it */
 extern uint64_t view_epoch;
 
 /* Worker threads for filter/search scans and parallel file loading. 0 means

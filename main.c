@@ -149,7 +149,7 @@ int main(int argc, char **argv)
 			size_t old = nlines;
 			int got = pump_follow();
 			if (got == 2) {
-				job_discard(); /* rotation: lines[] were rebuilt from scratch */
+				job_discard(); /* rotation: the line index was rebuilt from scratch */
 				if (filter_pat.active)
 					update_filter(filter_pat.text);	/* rescan as a job */
 				else

@@ -415,7 +415,7 @@ static void col_work(size_t lo, size_t hi, int slot, void *ctx)
 }
 
 /* Append to *arr every position p in [lo,hi) whose line
- * match(lines[pos_line(p)]) != inv, preserving position order. Each
+ * match(line_text(pos_line(p))) != inv, preserving position order. Each
  * pthread builds one slice; the slices concatenate in slot order. */
 void scan_collect(size_t lo, size_t hi, size_t (*pos_line)(size_t),
 			 int (*match)(const char *s, size_t len, regmatch_t *m), int inv,

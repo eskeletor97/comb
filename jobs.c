@@ -128,7 +128,7 @@ static size_t view_floor(size_t line)
  * steps one batch through the thread pool, then control returns so keys
  * are read (Esc bails between batches) and a spinner is painted.
  *
- * The visible state -- view[], srchit flags, committed patterns -- is
+ * The visible state -- view[], the hit bits, committed patterns -- is
  * untouched until commit: results accumulate in scratch buffers and the
  * new pattern waits in the pending specs above. Cancelling therefore
  * means just freeing scratch; small files still finish inside their
@@ -179,8 +179,8 @@ void job_discard(void)
 }
 
 /* per-line half of the highlight-search sweep: results land in hits[]
- * and reach lines[].srchit only at commit. Extending a literal can only
- * turn hits off, so lines already marked false skip the match test. */
+ * and reach hit_bit only at commit. Extending a literal can only turn
+ * hits off, so lines already unmarked in the committed bits skip it. */
 typedef struct {
 	unsigned char *hits;
 	int on, extend;
@@ -318,7 +318,7 @@ void job_finish(int commit)
 			extend_view(pend_ext_from);
 	}
 	dirty = 1;
-	view_epoch++;	/* view membership / srchit just changed */
+	view_epoch++;	/* view membership / hit bits just changed */
 }
 
 /* spinner chip text for render.c's chip zone; NULL inside the grace

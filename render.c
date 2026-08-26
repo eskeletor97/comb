@@ -126,8 +126,9 @@ size_t str_cols(const char *s, size_t n)
 	return w;
 }
 
-/* widths are computed at push time and immutable thereafter; widest_col
- * just reads the running max kept alongside them */
+/* widest_col() is a conservative bound: the max raw line length, refined
+ * with measured widths as lines are materialised. Kept so the horizontal-
+ * scroll cap never stops short of real content. */
 size_t widest_col(void)
 {
 	return wc_max;
@@ -320,7 +321,7 @@ static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 	Line *L = &lz;
 	lt_fill(L, idx);
 	if (!L->sev)
-		L->sev = severity(L->s, L->len);	/* lines are immutable; L is fresh */
+		L->sev = severity(L->s, L->len);	/* L is fresh each call */
 	const char *col = L->sev;
 	regmatch_t m;
 	int ms = -1, me = -1;

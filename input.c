@@ -420,9 +420,9 @@ void view_action(int act)
 		if (!search_pat.active || !nlines || !nv)
 			break;
 		int dir = act == A_SNEXT ? 1 : -1;
-		/* walk the visible view[], not the file: srchit is set on every
-		 * line, so scanning lines[] would land on a hit hidden by the
-		 * filter and snap cur to a nearby visible, non-match line. */
+		/* walk the visible view[], not the file: a hit bit is set on every
+		 * matching line, so scanning the raw lines would land on a hit hidden
+		 * by the filter and snap cur to a nearby visible, non-match line. */
 		size_t li = cur;
 		size_t i = li;
 		do
