@@ -65,7 +65,7 @@ void ensure_visible(void)
 		 * accumulated rows fit the pane */
 		size_t acc = 0, i = cur;
 		while (i > top) {
-			size_t hr = line_rows(&lines[view[i]]);
+			size_t hr = line_rows(view_at(i));
 			if (acc + hr > vis) {
 				if (i < cur)
 					i++;   /* exclude the line that broke the budget */
@@ -88,13 +88,13 @@ void ensure_visible(void)
 	/* wrap: same anchor, in rows. Early-out when the tail fills the pane. */
 	size_t acc = 0, i = top;
 	while (i < nv && acc < vis)
-		acc += line_rows(&lines[view[i++]]);
+		acc += line_rows(view_at(i++));
 	if (acc >= vis)
 		return;
 	acc = 0;
 	i = nv;
 	while (i > 0) {
-		size_t hr = line_rows(&lines[view[i - 1]]);
+		size_t hr = line_rows(view_at(i - 1));
 		if (acc + hr > vis)
 			break;
 		i--;
@@ -103,9 +103,12 @@ void ensure_visible(void)
 	top = i;
 }
 
-/* first view slot holding a line index >= line; view[] is sorted */
+/* first view slot holding a line index >= line; view[] is sorted (and
+ * the identity view is trivially sorted, so it is just line clamped). */
 static size_t view_floor(size_t line)
 {
+	if (!view)
+		return line > nv ? nv : line;
 	size_t lo = 0, hi = nv;
 	while (lo < hi) {
 		size_t mid = lo + (hi - lo) / 2;
@@ -190,8 +193,11 @@ static void search_job_work(size_t lo, size_t hi, int slot, void *ctx)
 	regmatch_t sm;
 	for (size_t i = lo; i < hi; i++) {
 		unsigned char v = 0;
-		if (c->on && !(c->extend && !lines[i].srchit))
-			v = (unsigned char)!!search_match(&lines[i], &sm);
+		if (c->on && !(c->extend && !hit_at(i))) {
+			size_t len;
+			const char *s = lt_text(i, &len);
+			v = (unsigned char)!!search_match(s, len, &sm);
+		}
 		c->hits[i] = v;
 	}
 }
@@ -215,14 +221,15 @@ void job_finish(int commit)
 			snprintf(search_prev, sizeof search_prev, "%s",
 				 pending_pat.text);
 			for (i = 0; i < job_end && i < nlines; i++)
-				lines[i].srchit = job_hits[i];
+				set_hit(i, job_hits[i]);
 		} else {
 			/* lines pushed while the job ran were marked with the
 			 * pending pattern; re-mark them under the restored one */
 			for (i = job_end; i < nlines; i++) {
 				regmatch_t sm;
-				lines[i].srchit = (unsigned char)
-					search_match(&lines[i], &sm);
+				size_t len;
+				const char *s = lt_text(i, &len);
+				set_hit(i, search_match(s, len, &sm));
 			}
 			job_restore_edit();
 		}
@@ -244,12 +251,15 @@ void job_finish(int commit)
 		}
 	} else {	/* K_VIEW_REPLACE / K_VIEW_NARROW */
 		if (commit) {
-			if (!*pending_pat.text) {	/* clearing: unfiltered */
+			if (!*pending_pat.text) {	/* clearing: unfiltered identity */
 				if (filter_pat.is_re)
 					regfree(&filter_pat.re);
 				memset(&filter_pat, 0,
 				       sizeof filter_pat);
 				filter_inv = 0;
+				view = NULL;	/* huge unfiltered logs use the identity view */
+				vcap = 0;
+				nv = nlines;
 			} else {
 				/* K_VIEW_NARROW must install the pattern too:
 				 * its literal extends the committed one, and leaving
@@ -259,24 +269,24 @@ void job_finish(int commit)
 				install_pattern(&filter_pat,
 						&pending_pat);
 				filter_pat.active = 1;
+				if (vcap < job_n) {
+					size_t nc = vcap ? vcap : 1024;
+					while (nc < job_n)
+						nc *= 2;
+					vcap = nc;
+					view = xrealloc(view, vcap * sizeof(*view));
+				}
+				if (job_n)   /* zero matches leaves both buffers NULL: skip */
+				memcpy(view, job_arr, job_n * sizeof(*view));
+				nv = job_n;
 			}
-			if (vcap < job_n) {
-				size_t nc = vcap ? vcap : 1024;
-				while (nc < job_n)
-					nc *= 2;
-				vcap = nc;
-				view = xrealloc(view, vcap * sizeof(*view));
-			}
-			if (job_n)   /* zero matches leaves both buffers NULL: skip */
-			memcpy(view, job_arr, job_n * sizeof(*view));
-			nv = job_n;
 			/* cursor anchoring, identical to the blocking path:
 			 * clear returns to the pre-filter selection, edits
 			 * re-anchor to the nearest line in file order */
 			if (jf_clearing && jf_was_filtered &&
 			    filter_anchor < nlines) {
 				size_t lo = view_floor(filter_anchor);
-				if (lo < nv && view[lo] == filter_anchor) {
+				if (lo < nv && view_at(lo) == filter_anchor) {
 					cur = lo;
 					size_t vis = pane_rows();
 					size_t max_top = nv > vis ? nv - vis : 0;
@@ -387,7 +397,7 @@ void update_filter(const char *q)
 			  !filter_pat.is_alt;
 	char prev[sizeof filter_pat.text];
 	snprintf(prev, sizeof prev, "%s", filter_pat.text);
-	size_t was = nv ? view[cur] : 0;
+	size_t was = nv ? view_at(cur) : 0;
 	size_t was_row = cur - top;
 	msg[0] = 0;
 
@@ -438,11 +448,12 @@ void update_filter(const char *q)
 
 	job_kind = narrow ? K_VIEW_NARROW : K_VIEW_REPLACE;
 	/* a clearing job must collect every line: inversion belonged to the
-	 * filter being removed, and match-all against inv=1 would keep nothing */
+	 * filter being removed, and match-all against inv=1 would keep nothing.
+	 * But the result is just the identity view, so skip the scan entirely. */
 	job_inv = clearing ? 0 : filter_inv;
 	job_lo = 0;
 	job_pos = 0;
-	job_end = narrow ? nv : nlines;
+	job_end = clearing ? 0 : (narrow ? nv : nlines);
 	job_n = 0;
 	job_t0 = now_ms();
 	job_active = 1;
@@ -450,6 +461,15 @@ void update_filter(const char *q)
 
 void extend_view(size_t from)
 {
+	/* no filter: the view is the identity range over every line, so it
+	 * is O(1) -- no scan, no array. */
+	if (!filter_pat.active) {
+		nv = nlines;
+		view = NULL;
+		vcap = 0;
+		view_epoch++;
+		return;
+	}
 	scan_collect(from, nlines, pos_ident, query_match, filter_inv,
 		     &view, &nv, &vcap);
 	view_epoch++;

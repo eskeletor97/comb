@@ -371,8 +371,7 @@ void view_action(int act)
 		break;
 	case A_HEND:
 		if (nv) {
-			Line *L = &lines[view[cur]];
-			size_t cw = line_cols(L);
+			size_t cw = line_cols(view_at(cur));
 			hscroll = cw > (size_t)cols
 					  ? (int)(cw - (size_t)cols)
 					  : 0;
@@ -381,7 +380,7 @@ void view_action(int act)
 	case A_FILTER:
 		editing = 1;
 		editing_search = 0;
-		filter_anchor = nv ? view[cur] : 0;
+		filter_anchor = nv ? view_at(cur) : 0;
 		filter_row = cur - top;
 		snprintf(edit, sizeof edit, "%s", filter_pat.text);
 		ecur = strlen(edit);
@@ -390,9 +389,9 @@ void view_action(int act)
 	case A_UNMARK: {
 		int want = (act == A_MARK);
 		if (nv) {
-			Line *L = &lines[view[cur]];
-			if ((int)L->marked != want) {
-				L->marked = (unsigned char)want;
+			size_t lx = view_at(cur);
+			if (lt_is_marked(lx) != want) {
+				lt_mark(lx, want);
 				nmarked += want ? 1 : -1;
 			}
 			if (mdir < 0) {
@@ -429,13 +428,16 @@ void view_action(int act)
 		do
 			i = dir > 0 ? (i + 1 < nv ? i + 1 : 0)
 				    : (i > 0 ? i - 1 : nv - 1);
-		while (!lines[view[i]].srchit && i != li);
-		if (lines[view[i]].srchit) {
+		while (!hit_at(view_at(i)) && i != li);
+		if (hit_at(view_at(i))) {
+			Line lz;
+			size_t lx = view_at(i);
 			cur = i;
 			/* the hit may sit beyond the right edge: bring its span
 			 * into view, keeping a margin clear of the scrollbar */
 			regmatch_t sm;
-			if (search_match(&lines[view[i]], &sm)) {
+			lt_fill(&lz, lx);
+			if (search_match(lz.s, lz.len, &sm)) {
 				size_t so = (size_t)sm.rm_so, se = (size_t)sm.rm_eo;
 				size_t maxc = widest_col();
 				size_t max = maxc + 2 > (size_t)cols

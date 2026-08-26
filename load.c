@@ -1,5 +1,14 @@
 /* comb - line ingestion: progress display, sanitizing,
- mmap/window loading, tail follow */
+ * mmap/window loading, tail follow.
+ *
+ * The per-line workspace is deliberately tiny: a compact lidx[] index
+ * records only where each line's raw bytes live and how long they are.
+ * Everything the viewer decorates lines with -- display width, service
+ * tag span, palette slot, severity, search hit -- is computed lazily by
+ * lt_fill() only for lines the user actually sees. Filter/search scans
+ * operate on (ptr,len) straight out of the index without materialising.
+ * The one eagerly-full thing is the service-color slot order, which must
+ * follow the file's first-appearance order to stay stable. */
 
 #define _GNU_SOURCE
 #include "comb.h"
@@ -23,10 +32,12 @@
 #endif
 
 static void detect_tag(Line *L);
-static void commit_slot(Line *L);
+static int line_has_crlfesc(const char *s, size_t n);
+static void commit_line_slot(size_t i);
+static int tag_span(const char *s, size_t n, int *so, int *eo);
 
 /* Line text lives in bump-allocated ~1 MiB chunks; chunks are never
- * moved or freed individually, so Line.s and svc_seen pointers stay
+ * moved or freed individually, so lidx[].raw and svc_seen pointers stay
  * valid until reset_lines rewinds the arena. */
 #define ARENA_CHUNK ((size_t)1 << 20)
 static char **achunk;
@@ -61,12 +72,15 @@ static void arena_reset(void)
 	nachunk = 0;
 }
 
-/* Zero-copy window onto a regular file: clean lines point into the
- * mapping instead of owning an arena copy. */
-
+/* A staged dirty line that has not yet become a complete line is held
+ * here (raw bytes), see feed()/flush_pending(). */
 static char *pend;
 static size_t plen;
 static int flushed_partial;	/* last pushed line had no trailing newline */
+/* transient per-line tag spans, filled by the parallel fill so the
+ * progress bar reflects the color pass too; freed after assign_slots. */
+static int *load_span;
+static size_t load_span_n;
 
 
 /* --- load progress: the only UI painted before the first render.
@@ -195,39 +209,6 @@ void prog_hide(void)
 }
 
 
-/* Per-line construction shared by the sequential (push_line) and parallel
- * (load workers) loaders: everything that only reads this line's bytes and
- * this Line slot. The service color slot is left to a later commit_slot
- * pass because it must follow first-appearance order over the whole file. */
-static void fill_line_fields(Line *L, const char *s, size_t len)
-{
-	regmatch_t sm;
-	L->s = s;
-	L->len = len;
-	L->marked = 0;
-	L->srchit = (unsigned char)search_match(L, &sm);
-	L->sev = NULL;
-	/* measure now: the page holding this line passes through the cache
-	 * exactly once, and deferring the width pass made logs bigger than
-	 * the page cache re-read the whole file on the first hscroll */
-	L->wcols = str_cols(L->s, L->len);
-	detect_tag(L);
-}
-
-static void push_line(const char *clean, size_t len)
-{
-	if (nlines == lcap) {
-		lcap = lcap ? lcap * 2 : 1024;
-		lines = xrealloc(lines, lcap * sizeof(*lines));
-	}
-	Line *L = &lines[nlines];
-	fill_line_fields(L, clean, len);
-	if (L->wcols > wc_max)
-		wc_max = L->wcols;
-	commit_slot(L);
-	nlines++;
-}
-
 /* Does the span hold a tab, CR, or ESC byte (anything sanitize must
  * rewrite)? Three separate memchr calls scan the line three times; a
  * single SIMD pass compares all three at once, which matters for the
@@ -320,6 +301,215 @@ static char *sanitize(const char *s, size_t n, size_t *outlen)
 	return o;
 }
 
+
+/* --- the compact per-line index ------------------------------------- */
+
+/* Grow lidx[] and the mark/hit bitmaps to hold at least `need` lines.
+ * New bitmap bytes are zeroed so a freshly appended line starts clean. */
+static void line_cap_grow(size_t need)
+{
+	if (need <= lcap)
+		return;
+	size_t nc = lcap ? lcap : 1024;
+	while (nc < need)
+		nc *= 2;
+	size_t oldbytes = lcap ? lcap / 8 + 1 : 0;
+	lidx = xrealloc(lidx, nc * sizeof(*lidx));
+	mark_bit = xrealloc(mark_bit, nc / 8 + 1);
+	hit_bit = xrealloc(hit_bit, nc / 8 + 1);
+	memset(mark_bit + oldbytes, 0, (nc / 8 + 1) - oldbytes);
+	memset(hit_bit + oldbytes, 0, (nc / 8 + 1) - oldbytes);
+	lcap = nc;
+}
+
+/* Append one line to the index: where its raw bytes live and how long.
+ * Nothing else is computed here -- width/tag/severity are lazy. */
+static void push_raw(const char *raw, size_t len)
+{
+	line_cap_grow(nlines + 1);
+	LineIdx *X = &lidx[nlines];
+	X->raw = raw;
+	X->len = (uint32_t)len;
+	X->dirty = (unsigned char)line_has_crlfesc(raw, len);
+	X->slot = 0xFF;	/* assigned by assign_slots() in file order */
+	if (len > wc_max)
+		wc_max = len;	/* conservative display-width bound */
+	nlines++;
+}
+
+/* bitset helpers over mark_bit / hit_bit */
+static int bit_get(const unsigned char *b, size_t i)
+{
+	return (b[i >> 3] >> (i & 7)) & 1;
+}
+
+int lt_is_marked(size_t i)	{ return bit_get(mark_bit, i); }
+void lt_mark(size_t i, int on)
+{
+	unsigned char m = (unsigned char)(1 << (i & 7));
+	if (on)
+		mark_bit[i >> 3] |= m;
+	else
+		mark_bit[i >> 3] &= (unsigned char)~m;
+}
+int hit_at(size_t i)		{ return bit_get(hit_bit, i); }
+void set_hit(size_t i, int on)
+{
+	unsigned char m = (unsigned char)(1 << (i & 7));
+	if (on)
+		hit_bit[i >> 3] |= m;
+	else
+		hit_bit[i >> 3] &= (unsigned char)~m;
+}
+
+
+/* --- lazy per-line access ------------------------------------------- */
+
+/* Fetch the displayed (sanitised) text of line i. Clean lines return the
+ * raw bytes (zero-copy); dirty lines are sanitised into the arena (stable
+ * until reset_lines). */
+const char *lt_text(size_t i, size_t *len)
+{
+	LineIdx *X = &lidx[i];
+	if (X->dirty) {
+		size_t cl;
+		char *clean = sanitize(X->raw, X->len, &cl);
+		*len = cl;
+		return clean;
+	}
+	*len = X->len;
+	return X->raw;
+}
+
+/* Materialise line i into *L (caller-owned): sanitised text, display
+ * width, service-tag span, palette slot, and the mark/hit bits. Called
+ * only for lines being drawn, navigated, or copied. */
+void lt_fill(Line *L, size_t i)
+{
+	size_t len;
+	const char *s = lt_text(i, &len);
+	L->s = s;
+	L->len = len;
+	L->marked = (unsigned char)lt_is_marked(i);
+	L->srchit = (unsigned char)hit_at(i);
+	L->sev = NULL;
+	L->wcols = str_cols(s, len);
+	if (L->wcols > wc_max)
+		wc_max = L->wcols;
+	detect_tag(L);
+	L->slot = lidx[i].slot == 0xFF ? -1 : (int)lidx[i].slot;
+}
+
+
+/* --- service-color slot (file-order first appearance) --------------- */
+
+static struct {
+	const char *name;	/* points into a line's raw bytes */
+	size_t len;
+	int slot;
+} svc_seen[128];
+static size_t nsvc_seen;
+
+/* return (and if new, record) the palette slot for a service-tag string.
+ * Order follows first appearance, so adjacent services get distinct hues;
+ * the name is stored by pointer (raw bytes are stable until reset_lines). */
+static int slot_for_tag(const char *name, size_t len)
+{
+	for (size_t j = 0; j < nsvc_seen; j++)
+		if (svc_seen[j].len == len &&
+		    !memcmp(svc_seen[j].name, name, len))
+			return svc_seen[j].slot;
+	if (nsvc_seen == 128) {
+		unsigned h = 2166136261u;
+		for (size_t k = 0; k < len; k++)
+			h = (h ^ (unsigned char)name[k]) * 16777619u;
+		return (int)(h % NSVC_COLORS);
+	}
+	svc_seen[nsvc_seen].name = name;
+	svc_seen[nsvc_seen].len = len;
+	svc_seen[nsvc_seen].slot = (int)(nsvc_seen % NSVC_COLORS);
+	return svc_seen[nsvc_seen++].slot;
+}
+
+/* Assign the palette slot for line i from a precomputed (so,eo) tag span,
+ * or by detecting the span on the fly when span is NULL. */
+static void commit_slot_from(size_t i, const int *span)
+{
+	int so, eo;
+	if (span) {
+		so = span[2 * i];
+		eo = span[2 * i + 1];
+		if (so < 0) {
+			lidx[i].slot = 0xFF;
+			return;
+		}
+	} else {
+		if (lidx[i].len > 2147483647 ||
+		    !tag_span(lidx[i].raw, lidx[i].len, &so, &eo)) {
+			lidx[i].slot = 0xFF;
+			return;
+		}
+	}
+	lidx[i].slot = (unsigned char)slot_for_tag(lidx[i].raw + so,
+						   (size_t)(eo - so));
+}
+
+static void commit_line_slot(size_t i)
+{
+	commit_slot_from(i, NULL);
+}
+
+/* parallel detect-tag pass: order-independent, so it splits across cores
+ * and writes each line's (so,eo) into span[]. */
+typedef struct { int *span; } span_ctx;
+static void span_work(size_t lo, size_t hi, int slot, void *ctx)
+{
+	span_ctx *c = ctx;
+	(void)slot;
+	for (size_t i = lo; i < hi; i++) {
+		int so, eo;
+		size_t len = lidx[i].len;
+		if (len > 2147483647 || !tag_span(lidx[i].raw, len, &so, &eo))
+			so = eo = -1;
+		c->span[2 * i] = so;
+		c->span[2 * i + 1] = eo;
+	}
+}
+
+/* Rebuild svc_seen and slot every indexed line in file order. On a big
+ * file the tag detection (the expensive part) is parallelised into a
+ * transient span array; slot assignment stays sequential so the palette
+ * rotation follows first appearance. Called once after an initial load
+ * and after a rotation rebuild. */
+static void assign_slots(void)
+{
+	nsvc_seen = 0;
+	if (load_span) {
+		/* spans already computed in the parallel fill; lines beyond the
+		 * indexed range (appended while loading) detect on the fly */
+		for (size_t i = 0; i < nlines; i++)
+			commit_slot_from(i, i < load_span_n ? load_span : NULL);
+		free(load_span);
+		load_span = NULL;
+		load_span_n = 0;
+	} else if (par_threads(nlines) > 1) {
+		int *span = xrealloc(NULL, 2 * nlines * sizeof(int));
+		span_ctx sc = { span };
+		par_run(0, nlines, par_threads(nlines), span_work, &sc);
+		for (size_t i = 0; i < nlines; i++)
+			commit_slot_from(i, span);
+		free(span);
+	} else {
+		for (size_t i = 0; i < nlines; i++)
+			commit_line_slot(i);
+	}
+}
+
+
+/* --- ingestion ------------------------------------------------------ */
+
+/* Buffer raw line bytes and index each complete line. Raw bytes are
+ * copied to the arena so lazy materialisation can re-sanitise them. */
 static void feed(const char *data, size_t n)
 {
 	pend = xrealloc(pend, plen + n);
@@ -332,15 +522,17 @@ static void feed(const char *data, size_t n)
 	if (flushed_partial && plen > 0 && pend[0] == '\n')
 		start = 1;
 	flushed_partial = 0;
-	/* memchr skips straight between newlines instead of byte-wise */
 	for (;;) {
 		const char *nl = memchr(pend + start, '\n', plen - start);
 		if (!nl)
 			break;
 		size_t k = (size_t)(nl - pend);
-		size_t len;
-		char *clean = sanitize(pend + start, k - start, &len);
-		push_line(clean, len);
+		size_t len = k - start;
+		char *raw = arena_alloc(len + 1);
+		memcpy(raw, pend + start, len);
+		raw[len] = 0;
+		push_raw(raw, len);
+		commit_line_slot(nlines - 1);
 		start = k + 1;
 	}
 	memmove(pend, pend + start, plen - start);
@@ -353,22 +545,24 @@ void flush_pending(void)
 {
 	if (plen == 0)
 		return;
-	size_t len;
-	char *clean = sanitize(pend, plen, &len);
-	push_line(clean, len);
+	char *raw = arena_alloc(plen + 1);
+	memcpy(raw, pend, plen);
+	raw[plen] = 0;
+	push_raw(raw, plen);
+	commit_line_slot(nlines - 1);
 	plen = 0;
 	flushed_partial = 1;
 }
 
+
 /* --- parallel mmap loading -------------------------------------------
- * The per-line work (sanitize probe, UTF-8 width, search hit, tag span) is
- * embarrassingly parallel: each piece reads only this line's bytes and this
- * Line slot. Only the line index, wc_max and the service-color
- * first-appearance order are file-global, and those are cheap to reduce or
- * defer. So a large mapping is split into line-aligned chunks, the chunk
- * counts are summed to lay out lines[] once, then threads fill their slice
- * in place. The order-dependent bits (service slot, wc_max) are folded in
- * after the joins. */
+ * The per-line work still needs the whole file's line boundaries, so the
+ * index is built by splitting the mapping into line-aligned chunks and
+ * counting then filling in place. Unlike the old eager loader there is no
+ * width/tag/search pass here -- each chunk only records raw pointers and
+ * the dirty probe, so the fill is nearly as cheap as the count. The
+ * order-dependent bits (service slot, wc_max) are folded in after the
+ * joins. */
 
 /* Parallel loading only pays off once the file is big enough to amortize the
  * thread spawns and the 2-pass (count then fill) scan. On a warm 12-core box
@@ -380,15 +574,10 @@ void flush_pending(void)
 static size_t load_done;	/* chunks finished in the current pass */
 static size_t load_nt;		/* chunk count of the running load */
 static size_t load_bnds[LOAD_MAX_THREADS + 1];	/* per-pass chunk boundaries */
-/* each worker's current scan position (absolute file offset). A worker writes
- * only its own slot and the main thread reads the whole array, so the bar can
- * advance even while earlier slices are still chewing. */
+/* each worker's current scan position (absolute file offset) */
 static size_t load_chunk_prog[LOAD_MAX_THREADS];
 
-/* Work done so far: the sum of bytes scanned across every slice. Unlike a
- * contiguous prefix (which stalls on the slowest leading slice and then jumps
- * when the equal-sized slices finish together), this climbs smoothly the whole
- * time every worker is chewing. */
+/* Work done so far: the sum of bytes scanned across every slice. */
 static size_t load_work_done(void)
 {
 	size_t sum = 0;
@@ -404,7 +593,6 @@ static size_t load_work_done(void)
 static size_t load_threads(size_t bytes)
 {
 	long n = effective_threads();
-	/* each thread should chew at least ~256 KiB, else spawn cost wins */
 	if ((size_t)n > bytes / ((size_t)256 << 10))
 		n = bytes / ((size_t)256 << 10);
 	if (n < 1)
@@ -415,9 +603,9 @@ static size_t load_threads(size_t bytes)
 typedef struct {
 	const char *lo, *hi;	/* byte range: whole lines */
 	size_t idx;		/* slice number: indexes load_chunk_prog */
-	size_t base;		/* lines[base .. base+count) */
+	size_t base;		/* lidx[base .. base+count) */
 	size_t count;		/* lines in this slice */
-	size_t peak;		/* slice-local max display width */
+	size_t peak;		/* slice-local max raw length */
 } load_chunk;
 
 typedef struct {
@@ -450,15 +638,8 @@ static void load_spawn(load_ctx *ctx, int with_prog)
 		made[k] = pthread_create(&th[k], NULL, load_tramp, &arg[k]) == 0;
 	}
 	if (with_prog) {
-		/* The main thread idles here while workers report their scan position.
-		 * The count and fill passes together bank 2x the file's bytes, so the
-		 * bar spans one continuous 0..100% sweep across both: count fills the
-		 * first half, fill the second. Halving the running total keeps it on
-		 * prog_file's fmap_len denominator. */
 		while (__sync_fetch_and_add(&load_done, 0) < nt) {
 			prog_file((ctx->base + load_work_done()) / 2);
-			/* Tiny poll: this wait becomes the load's latency for files that
-			 * finish in one tick, so keep it far below a human's blur. */
 			struct timespec ts = { 0, 2 * 1000000 };
 			nanosleep(&ts, NULL);
 		}
@@ -494,10 +675,12 @@ static void count_chunk(load_chunk *c)
 	__sync_fetch_and_add(&load_done, 1);
 }
 
+/* Fill a slice of the index: record each line's raw pointer and length and
+ * whether it needs sanitising. No width/tag/severity work here. */
 static void fill_chunk(load_chunk *c)
 {
 	const char *p = c->lo, *e = c->hi;
-	Line *L = lines + c->base;
+	LineIdx *L = lidx + c->base;
 	size_t i = 0, maxc = 0;
 	size_t next = (size_t)(p - fmap) + PROG_STEP_BYTES;
 	for (;;) {
@@ -505,13 +688,20 @@ static void fill_chunk(load_chunk *c)
 		if (!nl)
 			break;
 		size_t n = (size_t)(nl - p);
-		if (line_has_crlfesc(p, n)) {
-			size_t cl;
-			char *clean = sanitize(p, n, &cl);
-			fill_line_fields(&L[i++], clean, cl);
-		} else {
-			fill_line_fields(&L[i++], p, n);
+		L[i].raw = p;
+		L[i].len = (uint32_t)n;
+		L[i].dirty = (unsigned char)line_has_crlfesc(p, n);
+		L[i].slot = 0xFF;
+		if (n > maxc)
+			maxc = n;
+		if (load_span) {
+			int so, eo;
+			if (n > 2147483647 || !tag_span(p, n, &so, &eo))
+				so = eo = -1;
+			load_span[2 * (c->base + i)] = so;
+			load_span[2 * (c->base + i) + 1] = eo;
 		}
+		i++;
 		p = nl + 1;
 		if ((size_t)(p - fmap) >= next) {
 			__atomic_store_n(&load_chunk_prog[c->idx],
@@ -522,9 +712,6 @@ static void fill_chunk(load_chunk *c)
 	/* any trailing bytes after the last '\n' are left for the feed path
 	 * below, so a file that grows across the mmap/read seam merges the
 	 * partial line instead of splitting it */
-	for (size_t j = 0; j < i; j++)
-		if (L[j].wcols > maxc)
-			maxc = L[j].wcols;
 	c->peak = maxc;
 	__atomic_store_n(&load_chunk_prog[c->idx], (size_t)(c->hi - fmap),
 			 __ATOMIC_RELAXED);
@@ -546,7 +733,6 @@ static void drain_map_par(void)
 			bnds[k] = prev;	/* previous boundary already past nominal */
 			continue;
 		}
-		/* align the boundary to the next line start so no line splits */
 		const char *nl = memchr(fmap + fmap_pos + nominal, '\n',
 					total - nominal);
 		bnds[k] = nl ? (size_t)(nl - (fmap + fmap_pos)) + 1 : total;
@@ -573,25 +759,24 @@ static void drain_map_par(void)
 		chunks[k].base = total_lines;
 		total_lines += chunks[k].count;
 	}
-	if (total_lines > lcap) {
-		lines = xrealloc(lines, total_lines * sizeof(*lines));
-		lcap = total_lines;
-	}
+	line_cap_grow(total_lines);
 	nlines = total_lines;
+
+	/* colour detection runs here (parallel), ahead of the 100% bar, so the
+	 * only post-fill work is the fast slot ordering. */
+	load_span = xrealloc(NULL, 2 * total_lines * sizeof(int));
+	load_span_n = total_lines;
 
 	load_ctx fc = { chunks, nt, total, fill_chunk };
 	for (size_t k = 0; k < nt; k++)
 		load_chunk_prog[k] = bnds[k];
 	load_done = 0;
-	load_spawn(&fc, 1);	/* fill pass: the heavy per-line work */
+	load_spawn(&fc, 1);	/* fill pass: still just the raw index */
 
 	wc_max = 0;
 	for (size_t k = 0; k < nt; k++)
 		if (chunks[k].peak > wc_max)
 			wc_max = chunks[k].peak;
-	/* service color follows first-appearance order: one sequential pass */
-	for (size_t i = 0; i < nlines; i++)
-		commit_slot(&lines[i]);
 
 	/* buffer a final partial line (no trailing '\n') the way the sequential
 	 * drain does, so a growing file's first extra read merges it correctly */
@@ -606,8 +791,8 @@ static void drain_map_par(void)
 	prog_file(fmap_len);
 }
 
-/* scan newly visible mapping range into lines; a trailing partial line
- * goes back through pend so streaming/follow continue seamlessly */
+/* scan newly visible mapping range into the line index; a trailing partial
+ * line goes back through pend so streaming/follow continue seamlessly */
 static void drain_map(void)
 {
 	/* a big file is the common choke point: split across cores */
@@ -616,28 +801,21 @@ static void drain_map(void)
 		drain_map_par();
 		return;
 	}
-	size_t start = fmap_pos;
+	size_t start = 0;
 	for (;;) {
-		const char *nl = memchr(fmap + start, '\n', fmap_len - start);
+		const char *nl = memchr(fmap + fmap_pos + start, '\n',
+					fmap_len - fmap_pos - start);
 		if (!nl)
 			break;
-		size_t k = (size_t)(nl - fmap);
-		const char *s = fmap + start;
-		size_t n = k - start;
-		/* SIMD probe for a tab/CR/ESC: if absent the line is clean */
-		if (line_has_crlfesc(s, n)) {
-			size_t len;
-			char *clean = sanitize(s, n, &len);
-			push_line(clean, len);
-		} else {
-			push_line(s, n);
-		}
-		start = k + 1;
-		prog_file(start);
+		const char *s = fmap + fmap_pos + start;
+		size_t len = (size_t)(nl - s);
+		push_raw(s, len);
+		start = (size_t)(nl - (fmap + fmap_pos)) + 1;
+		prog_file(fmap_pos + start);
 	}
-	fmap_pos = start;
-	if (start < fmap_len)
-		feed(fmap + start, fmap_len - start);
+	fmap_pos += start;
+	if (fmap_pos < fmap_len)
+		feed(fmap + fmap_pos, fmap_len - fmap_pos);
 }
 
 /* non-blocking drain of piped stdin; latches EOF so closed pipes
@@ -663,12 +841,6 @@ static int append_stdin(void)
 	return nlines != old;
 }
 
-static struct {
-	const char *name;	/* points into a Line's buffer */
-	size_t len;
-	int slot;
-} svc_seen[128];
-static size_t nsvc_seen;
 
 /* Byte span of the syslog service tag; returns 1 and fills *so / *eo, or 0
  * if none. Heuristic: the first field ending in ':' after a timestamp-ish
@@ -687,10 +859,6 @@ static size_t nsvc_seen;
  * one stable tag per prefix instead of random prose words. */
 static int tag_span(const char *s, size_t n, int *so, int *eo)
 {
-	/* A tag is the *last* byte of a space-delimited field, so its ':'
-	 * is always followed by a space or end-of-line. Skim for such a
-	 * field-boundary colon and reject lines without one (the common
-	 * case) with a single memchr walk instead of the field walk below. */
 	const char *colon = s, *end = s + n;
 	while ((colon = memchr(colon, ':', (size_t)(end - colon))) != NULL) {
 		if (colon + 1 == end || colon[1] == ' ')
@@ -710,8 +878,6 @@ static int tag_span(const char *s, size_t n, int *so, int *eo)
 			break;
 		size_t fs = i;
 		int digit = 0;
-		/* one pass per field: find its end and, until a digit has been
-		 * seen in some field, whether it holds one */
 		while (i < n && s[i] != ' ') {
 			if (!saw_digit && !digit &&
 			    (unsigned char)s[i] >= '0' && (unsigned char)s[i] <= '9')
@@ -723,8 +889,7 @@ static int tag_span(const char *s, size_t n, int *so, int *eo)
 		pfs = fs;
 		saw_digit = saw_digit || digit;
 		if (++field < 2 || !saw_digit)
-			continue;	/* tag needs a timestamp-ish preamble,
-					 * else prose reads as "tag: text" */
+			continue;
 		if (fe == fs || s[fe - 1] != ':' || fe - fs > 64 || s[fs] == '<')
 			continue;
 		size_t b = fs, e = fe - 1;
@@ -732,7 +897,7 @@ static int tag_span(const char *s, size_t n, int *so, int *eo)
 			if (pf == (size_t)-1)
 				continue;
 			b = pf;
-			e = fs;	/* stop before the ':' */
+			e = fs;
 		}
 		if (e > b && s[e - 1] == ']') {
 			size_t k = e - 1;
@@ -754,50 +919,17 @@ static int tag_span(const char *s, size_t n, int *so, int *eo)
 
 /* Detect this line's service-tag byte span. Order-independent: only reads
  * the line's own bytes, so it is safe to run in the parallel loader. The
- * palette slot is left -1 until commit_slot runs in file order. */
+ * palette slot is left -1; lt_fill reads it from lidx[].slot instead. */
 static void detect_tag(Line *L)
 {
 	int fs, e;
 	L->slot = -1;
 	L->tag_so = -1;
 	L->tag_eo = -1;
-	/* tag spans are ints: a single line longer than 2GiB has none */
 	if (L->len > 2147483647 || !tag_span(L->s, L->len, &fs, &e))
 		return;
 	L->tag_so = fs;
 	L->tag_eo = e;
-}
-
-/* Assign the palette slot for an already-detected tag. Order-dependent:
- * slots follow order of first appearance in the file, so a parallel load
- * calls this once per line in file order after the heavy work is done.
- * Run at push time for the sequential path: slots follow order of
- * appearance in the file, and render-time assignment reshuffles colors
- * on reload (draw order differs from file order). */
-static void commit_slot(Line *L)
-{
-	int fs = L->tag_so, e = L->tag_eo;
-	if (fs < 0)
-		return;
-	for (size_t j = 0; j < nsvc_seen; j++)
-		if (svc_seen[j].len == (size_t)(e - fs) &&
-		    !memcmp(svc_seen[j].name, L->s + fs, (size_t)(e - fs))) {
-			L->slot = svc_seen[j].slot;
-			return;
-		}
-	if (nsvc_seen == 128) {
-		/* table full: hash into the palette instead */
-		unsigned h = 2166136261u;
-		for (int k = fs; k < e; k++)
-			 h = (h ^ (unsigned char)L->s[k]) * 16777619u;
-		L->slot = (int)(h % NSVC_COLORS);
-		return;
-	}
-	svc_seen[nsvc_seen].name = L->s + fs;
-	svc_seen[nsvc_seen].len = (size_t)(e - fs);
-	svc_seen[nsvc_seen].slot = (int)(nsvc_seen % NSVC_COLORS);
-	L->slot = svc_seen[nsvc_seen].slot;
-	nsvc_seen++;
 }
 
 void reset_lines(void)
@@ -809,12 +941,22 @@ void reset_lines(void)
 		fmap_len = fmap_pos = 0;
 	}
 	nlines = 0;
+	lcap = 0;
+	free(lidx);
+	lidx = NULL;
+	free(mark_bit);
+	mark_bit = NULL;
+	free(hit_bit);
+	hit_bit = NULL;
+	free(load_span);
+	load_span = NULL;
+	load_span_n = 0;
 	plen = 0;
 	flushed_partial = 0;
 	nmarked = 0;
 	nv = 0;	/* view entries referenced the freed buffers */
 	nsvc_seen = 0;	/* tag pointers referenced the freed buffers */
-	wc_max = 0;	/* folded widths belonged to the old lines */
+	wc_max = 0;
 	prog_mark = 0;
 }
 
@@ -839,8 +981,6 @@ static void try_map(void)
 		       MAP_PRIVATE, fd, 0);
 	if (p == MAP_FAILED)
 		return;
-	/* scans only ever run forward; ignore errors (old kernels on
-	 * exotic maps may not honor it) */
 	madvise(p, (size_t)st.st_size, MADV_SEQUENTIAL);
 	fmap = p;
 	fmap_len = (size_t)st.st_size;
@@ -852,6 +992,7 @@ void load_all(void)
 	if (use_stdin) {
 		append_stdin();
 		flush_pending();
+		assign_slots();
 		return;
 	}
 	if (fd < 0) {
@@ -864,6 +1005,7 @@ void load_all(void)
 	read_available(fd);
 	flush_pending();
 	fsize = lseek(fd, 0, SEEK_CUR);
+	assign_slots();
 }
 
 /* returns 0 = no new data, 1 = new lines appended, 2 = file rotated */
@@ -871,9 +1013,6 @@ static int append_new(void)
 {
 	struct stat st, fst;
 	int rotated = 0;
-	/* rename+recreate rotation keeps our fd on the old inode, whose
-	 * size never changes -- compare the path's inode too; the size
-	 * check alone covers copytruncate truncation */
 	if (fstat(fd, &fst) == 0 && stat(path, &st) == 0 &&
 	    (st.st_ino != fst.st_ino || st.st_dev != fst.st_dev ||
 	     (off_t)st.st_size < fsize)) {
@@ -885,15 +1024,16 @@ static int append_new(void)
 		fsize = 0;
 		rotated = 1;
 		try_map();
-		/* skip what mmap already covered; fmap_len is 0 when unmapped,
-		 * so an mmap failure still reads the whole file */
 		lseek(fd, (off_t)fmap_len, SEEK_SET);
 	}
 	off_t before = lseek(fd, 0, SEEK_CUR);
 	read_available(fd);
-	off_t now = lseek(fd, 0, SEEK_CUR);
-	fsize = now;
-	return rotated ? 2 : (now != before);
+	fsize = lseek(fd, 0, SEEK_CUR);
+	if (rotated) {
+		flush_pending();
+		assign_slots();
+	}
+	return rotated ? 2 : (fsize != before);
 }
 
 /* one round of new data from the followed source: 0 = none,
@@ -905,8 +1045,6 @@ int pump_follow(void)
 		return poll(&ps, 1, 0) > 0 ? append_stdin() : 0;
 	}
 	if (fd < 0) {
-		/* rotation race lost the file between stat and open;
-		 * retry until it reappears */
 		fd = open(path, O_RDONLY);
 		if (fd < 0)
 			return 0;

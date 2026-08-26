@@ -119,8 +119,8 @@ static void copy_text(const char *s, size_t len)
 
 void clear_marks(void)
 {
-	for (size_t i = 0; i < nlines; i++)
-		lines[i].marked = 0;
+	if (nlines)
+		memset(mark_bit, 0, nlines / 8 + 1);
 	nmarked = 0;
 }
 
@@ -129,15 +129,20 @@ void copy_current(void)
 	if (nmarked > 0) {
 		size_t total = 0;
 		for (size_t i = 0; i < nlines; i++)
-			if (lines[i].marked)
-				total += lines[i].len + 1;
+			if (lt_is_marked(i)) {
+				size_t len;
+				lt_text(i, &len);
+				total += len + 1;
+			}
 		char *buf = xrealloc(NULL, total + 1);
 		size_t off = 0;
 		for (size_t i = 0; i < nlines; i++) {
-			if (!lines[i].marked)
+			if (!lt_is_marked(i))
 				continue;
-			memcpy(buf + off, lines[i].s, lines[i].len);
-			off += lines[i].len;
+			size_t len;
+			const char *s = lt_text(i, &len);
+			memcpy(buf + off, s, len);
+			off += len;
 			buf[off++] = '\n';
 		}
 		copy_text(buf, off);
@@ -149,7 +154,8 @@ void copy_current(void)
 	}
 	if (nv == 0)
 		return;
-	Line *L = &lines[view[cur]];
-	copy_text(L->s, L->len);
-	snprintf(msg, sizeof msg, "copied line %zu (%zu bytes)", cur + 1, L->len);
+	size_t len;
+	const char *s = lt_text(view_at(cur), &len);
+	copy_text(s, len);
+	snprintf(msg, sizeof msg, "copied line %zu (%zu bytes)", cur + 1, len);
 }

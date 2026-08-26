@@ -6,11 +6,19 @@
 
 #include <unistd.h>
 
-Line *lines;
+LineIdx *lidx;
 size_t nlines, lcap;
+
+unsigned char *mark_bit;	/* marked-line bitset */
+unsigned char *hit_bit;		/* highlight-search-hit bitset */
 
 size_t *view;
 size_t nv, vcap;
+
+size_t view_at(size_t k)
+{
+	return view ? view[k] : k;
+}
 
 char path[4096];
 int use_stdin;
@@ -24,8 +32,8 @@ int stdin_eof;	/* pipe closed: no more input will ever come */
 char *fmap;
 size_t fmap_len, fmap_pos;
 
-/* running max of line widths; maintained at push time, see push_line.
- * reset_lines rewinds it alongside the lines themselves. */
+/* running max of raw line lengths; maintained at index time (push_raw),
+ * refined with measured widths on materialisation. reset_lines rewinds it. */
 size_t wc_max;
 
 Pat filter_pat;
@@ -34,7 +42,7 @@ Pat search_pat;
 /* candidate for in-flight scans; the UI keeps serving the last committed
  * view/pattern until the job lands (see step_job), so Esc can drop a
  * mistyped query wholesale. Workers test the pending spec; n/N,
- * push_line marking and the status bar stay on the committed ones. */
+ * hit marking and the status bar stay on the committed ones. */
 Pat pending_pat;
 
 int re_mode;		/* UI toggle for the next filter: literal vs ERE */

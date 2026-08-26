@@ -133,16 +133,18 @@ size_t widest_col(void)
 	return wc_max;
 }
 
-size_t line_cols(Line *L)
+size_t line_cols(size_t i)
 {
-	return L->wcols;
+	Line lz;
+	lt_fill(&lz, i);
+	return lz.wcols;
 }
 
-size_t line_rows(Line *L)
+size_t line_rows(size_t i)
 {
 	if (!wrap)
 		return 1;
-	size_t n = (line_cols(L) + (size_t)cols - 1) / (size_t)cols;
+	size_t n = (line_cols(i) + (size_t)cols - 1) / (size_t)cols;
 	return n ? n : 1;
 }
 
@@ -314,9 +316,11 @@ static int collect_spans(const Line *L, Span *sp)
  * on the next row; otherwise it stops at the right edge (hscroll). */
 static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 {
-	Line *L = &lines[idx];
+	Line lz;
+	Line *L = &lz;
+	lt_fill(L, idx);
 	if (!L->sev)
-		L->sev = severity(L->s, L->len);	/* scan once, lines are immutable */
+		L->sev = severity(L->s, L->len);	/* lines are immutable; L is fresh */
 	const char *col = L->sev;
 	regmatch_t m;
 	int ms = -1, me = -1;
@@ -325,12 +329,12 @@ static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 	m.rm_eo = (regoff_t)L->len;	/* REG_STARTEND: no NUL needed */
 	if (!nocolor && L->srchit) {
 		regmatch_t sm;
-		if (search_match(L, &sm)) {
+		if (search_match(L->s, L->len, &sm)) {
 			ss = (int)sm.rm_so;
 			se = (int)sm.rm_eo;
 		}
 	}
-	if (query_match(L, &m)) {
+	if (query_match(L->s, L->len, &m)) {
 		ms = (int)m.rm_so;
 		me = (int)m.rm_eo;
 	}
@@ -647,7 +651,7 @@ void render(void)
 	fputs("\x1b[H", stdout);
 	size_t r = 0, i = top;
 	for (; i < nv && r < vis; i++)
-		r += draw_line(view[i], i == cur, r, vis);
+		r += draw_line(view_at(i), i == cur, r, vis);
 	if (r < vis) {
 		printf("\x1b[%zu;1H", r + 1);
 		if (nv == 0 && !filter_pat.active)
@@ -685,7 +689,7 @@ void render(void)
 					hi2 = lo + 1;
 				unsigned char hit = 0;
 				for (size_t k = lo; k < hi2 && k < nv; k++)
-					if (lines[view[k]].srchit) {
+					if (hit_at(view_at(k))) {
 						hit = 1;
 						break;
 					}

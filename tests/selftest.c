@@ -224,6 +224,14 @@ static Line mkline(const char *s)
 	return L;
 }
 
+/* exercise the production index path (push_raw + file-order slot) instead
+ * of any test-only loader shim */
+static void tpush(const char *s)
+{
+	push_raw(s, strlen(s));
+	commit_line_slot(nlines - 1);
+}
+
 static const Span *find_attr(const Span *sp, int n, const char *attr)
 {
 	for (int i = 0; i < n; i++)
@@ -263,10 +271,12 @@ static void test_collect_spans(void)
 	const Span *p = find_attr(sp, n, PAREN_COLOR);
 	CHECK(p && p->so == 4 && p->se == 15 && L.s[p->se - 1] == ')');
 
-	/* <info> token hue after the service tag */
+	/* <info> token hue after the service tag (slot from the real lookup) */
 	L = mkline("Aug 22 23:53:27 host foo[1]: <info> hello");
 	detect_tag(&L);
-	commit_slot(&L);
+	if (L.tag_so >= 0)
+		L.slot = slot_for_tag(L.s + L.tag_so,
+				      (size_t)(L.tag_eo - L.tag_so));
 	n = collect_spans(&L, sp);
 	const char *tok = "\x1b[38;5;110m";	/* cornflower, matches token_attr */
 	const Span *t = find_attr(sp, n, tok);
@@ -332,8 +342,8 @@ static void test_job_cancel(void)
 {
 	filter_pat.active = filter_pat.is_re = 0;
 	re_mode = 1;
-	push_line("abc here", 8);
-	push_line("nothing", 7);
+	tpush("abc here");
+	tpush("nothing");
 
 	update_filter("a.c");		/* true regex: not alt-parseable */
 	job_flush();
@@ -359,7 +369,7 @@ static void test_clear_inverted_filter(void)
 	size_t base = nlines;
 	filter_pat.active = filter_pat.is_re = 0;
 	re_mode = 0;
-	push_line("zqxj marker", 11);
+	tpush("zqxj marker");
 
 	filter_inv = 1;
 	update_filter("zqxj");		/* inverted: every prior line stays */
@@ -398,22 +408,22 @@ static void test_alt(void)
 	CHECK(alt_parse("error|warn", 1, &as) == 1);
 	L.s = "something error happened";
 	L.len = strlen(L.s);
-	CHECK(alt_match(&as, &L, &m) == 1 && m.rm_so == 10 && m.rm_eo == 15);
+	CHECK(alt_match(&as, L.s, L.len, &m) == 1 && m.rm_so == 10 && m.rm_eo == 15);
 
 	/* ties at the same start go to the longest (POSIX-ish) */
 	CHECK(alt_parse("error|errorx", 1, &as) == 1);
 	L.s = "errorx";
 	L.len = strlen(L.s);
-	CHECK(alt_match(&as, &L, &m) == 1 && m.rm_eo == 6);
+	CHECK(alt_match(&as, L.s, L.len, &m) == 1 && m.rm_eo == 6);
 
 	/* per-piece anchors hold */
 	CHECK(alt_parse("^sshd", 1, &as) == 1 && as.bol[0]);
 	L.s = "xsshd";
 	L.len = strlen(L.s);
-	CHECK(alt_match(&as, &L, &m) == 0);
+	CHECK(alt_match(&as, L.s, L.len, &m) == 0);
 	L.s = "sshd ok";
 	L.len = strlen(L.s);
-	CHECK(alt_match(&as, &L, &m) == 1 && m.rm_so == 0);
+	CHECK(alt_match(&as, L.s, L.len, &m) == 1 && m.rm_so == 0);
 }
 
 static void test_job_discard_ownership(void)

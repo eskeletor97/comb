@@ -228,13 +228,14 @@ int alt_parse(const char *q, int icase, AltSpec *as)
 /* best literal match across the alternation. Each piece finds its own
  * leftmost hit; the winner is the leftmost, breaking ties by longest
  * (approximating POSIX leftmost-longest for disjoint literal pieces). */
-static int alt_match(const AltSpec *as, const Line *L, regmatch_t *m)
+static int alt_match(const AltSpec *as, const char *s, size_t len,
+		      regmatch_t *m)
 {
 	ptrdiff_t best = -1, best_len = -1;
 	for (int i = 0; i < as->n; i++) {
 		ptrdiff_t off = pat_find(as->buf + as->off[i], as->len[i],
 					as->bol[i], as->eol[i], as->icase,
-					L->s, L->len);
+					s, len);
 		if (off < 0)
 			continue;
 		if (best == -1 || off < best ||
@@ -253,17 +254,18 @@ static int alt_match(const AltSpec *as, const Line *L, regmatch_t *m)
 /* shared matcher for one Pat spec: dispatch its literal, literal
  * alternation or compiled regex against one line, filling m with the
  * match (highlight) span */
-static int pattern_match(const Line *L, const Pat *p, regmatch_t *m)
+static int pattern_match(const char *s, size_t len, const Pat *p,
+			 regmatch_t *m)
 {
 	if (p->is_alt)
-		return alt_match(&p->alt, L, m);
+		return alt_match(&p->alt, s, len, m);
 	if (p->is_re) {
 		m->rm_so = 0;
-		m->rm_eo = (regoff_t)L->len;	/* REG_STARTEND: no NUL needed */
-		return regexec(&p->re, L->s, 1, m, REG_STARTEND) == 0;
+		m->rm_eo = (regoff_t)len;	/* REG_STARTEND: no NUL needed */
+		return regexec(&p->re, s, 1, m, REG_STARTEND) == 0;
 	}
 	ptrdiff_t off = pat_find(p->lit.buf, p->lit.len, p->lit.bol, p->lit.eol,
-				 p->lit.icase, L->s, L->len);
+				 p->lit.icase, s, len);
 	if (off < 0)
 		return 0;
 	m->rm_so = (regoff_t)off;
@@ -272,12 +274,12 @@ static int pattern_match(const Line *L, const Pat *p, regmatch_t *m)
 }
 
 /* active-filter test; on match fills m with the highlight span */
-int query_match(const Line *L, regmatch_t *m)
+int query_match(const char *s, size_t len, regmatch_t *m)
 {
 	if (pending_pat.active) {	/* a scan is testing a candidate pattern */
 		/* an empty candidate text is a pending clear: the empty literal
 		 * matches every line again, with an empty highlight span */
-		return pattern_match(L, &pending_pat, m);
+		return pattern_match(s, len, &pending_pat, m);
 	}
 	if (!filter_pat.active) {
 		m->rm_so = m->rm_eo = 0;	/* empty span: nothing to highlight */
@@ -285,7 +287,7 @@ int query_match(const Line *L, regmatch_t *m)
 	}
 	/* no zero-width guard here: the return decides view membership, and
 	 * a pattern like a* matching empty must keep lines visible */
-	return pattern_match(L, &filter_pat, m);
+	return pattern_match(s, len, &filter_pat, m);
 }
 
 /* does the highlight-search pattern hit this line? fills m with the span.
@@ -294,14 +296,14 @@ int query_match(const Line *L, regmatch_t *m)
  * previous results until commit. An empty candidate query must answer
  * "no hits" rather than falling back to the committed search -- lines
  * pushed mid-sweep are never rewritten at commit (see job_finish). */
-int search_match(const Line *L, regmatch_t *m)
+int search_match(const char *s, size_t len, regmatch_t *m)
 {
 	const Pat *p = pending_pat.active ? &pending_pat : &search_pat;
 	int on = p->active && (p != &pending_pat || p->enable_on_commit);
 	regmatch_t mm;
 	if (!on)
 		return 0;
-	if (!pattern_match(L, p, &mm))
+	if (!pattern_match(s, len, p, &mm))
 		return 0;
 	/* a zero-width regex match is not a hit: n/N and the scrollbar need
 	 * a real span to land on */
@@ -388,7 +390,7 @@ typedef struct {
 
 typedef struct {
 	size_t (*pos_line)(size_t p);	/* position -> line index */
-	int (*match)(const Line *L, regmatch_t *m);
+	int (*match)(const char *s, size_t len, regmatch_t *m);
 	int inv;
 	par_list *lst;			/* per-slot match collectors */
 } col_ctx;
@@ -400,7 +402,9 @@ static void col_work(size_t lo, size_t hi, int slot, void *ctx)
 	regmatch_t m;
 	for (size_t p = lo; p < hi; p++) {
 		size_t li = c->pos_line(p);
-		if (c->match(&lines[li], &m) != c->inv) {
+		size_t len;
+		const char *s = lt_text(li, &len);
+		if (c->match(s, len, &m) != c->inv) {
 			if (b->n == b->cap) {
 				b->cap = b->cap ? b->cap * 2 : 512;
 				b->a = xrealloc(b->a, b->cap * sizeof(*b->a));
@@ -414,7 +418,7 @@ static void col_work(size_t lo, size_t hi, int slot, void *ctx)
  * match(lines[pos_line(p)]) != inv, preserving position order. Each
  * pthread builds one slice; the slices concatenate in slot order. */
 void scan_collect(size_t lo, size_t hi, size_t (*pos_line)(size_t),
-			 int (*match)(const Line *L, regmatch_t *m), int inv,
+			 int (*match)(const char *s, size_t len, regmatch_t *m), int inv,
 			 size_t **arr, size_t *n, size_t *cap)
 {
 	int nthreads = par_threads(hi - lo);
@@ -443,4 +447,4 @@ void scan_collect(size_t lo, size_t hi, size_t (*pos_line)(size_t),
 }
 
 size_t pos_ident(size_t p) { return p; }
-size_t pos_view(size_t p) { return view[p]; }
+size_t pos_view(size_t p) { return view_at(p); }

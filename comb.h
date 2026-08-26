@@ -14,7 +14,10 @@
 #include <sys/types.h>
 #include <termios.h>
 
-/* one ingested line: s points either into the arena or into the mmap */
+/* one materialised line: s points either into the arena, the mmap, or a
+ * sanitising copy made on demand. A Line is a *transient* view built by
+ * lt_fill() for lines currently on screen (or being tested); the only
+ * persistent per-line state lives in lidx[] and the marker/search bitmaps. */
 typedef struct {
 	const char *s;
 	size_t len;
@@ -25,6 +28,20 @@ typedef struct {
 	size_t wcols;		/* display width cache, 0 = uncomputed */
 	const char *sev;	/* severity SGR cache, NULL = unscanned */
 } Line;
+
+/* the persistent, compact per-line index. Everything the viewer needs to
+ * reach line i on demand: where its raw bytes live and how long they are.
+ * Display width, service-tag span, palette slot and severity are *not*
+ * stored here -- they are recomputed by lt_fill() only for lines that are
+ * actually drawn. raw points into the mmap (clean file lines) or into the
+ * arena (stdin / appended / sanitised copies); both are stable until the
+ * next reset_lines(). */
+typedef struct {
+	const char *raw;
+	uint32_t len;		/* raw byte length, excluding the '\n' */
+	unsigned char dirty;	/* needs sanitising (tab/CR/ESC present) */
+	unsigned char slot;	/* service palette slot, 0xFF = no tag */
+} LineIdx;
 
 /* parsed literal pattern, shared shape for the filter's and search's
  * matchers: buffer + ^/$ anchors + smart-case flag */
@@ -53,11 +70,21 @@ typedef void (*par_work)(size_t lo, size_t hi, int slot, void *ctx);
 
 /* --- shared viewer state (defined in state.c) ------------------------ */
 
-extern Line *lines;
+extern LineIdx *lidx;
 extern size_t nlines, lcap;
+
+/* per-line bitset flags; lines are transient, so marks and highlight-search
+ * hits live here instead of in a Line. */
+extern unsigned char *mark_bit;
+extern unsigned char *hit_bit;
 
 extern size_t *view;
 extern size_t nv, vcap;
+
+/* the visible view is an identity range when no filter is active
+ * (view==NULL, view_at(k)==k), so a huge unfiltered log needs no array; a
+ * filtered view materialises view[] of matching line indices. */
+size_t view_at(size_t k);
 
 extern char path[4096];
 extern int use_stdin;
@@ -70,8 +97,8 @@ extern int stdin_eof;	/* pipe closed: no more input will ever come */
 extern char *fmap;
 extern size_t fmap_len, fmap_pos;
 
-/* running max of line widths; maintained at push time, see push_line.
- * reset_lines rewinds it alongside the lines themselves. */
+/* running max of raw line lengths; maintained at index time (push_raw),
+ * refined with measured widths on materialisation. reset_lines rewinds it. */
 extern size_t wc_max;
 
 /* One pattern, in one of three roles. Lifecycle: update_filter /
@@ -167,16 +194,26 @@ void human_bytes(char *o, size_t v);
 void group_digits(char *o, size_t v);
 void prog_hide(void);
 
+/* lazy per-line access (see load.c): materialise line i or fetch just its
+ * displayed text. lt_text returns a stable pointer (raw for clean lines,
+ * an arena-copied sanitised string for dirty ones) and the byte length. */
+void lt_fill(Line *L, size_t i);
+const char *lt_text(size_t i, size_t *len);
+void lt_mark(size_t i, int on);
+int lt_is_marked(size_t i);
+void set_hit(size_t i, int on);
+int hit_at(size_t i);
+
 /* --- match.c --------------------------------------------------------- */
 int smart_case(const char *q);
 void lit_parse(const char *q, int icase, LitSpec *ls);
 int alt_parse(const char *q, int icase, AltSpec *as);
-int query_match(const Line *L, regmatch_t *m);
-int search_match(const Line *L, regmatch_t *m);
+int query_match(const char *s, size_t len, regmatch_t *m);
+int search_match(const char *s, size_t len, regmatch_t *m);
 int par_threads(size_t len);
 void par_run(size_t lo, size_t hi, int nthreads, par_work work, void *ctx);
 void scan_collect(size_t lo, size_t hi, size_t (*pos_line)(size_t),
-		  int (*match)(const Line *L, regmatch_t *m), int inv,
+		  int (*match)(const char *s, size_t len, regmatch_t *m), int inv,
 		  size_t **arr, size_t *n, size_t *cap);
 size_t pos_ident(size_t p);
 size_t pos_view(size_t p);
@@ -205,8 +242,8 @@ const char *job_spin_text(void);	/* spinner chip text, NULL inside grace */
 size_t str_cols(const char *s, size_t n);
 size_t widest_col(void);
 void paint_chips(void);		/* partial chip-zone repaint (job fast path) */
-size_t line_cols(Line *L);
-size_t line_rows(Line *L);
+size_t line_cols(size_t i);
+size_t line_rows(size_t i);
 void render(void);
 
 /* --- clip.c ---------------------------------------------------------- */
