@@ -311,8 +311,25 @@ void job_finish(int commit)
 	view_epoch++;	/* view membership / srchit just changed */
 }
 
-/* run one batch through the thread pool; paints the spinner (not while
- * the prompt row is in use) and commits when the range ends */
+/* spinner chip text for render.c's chip zone; NULL inside the grace
+ * period (fast scans must not flash it) or when no job is running.
+ * Advances the frame per call: called once per rendered frame. */
+const char *job_spin_text(void)
+{
+	static char buf[80];
+	if (!job_active || now_ms() - job_t0 < JOB_PROG_MS)
+		return NULL;
+	static const char frames[] = "|/-\\";
+	snprintf(buf, sizeof buf, "%c %s %d%%  esc bails",
+		 frames[job_spin++ & 3],
+		 job_kind == K_SEARCH ? "searching" : "filtering",
+		 (int)((job_pos - job_lo) * 100 /
+		       (job_end - job_lo ? job_end - job_lo : 1)));
+	return buf;
+}
+
+/* run one batch through the thread pool; requests a repaint for the
+ * spinner chip and commits when the range ends */
 void step_job(void)
 {
 	size_t hi = job_end - job_pos > JOB_BATCH
@@ -328,21 +345,10 @@ void step_job(void)
 			     query_match, job_inv, &job_arr, &job_n, &job_cap);
 	}
 	job_pos = hi;
-	{
-		uint64_t now = now_ms();
-		if (rows >= 2 && !editing && now - job_t0 >= JOB_PROG_MS &&
-		    now - job_spin_ms >= JOB_SPIN_MS) {
-			job_spin_ms = now;
-			static const char frames[] = "|/-\\";
-			const char *what = job_kind == K_SEARCH ? "searching" : "filtering";
-			int pct = (int)((job_pos - job_lo) * 100 /
-					(job_end - job_lo ? job_end - job_lo : 1));
-			char buf[80];
-			snprintf(buf, sizeof buf, "%c %s %d%%  esc bails",
-				 frames[job_spin++ & 3], what, pct);
-			printf("\x1b[%d;1H\x1b[K\x1b[1;7m %s \x1b[0m", rows, buf);
-			fflush(stdout);
-		}
+	uint64_t now = now_ms();
+	if (now - job_t0 >= JOB_PROG_MS && now - job_spin_ms >= JOB_SPIN_MS) {
+		job_spin_ms = now;
+		paint_chips();	/* main loop is busy feeding batches: no render() */
 	}
 	if (job_pos >= job_end)
 		job_finish(1);

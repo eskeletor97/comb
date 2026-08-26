@@ -199,10 +199,12 @@ void defer_update(void);
 void apply_edit(void);
 int debounce_elapsed(void);
 int debounce_ms_left(void);
+const char *job_spin_text(void);	/* spinner chip text, NULL inside grace */
 
 /* --- render.c -------------------------------------------------------- */
 size_t str_cols(const char *s, size_t n);
 size_t widest_col(void);
+void paint_chips(void);		/* partial chip-zone repaint (job fast path) */
 size_t line_cols(Line *L);
 size_t line_rows(Line *L);
 void render(void);

@@ -513,22 +513,101 @@ static void draw_status_bar(void)
 }
 
 /* input bar: the vim-style filter prompt while editing, transient notices
- * (bad regex, mode flips, copy confirmations) otherwise. The notice is
- * right-aligned on this row so it never hides behind prompt content: pad
- * from column curcol, then inverse video ending at the right edge. */
-static void notice(int curcol)
+ * (bad regex, mode flips, copy confirmations) otherwise. Chips are
+ * right-aligned on this row so they never hide behind prompt content:
+ * the spinner chip sits flush right (stable column while it animates),
+ * the latest message to its left; a cluster that can't fit between the
+ * cursor and the edge drops the message first, then skips entirely. */
+/* latest message plus the live spinner, one inverse-video cluster flush
+ * right on the input bar row (stable column while the spinner animates).
+ * All chip text is ASCII: bytes == cells. Like prompt/status bar, the
+ * cluster carries a single painted space on each edge. A cluster that
+ * can't fit between curcol and the edge drops the message first;
+ * returns the cell width drawn, 0 if nothing fits. */
+static int chips(int curcol)
 {
-	if (!*msg)
-		return;
-	int nw = (int)strlen(msg);
-	int room = cols - curcol + 1;
-	if (nw > room)
-		return;
-	for (int i = 0; i < room - nw; i++)
-		fputc(' ', stdout);
-	fputs("\x1b[1;7m", stdout);
-	fwrite(msg, 1, (size_t)nw, stdout);
+	const char *spin = job_spin_text();
+	int sw = spin ? (int)strlen(spin) : 0;
+	int mw = *msg ? (int)strlen(msg) : 0;
+	int gap = mw && sw ? 2 : 0;	/* spacer lives between chips only */
+	if (mw && mw + gap + sw + 2 > cols - curcol)
+		mw = 0;		/* tight fit: message yields to live feedback */
+	if ((!mw && !sw) || sw + 2 > cols - curcol)
+		return 0;
+	gap = mw && sw ? 2 : 0;	/* msg may have just been dropped */
+	int w = mw + gap + sw + 2;
+	int start = cols - w + 1;
+	printf("\x1b[%d;%dH\x1b[1;7m ", rows, start);
+	if (mw)
+		printf("%s", msg);
+	if (gap)
+		fputs("  ", stdout);
+	if (sw)
+		fputs(spin, stdout);
+	fputc(' ', stdout);
 	fputs("\x1b[0m", stdout);
+	return w;
+}
+
+/* visible edit-buffer window [off,eend), prefix width and cursor column:
+ * must hold the cursor and fit maxw cells, clipping both sides. The
+ * cursor pins toward the right edge while scrolling left. */
+struct edwin {
+	size_t off, eend;
+	int pfx, cw;
+};
+
+static void edit_window(struct edwin *w)
+{
+	size_t elen = strlen(edit);
+	w->pfx = 2 + (re_mode ? 1 : 0) +
+		 (!editing_search && filter_inv ? 1 : 0);
+	int maxw = cols - (w->pfx + 2) > 1 ? cols - (w->pfx + 2) : 1;
+	w->off = 0;
+	while (w->off < elen &&
+	       str_cols(edit + w->off, ecur - w->off) > (size_t)(maxw - 1)) {
+		size_t cl;
+		u8_decode(edit + w->off, elen - w->off, &cl);
+		w->off += cl;
+	}
+	w->eend = w->off;
+	int acc = 0;
+	while (w->eend < elen) {
+		size_t cl;
+		int gw = glyph_width(u8_decode(edit + w->eend,
+					       elen - w->eend, &cl));
+		if (acc + gw > maxw)
+			break;
+		acc += gw;
+		w->eend += cl;
+	}
+	w->cw = (int)str_cols(edit + w->off, ecur - w->off);
+}
+
+/* partial chip-zone repaint from the job-feeding fast path: with no keys
+ * arriving, the main loop steps batches without ever reaching render(),
+ * so the spinner tick paints here directly. Never touches prompt cells.
+ * Chips can only shrink via a keypress or job end, both of which force
+ * a full render that clears the row -- no stale-cell handling needed. */
+void paint_chips(void)
+{
+	struct edwin w;
+	if (!have_input_bar())
+		return;
+	int curcol = 1;
+	if (editing) {
+		edit_window(&w);
+		curcol = w.pfx + w.cw + 1;
+	}
+	if (!chips(curcol))
+		return;
+	if (editing) {
+		struct edwin w;
+		edit_window(&w);
+		printf("\x1b[%d;%dH\x1b[?25h", rows, w.pfx + w.cw + 1);
+	} else
+		fputs("\x1b[?25l", stdout);
+	fflush(stdout);
 }
 
 static void draw_input_bar(void)
@@ -540,48 +619,25 @@ static void draw_input_bar(void)
 	printf("\x1b[%d;1H\x1b[K", rows);
 
 	if (editing) {
-		/* window [off,eend) of the edit buffer: must hold the cursor
-		 * and fit maxw cells, clipping both sides. The cursor pins
-		 * toward the right edge while scrolling left. */
-		size_t elen = strlen(edit);
-		int pfx = 2 + (re_mode ? 1 : 0) +
-			  (!editing_search && filter_inv ? 1 : 0);
-		int maxw = cols - (pfx + 2) > 1 ? cols - (pfx + 2) : 1;
-		size_t off = 0;
-		while (off < elen &&
-		       str_cols(edit + off, ecur - off) > (size_t)(maxw - 1)) {
-			size_t cl;
-			u8_decode(edit + off, elen - off, &cl);
-			off += cl;
-		}
-		size_t eend = off, acc = 0;
-		while (eend < elen) {
-			size_t cl;
-			int gw = glyph_width(u8_decode(edit + eend,
-						       elen - eend, &cl));
-			if (acc + (size_t)gw > (size_t)maxw)
-				break;
-			acc += gw;
-			eend += cl;
-		}
-		int cw = (int)str_cols(edit + off, ecur - off);
+		struct edwin w;
+		edit_window(&w);
 		fputs("\x1b[1;7m ", stdout);
 		fputc(editing_search ? '\\' : '/', stdout);
 		if (re_mode)
 			fputc('r', stdout);
 		if (!editing_search && filter_inv)
 			fputc('!', stdout);
-		fwrite(edit + off, 1, eend - off, stdout);
+		fwrite(edit + w.off, 1, w.eend - w.off, stdout);
 		fputs(" \x1b[0m", stdout);
 		/* cursor sits on the char right of it, or on our trailing
 		 * space when it is at the end of the window */
-		int pw = pfx + cw + 1;
-		notice(pw + 1);
+		int pw = w.pfx + w.cw + 1;
+		chips(pw + 1);
 		printf("\x1b[%d;%dH\x1b[?25h", rows, pw);
 		return;
 	}
 
-	notice(1);
+	chips(1);
 	fputs("\x1b[?25l", stdout);
 }
 
