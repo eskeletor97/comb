@@ -66,7 +66,11 @@ use
 worker threads for parallel file loading and parallel filter/search scans.
 The default is online CPUs minus two, clamped to a minimum of 1;
 .B \-t 1
-runs single-threaded (no worker threads).
+runs single-threaded (no worker threads). On a slow disk (SATA HDD) a single
+thread saturates the read, so
+.B \-t 1
+avoids the loader's extra pass; the two-pass parallel load only pays off when
+the file is already paged or sits on fast storage.
 .TP
 .BR \-\-no\-color ", " \-C
 disable syntax coloring; also honors the

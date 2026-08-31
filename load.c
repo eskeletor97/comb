@@ -466,32 +466,50 @@ void lt_fill(Line *L, size_t i)
 
 /* --- service-color slot (file-order first appearance) --------------- */
 
+#define SVC_TAB_BITS 8
+#define SVC_TAB_SIZE (1u << SVC_TAB_BITS)
+#define SVC_MAX_SEEN 128
+
 static struct {
-	const char *name;	/* points into a line's raw bytes */
+	const char *name;	/* into a line's raw bytes; NULL = empty slot */
 	size_t len;
 	int slot;
-} svc_seen[128];
+} svc_seen[SVC_TAB_SIZE];
 static size_t nsvc_seen;
+
+static size_t svc_hash(const char *name, size_t len)
+{
+	uint32_t h = 2166136261u;
+	for (size_t k = 0; k < len; k++)
+		h = (h ^ (unsigned char)name[k]) * 16777619u;
+	return h;
+}
 
 /* return (and if new, record) the palette slot for a service-tag string.
  * Order follows first appearance, so adjacent services get distinct hues;
  * the name is stored by pointer (raw bytes are stable until reset_lines). */
 static int slot_for_tag(const char *name, size_t len)
 {
-	for (size_t j = 0; j < nsvc_seen; j++)
-		if (svc_seen[j].len == len &&
-		    !memcmp(svc_seen[j].name, name, len))
-			return svc_seen[j].slot;
-	if (nsvc_seen == 128) {
-		unsigned h = 2166136261u;
-		for (size_t k = 0; k < len; k++)
-			h = (h ^ (unsigned char)name[k]) * 16777619u;
-		return (int)(h % NSVC_COLORS);
+	size_t h = svc_hash(name, len) & (SVC_TAB_SIZE - 1);
+	size_t empty = (size_t)-1;
+	for (size_t probe = 0; probe < SVC_TAB_SIZE; probe++) {
+		size_t s = (h + probe) & (SVC_TAB_SIZE - 1);
+		const char *seen = svc_seen[s].name;
+		if (!seen) {
+			empty = s;
+			break;
+		}
+		if (svc_seen[s].len == len && !memcmp(seen, name, len))
+			return svc_seen[s].slot;
 	}
-	svc_seen[nsvc_seen].name = name;
-	svc_seen[nsvc_seen].len = len;
-	svc_seen[nsvc_seen].slot = (int)(nsvc_seen % NSVC_COLORS);
-	return svc_seen[nsvc_seen++].slot;
+	/* rare tag beyond the first-appearance cap, or a full table: hashed hue */
+	if (empty == (size_t)-1 || nsvc_seen >= SVC_MAX_SEEN)
+		return (int)(svc_hash(name, len) % NSVC_COLORS);
+	svc_seen[empty].name = name;
+	svc_seen[empty].len = len;
+	svc_seen[empty].slot = (int)(nsvc_seen % NSVC_COLORS);
+	nsvc_seen++;
+	return svc_seen[empty].slot;
 }
 
 /* Assign the palette slot for line i from a precomputed (so,eo) tag span,
@@ -547,6 +565,7 @@ static void span_work(size_t lo, size_t hi, int slot, void *ctx)
 static void assign_slots(void)
 {
 	nsvc_seen = 0;
+	memset(svc_seen, 0, sizeof svc_seen);
 	if (load_span) {
 		/* spans already computed in the parallel fill; lines beyond the
 		 * indexed range (appended while loading) detect on the fly */
@@ -666,10 +685,12 @@ void flush_pending(void)
  * joins. */
 
 /* Parallel loading only pays off once the file is big enough to amortize the
- * thread spawns and the 2-pass (count then fill) scan. On a warm 12-core box
- * a ~7 MiB log is ~4x slower parallel than single-threaded; the crossover is
- * well past a few dozen MiB, so stay sequential below here. */
-#define LOAD_MIN_BYTES ((size_t)1 << 26)	/* 64 MiB */
+ * thread spawns and the 2-pass (count then fill) scan; on a warm 12-core box
+ * a ~7 MiB log is ~4x slower parallel than single-threaded. It wins when the
+ * file is already paged or on fast storage; on a slow disk a single thread
+ * saturates the read anyway, so the extra pass only adds cost. Stay sequential
+ * below here and let -t 1 force a single thread when you know storage is slow. */
+#define LOAD_MIN_BYTES ((size_t)1 << 29)	/* 512 MiB */
 #define LOAD_MAX_THREADS MAX_THREADS
 
 static size_t load_done;	/* chunks finished in the current pass */
@@ -740,7 +761,7 @@ static void load_spawn(load_ctx *ctx, int with_prog)
 	}
 	if (with_prog) {
 		while (__sync_fetch_and_add(&load_done, 0) < nt) {
-			prog_file((ctx->base + load_work_done()) / 2);
+			prog_file(ctx->base + load_work_done());
 			struct timespec ts = { 0, 2 * 1000000 };
 			nanosleep(&ts, NULL);
 		}
@@ -783,7 +804,6 @@ static void fill_chunk(load_chunk *c)
 	const char *p = c->lo, *e = c->hi;
 	LineIdx *L = lidx + c->base;
 	size_t i = 0, maxc = 0;
-	size_t next = (size_t)(p - fmap) + PROG_STEP_BYTES;
 	for (;;) {
 		const char *nl = memchr(p, '\n', (size_t)(e - p));
 		if (!nl)
@@ -807,19 +827,11 @@ static void fill_chunk(load_chunk *c)
 		}
 		i++;
 		p = nl + 1;
-		if ((size_t)(p - fmap) >= next) {
-			__atomic_store_n(&load_chunk_prog[c->idx],
-					 (size_t)(p - fmap), __ATOMIC_RELAXED);
-			next += PROG_STEP_BYTES;
-		}
 	}
 	/* any trailing bytes after the last '\n' are left for the feed path
 	 * below, so a file that grows across the mmap/read seam merges the
 	 * partial line instead of splitting it */
 	c->peak = maxc;
-	__atomic_store_n(&load_chunk_prog[c->idx], (size_t)(c->hi - fmap),
-			 __ATOMIC_RELAXED);
-	__sync_fetch_and_add(&load_done, 1);
 }
 
 static void drain_map_par(void)
@@ -872,10 +884,7 @@ static void drain_map_par(void)
 	load_span_n = total_lines;
 
 	load_ctx fc = { chunks, nt, total, fill_chunk };
-	for (size_t k = 0; k < nt; k++)
-		load_chunk_prog[k] = bnds[k];
-	load_done = 0;
-	load_spawn(&fc, 1);	/* fill pass: still just the raw index */
+	load_spawn(&fc, 0);	/* fill pass: page-cached fast path, no live progress */
 
 	wc_max = 0;
 	for (size_t k = 0; k < nt; k++)
@@ -1061,6 +1070,7 @@ void reset_lines(void)
 	nmarked = 0;
 	nv = 0;	/* view entries referenced the freed buffers */
 	nsvc_seen = 0;	/* tag pointers referenced the freed buffers */
+	memset(svc_seen, 0, sizeof svc_seen);
 	wc_max = 0;
 	prog_mark = 0;
 	skip_to_nl = 0;
