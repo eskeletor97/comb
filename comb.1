@@ -27,6 +27,12 @@ tool's output in via stdin instead. A single line longer than
 .B …
 tail.
 .PP
+Text is sanitized against terminal control: ANSI escape sequences are
+stripped, and any remaining C0/DEL control byte is rewritten
+.RB \( cat " -v"
+.RB \(^G \(^H " ...) so a log cannot ring the bell, move the cursor or
+shift the character set. Valid UTF-8 is left untouched.
+.PP
 Filters match literal text by default with smart case (a pattern containing
 no uppercase letters matches case-insensitively). A leading
 .B ^

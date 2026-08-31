@@ -63,6 +63,12 @@ unbounded stream (e.g. `/dev/urandom`) would never finish loading and would
 buffer without bound. Pipe such a source in instead; a single line longer
 than `MAX_LINE_LEN` (config.h, 4096) is truncated with a dim `…` tail.
 
+Text is sanitized against terminal control: ANSI escape sequences are
+stripped, and any remaining C0/DEL control byte is rewritten in `cat -v`
+style (`^G`, `^H`, ...), so a log can't ring the bell, move the cursor,
+shift the character set or otherwise drive the terminal. Valid UTF-8 is left
+untouched.
+
 ## Keys
 
 | key              | action                                    |

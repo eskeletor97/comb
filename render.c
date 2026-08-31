@@ -382,7 +382,8 @@ static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 
 	while (b < L->len) {
 		size_t cl;
-		int gw = glyph_width(u8_decode(L->s + b, L->len - b, &cl));
+		unsigned cp = u8_decode(L->s + b, L->len - b, &cl);
+		int gw = glyph_width(cp);
 		if ((wrap ? sc + (size_t)gw > (size_t)cols
 			   : dc + (size_t)gw > (size_t)hscroll + (size_t)cols)) {
 			if (!wrap)
@@ -428,6 +429,17 @@ static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 			BASE();	/* repaint the whole stack on any overlay edge */
 			if (act && !sinv)	/* span yields to the search overlay */
 				fputs(act->attr, stdout);
+		}
+		/* Last line of defense: C0 is caret-escaped in sanitize, so reaching
+		 * here with a control means a standalone C1 byte (0x80-0x9f), which an
+		 * 8-bit terminal would treat as an ESC-based control sequence. Emit an
+		 * inert one-cell glyph instead; a valid UTF-8 char (cl > 1) is untouched. */
+		if (cp < 0x20 || cp == 0x7f || (cl == 1 && cp >= 0x80 && cp <= 0x9f)) {
+			fputs("\xef\xbf\xbd", stdout);	/* U+FFFD */
+			b += cl;
+			dc += (size_t)gw;
+			sc += (size_t)gw;
+			continue;
 		}
 		fwrite(L->s + b, 1, cl, stdout);
 		b += cl;

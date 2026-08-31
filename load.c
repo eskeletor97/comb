@@ -32,7 +32,7 @@
 #endif
 
 static void detect_tag(Line *L);
-static int line_has_crlfesc(const char *s, size_t n);
+static int line_needs_sanitize(const char *s, size_t n);
 static void commit_line_slot(size_t i);
 static int tag_span(const char *s, size_t n, int *so, int *eo);
 
@@ -211,37 +211,44 @@ void prog_hide(void)
 }
 
 
-/* Does the span hold a tab, CR, or ESC byte (anything sanitize must
- * rewrite)? Three separate memchr calls scan the line three times; a
- * single SIMD pass compares all three at once, which matters for the
- * common case where the file is entirely clean. Falls back to memchr
- * on non-SSE2 targets. */
+/* Does the span hold any byte sanitize must rewrite -- tab, CR, ESC, or
+ * another C0/DEL control a terminal would act on (bell, backspace, form-feed,
+ * charset shift...)? Only ASCII-range controls matter; a high-bit byte is a
+ * UTF-8 sequence and must be left alone. One SIMD pass sees the whole block,
+ * which keeps an all-clean file cheap. Falls back to a scalar scan. */
 #if USE_SSE2
-static int line_has_crlfesc(const char *s, size_t n)
+static int line_needs_sanitize(const char *s, size_t n)
 {
-	const __m128i tab = _mm_set1_epi8('\t');
-	const __m128i cr = _mm_set1_epi8('\r');
-	const __m128i esc = _mm_set1_epi8(0x1b);
+	const __m128i space = _mm_set1_epi8(0x20);
+	const __m128i del   = _mm_set1_epi8(0x7f);
+	const __m128i high  = _mm_set1_epi8(0x80);
 	size_t i = 0;
 	for (; i + 16 <= n; i += 16) {
 		__m128i v = _mm_loadu_si128((const __m128i *)(const void *)(s + i));
-		__m128i hit = _mm_or_si128(_mm_cmpeq_epi8(v, tab),
-				    _mm_or_si128(_mm_cmpeq_epi8(v, cr),
-						 _mm_cmpeq_epi8(v, esc)));
-		if (_mm_movemask_epi8(hit) != 0)
+		__m128i ascii = _mm_cmpeq_epi8(_mm_and_si128(v, high),
+					     _mm_setzero_si128());
+		__m128i ctrl = _mm_or_si128(_mm_cmplt_epi8(v, space),
+					    _mm_cmpeq_epi8(v, del));
+		ctrl = _mm_and_si128(ctrl, ascii);
+		if (_mm_movemask_epi8(ctrl) != 0)
 			return 1;
 	}
 	for (; i < n; i++) {
 		unsigned char c = (unsigned char)s[i];
-		if (c == '\t' || c == '\r' || c == 0x1b)
+		if (c < 0x20 || c == 0x7f)
 			return 1;
 	}
 	return 0;
 }
 #else
-static int line_has_crlfesc(const char *s, size_t n)
+static int line_needs_sanitize(const char *s, size_t n)
 {
-	return memchr(s, '\t', n) || memchr(s, '\r', n) || memchr(s, 0x1b, n);
+	for (size_t i = 0; i < n; i++) {
+		unsigned char c = (unsigned char)s[i];
+		if (c < 0x20 || c == 0x7f)
+			return 1;
+	}
+	return 0;
 }
 #endif
 
@@ -258,18 +265,19 @@ enum {
  * costs a single SIMD scan per line instead of a probe plus a copy. */
 static unsigned char classify_line(const char *s, size_t n)
 {
-	if (n > 0 && (unsigned char)s[n - 1] == '\r' && !line_has_crlfesc(s, n - 1))
+	if (n > 0 && (unsigned char)s[n - 1] == '\r' && !line_needs_sanitize(s, n - 1))
 		return L_TRIMCR;
-	return line_has_crlfesc(s, n) ? L_SANITIZE : L_CLEAN;
+	return line_needs_sanitize(s, n) ? L_SANITIZE : L_CLEAN;
 }
 
-/* strip ANSI sequences and CRs, expand tabs; returns arena-allocated
- * string. Worst case is tab expansion (+3 bytes each). */
+/* strip ANSI sequences and CRs, expand tabs, and rewrite surviving C0/DEL
+ * controls as ^X (cat -v style) so nothing a terminal would act on is ever
+ * emitted; returns an arena-allocated string. */
 static char *sanitize(const char *s, size_t n, size_t *outlen)
 {
-	/* fast path: with no tab/CR/ESC there is nothing to expand or strip,
+	/* fast path: with no control byte there is nothing to expand or strip,
 	 * so just copy the run (the SIMD probe beats a scalar byte pass) */
-	if (!line_has_crlfesc(s, n)) {
+	if (!line_needs_sanitize(s, n)) {
 		char *o = arena_alloc(n + 1);
 		memcpy(o, s, n);
 		o[n] = 0;
@@ -277,9 +285,13 @@ static char *sanitize(const char *s, size_t n, size_t *outlen)
 		return o;
 	}
 	size_t extra = 0;
-	for (size_t i = 0; i < n; i++)
-		if (s[i] == '\t')
-			extra += 3;
+	for (size_t i = 0; i < n; i++) {
+		unsigned char c = (unsigned char)s[i];
+		if (c == '\t')
+			extra += 3;		/* 1 byte -> 4 spaces */
+		else if (c < 0x20 || c == 0x7f)
+			extra += 1;		/* ctrl -> two-cell ^X; CR is dropped */
+	}
 	char *o = arena_alloc(n + extra + 1);
 	size_t j = 0;
 	for (size_t i = 0; i < n; i++) {
@@ -312,6 +324,16 @@ static char *sanitize(const char *s, size_t n, size_t *outlen)
 			if (i + 1 < n && (unsigned char)s[i + 1] >= 0x40 &&
 			    (unsigned char)s[i + 1] <= 0x5f)
 				i++;
+			continue;
+		}
+		if (c < 0x20) {	/* C0 control (not tab/CR/ESC): render as ^X */
+			o[j++] = '^';
+			o[j++] = (char)(c ^ 0x40);	/* 0x00->@ ... 0x1f->_ */
+			continue;
+		}
+		if (c == 0x7f) {	/* DEL */
+			o[j++] = '^';
+			o[j++] = '?';
 			continue;
 		}
 		o[j++] = s[i];

@@ -89,6 +89,15 @@ static void test_sanitize(void)
 
 	o = sanitize("a\x1bxb", 4, &n);	/* not a final byte: only Esc goes */
 	CHECK(n == 3 && !strcmp(o, "axb"));
+
+	o = sanitize("a\x07" "b", 3, &n);	/* BEL -> ^G, not a raw bell */
+	CHECK(n == 4 && !strcmp(o, "a^Gb"));
+
+	o = sanitize("A\x00" "B", 3, &n);	/* NUL -> ^@ */
+	CHECK(n == 4 && !strcmp(o, "A^@B"));
+
+	o = sanitize("x\x7fy", 3, &n);	/* DEL -> ^? */
+	CHECK(n == 4 && !strcmp(o, "x^?y"));
 }
 
 static ptrdiff_t lf(LitSpec *ls, const char *s, size_t n)
