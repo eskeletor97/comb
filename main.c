@@ -111,12 +111,12 @@ int main(int argc, char **argv)
 	prog_hide();
 	{
 		/* flex a little: how much landed and how fast */
-		char g[32], hb[16];
+		char g[32], hb[HUMAN_BYTES_BUF];
 		group_digits(g, nlines);
 		human_bytes(hb, fmap_len + prog_fed);
 		double secs = (now_ms() - prog_t0) / 1000.0;
 		if (secs >= 1.0) {
-			char ps[16];
+			char ps[HUMAN_BYTES_BUF];
 			human_bytes(ps, (size_t)((fmap_len + prog_fed) / secs));
 			snprintf(msg, sizeof msg,
 				 "loaded %s lines (%s) in %.1fs (%s/s)",
@@ -130,7 +130,10 @@ int main(int argc, char **argv)
 	if (init_re) {
 		re_mode = 1;	/* -e promises a REGEX */
 		update_filter(init_re);
-		job_flush();
+		if (job_active)
+			job_flush();
+		else	/* bad regex: show the whole file instead of a blank pane */
+			rebuild_view();
 	} else
 		rebuild_view();
 	cur = nv ? nv - 1 : 0;
@@ -150,10 +153,15 @@ int main(int argc, char **argv)
 			int got = pump_follow();
 			if (got == 2) {
 				job_discard(); /* rotation: the line index was rebuilt from scratch */
-				if (filter_pat.active)
+				if (filter_pat.active) {
 					update_filter(filter_pat.text);	/* rescan as a job */
-				else
+					job_flush();	/* one job slot: land the filter before re-searching */
+				} else
 					rebuild_view();
+				/* rotation dropped the hit bits; re-run a highlight search or
+				 * it stays "on" but finds nothing (n/N says no matches) */
+				if (search_pat.active)
+					update_search(search_pat.text);
 			} else if (got == 1) {
 				if (job_active) {
 					if (!pend_ext || old < pend_ext_from)
@@ -254,6 +262,10 @@ int main(int argc, char **argv)
 	 * Ctrl-C would. Best effort: root-owned feeders ignore it. */
 	if (use_stdin && !stdin_eof) {
 		tio_saved = 0;	/* on_sigexit must not repaint the leave sequence */
+		/* take the feeder's process group down without running our own
+		 * SIGINT handler, which would _exit(128+sig) and make `q` look
+		 * like a signal death */
+		signal(SIGINT, SIG_IGN);
 		kill(0, SIGINT);
 	}
 	return 0;

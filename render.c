@@ -187,6 +187,10 @@ typedef struct {
 } Span;
 
 #define LINE_SPANS 24
+/* total bytes the quote/paren scans may chase per line. Unbalanced brackets
+ * would otherwise rescan to end-of-line from every position, turning one
+ * tall line into a quadratic frame (a 16k-char `((((` line was ~35ms/redraw). */
+#define SPAN_SCAN_BUDGET 4096
 
 /* insert keeping spans sorted by start; overlapping earlier spans win */
 static void add_span(Span *sp, int *n, int so, int se, const char *attr)
@@ -270,18 +274,21 @@ static int collect_spans(const Line *L, Span *sp)
 	}
 
 	/* double and single quotes */
-	int q = 0;
-	for (size_t k = 0; k < L->len && q < 12; k++) {
+	int q = 0, budget = SPAN_SCAN_BUDGET;
+	for (size_t k = 0; k < L->len && q < 12 && budget > 0; k++) {
 		char qc = s[k];
 		if (qc != '"' && qc != '\'')
 			continue;
 		if (qc == '\'' && k > 0 &&
 		    isalnum((unsigned char)s[k - 1]))
 			continue;
-		size_t j = k + 1;
-		while (j < L->len && s[j] != qc)
+		size_t j = k + 1, lim = k + (size_t)budget;
+		if (lim > L->len)
+			lim = L->len;
+		while (j < lim && s[j] != qc)
 			j++;
-		if (j >= L->len)
+		budget -= (int)(j - k);
+		if (j >= L->len || s[j] != qc)
 			continue;
 		if (qc == '\'' && j + 1 < L->len &&
 		    isalnum((unsigned char)s[j + 1]))
@@ -291,19 +298,23 @@ static int collect_spans(const Line *L, Span *sp)
 		k = j;
 	}
 	/* parenthesis groups, nesting included; unbalanced ones stay plain.
-	 * Shares the quotes' budget of 12 spans per line */
-	for (size_t k = 0; k < L->len && q < 12; k++) {
+	 * Shares the quotes' budget of 12 spans per line, and the scan budget
+	 * above so a line of stray '(' costs a bounded amount of work. */
+	for (size_t k = 0; k < L->len && q < 12 && budget > 0; k++) {
 		if (s[k] != '(')
 			continue;
 		int depth = 0;
-		size_t j = k;
-		for (; j < L->len; j++) {
+		size_t j = k, lim = k + (size_t)budget;
+		if (lim > L->len)
+			lim = L->len;
+		for (; j < lim; j++) {
 			if (s[j] == '(')
 				depth++;
 			else if (s[j] == ')' && --depth == 0)
 				break;
 		}
-		if (j >= L->len)
+		budget -= (int)(j - k);
+		if (depth != 0 || j >= L->len)
 			continue;
 		add_span(sp, &n, (int)k, (int)(j + 1), PAREN_COLOR);
 		q++;
@@ -466,7 +477,9 @@ static void draw_status_bar(void)
 			 (int)sl, src, where, mk, flw, rmk, imk,
 			 filter_pat.active ? "  /" : "", (int)ql, filter_pat.text,
 			 (nv == 0 && filter_pat.active) ? "  (no matches)" : "");
-		if ((int)strlen(left) <= budget)
+		/* fit by terminal cells, not bytes: a UTF-8 path/query overflows
+		 * the row even when strlen() looks short */
+		if ((int)str_cols(left, strlen(left)) <= budget)
 			break;
 		if (sl) {	/* path yields first; position and marks stay */
 			sl /= 2;
@@ -486,13 +499,21 @@ static void draw_status_bar(void)
 			break;	/* only position (+marks) left: clamp below */
 		}
 	}
-	int lw = (int)strlen(left);
+	int lw = (int)str_cols(left, strlen(left));
 	if (lw > budget && budget >= 0) {
-		while (budget > 0 &&
-		       ((unsigned char)left[budget] & 0xC0) == 0x80)
-			budget--;
-		left[budget] = 0;
-		lw = budget;
+		/* drop whole glyphs until the painted width fits, instead of
+		 * cutting a byte count that says more than the cells it paints */
+		size_t blen = 0, w = 0, total = strlen(left);
+		while (blen < total) {
+			size_t cl;
+			int gw = glyph_width(u8_decode(left + blen, total - blen, &cl));
+			if ((int)(w + (size_t)gw) > budget)
+				break;
+			w += (size_t)gw;
+			blen += cl;
+		}
+		left[blen] = 0;
+		lw = (int)w;
 	}
 	/* longest reference that fits whole; none if the row is too tight */
 	const char *hint = NULL;
@@ -533,7 +554,7 @@ static int chips(int curcol)
 {
 	const char *spin = job_spin_text();
 	int sw = spin ? (int)strlen(spin) : 0;
-	int mw = *msg ? (int)strlen(msg) : 0;
+	int mw = *msg ? (int)str_cols(msg, strlen(msg)) : 0;
 	int gap = mw && sw ? 2 : 0;	/* spacer lives between chips only */
 	if (mw && mw + gap + sw + 2 > cols - curcol)
 		mw = 0;		/* tight fit: message yields to live feedback */
@@ -596,21 +617,19 @@ static void edit_window(struct edwin *w)
  * a full render that clears the row -- no stale-cell handling needed. */
 void paint_chips(void)
 {
-	struct edwin w;
 	if (!have_input_bar())
 		return;
 	int curcol = 1;
 	if (editing) {
+		struct edwin w;
 		edit_window(&w);
 		curcol = w.pfx + w.cw + 1;
 	}
 	if (!chips(curcol))
 		return;
-	if (editing) {
-		struct edwin w;
-		edit_window(&w);
-		printf("\x1b[%d;%dH\x1b[?25h", rows, w.pfx + w.cw + 1);
-	} else
+	if (editing)
+		printf("\x1b[%d;%dH\x1b[?25h", rows, curcol);
+	else
 		fputs("\x1b[?25l", stdout);
 	fflush(stdout);
 }

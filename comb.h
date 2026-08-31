@@ -14,6 +14,9 @@
 #include <sys/types.h>
 #include <termios.h>
 
+/* minimum output buffer for human_bytes() (defined for its callers too) */
+#define HUMAN_BYTES_BUF 32
+
 /* one materialised line: s points either into the arena, the mmap, or a
  * sanitising copy made on demand. A Line is a *transient* view built by
  * lt_fill() for lines currently on screen (or being tested); the only
@@ -34,12 +37,14 @@ typedef struct {
  * Display width, service-tag span, palette slot and severity are *not*
  * stored here -- they are recomputed by lt_fill() only for lines that are
  * actually drawn. raw points into the mmap (clean file lines) or into the
- * arena (stdin / appended / sanitised copies); both are stable until the
+ * arena (stdin / appended lines, and the sanitised copy lt_text() writes
+ * back the first time a dirty line is touched). Both are stable until the
  * next reset_lines(). */
 typedef struct {
 	const char *raw;
-	uint32_t len;		/* raw byte length, excluding the '\n' */
-	unsigned char dirty;	/* needs sanitising (tab/CR/ESC present) */
+	uint32_t len;		/* byte length, excluding the '\n' */
+	unsigned char dirty;	/* L_CLEAN/L_TRIMCR/L_SANITIZE (see load.c);
+				 * lt_text() materialises the line and clears it */
 	unsigned char slot;	/* service palette slot, 0xFF = no tag */
 } LineIdx;
 

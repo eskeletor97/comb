@@ -76,11 +76,14 @@ For those, pipe: `journalctl -o short-precise | comb`, `zcat error.log.gz | comb
 | Space / x        | mark / unmark line, sweep in last direction |
 | c or y           | copy marked lines, else current line      |
 | Enter            | scroll down (accepts filter in prompt)    |
-| Esc              | cancel editing; clear marks or filter; bail
-|                  | out of an in-flight filter/search scan      |
+| Esc              | leave the prompt (the typed query stays);   |
+|                  | clear marks or filter; bail out of an     |
+|                  | in-flight filter/search scan               |
 | f                | toggle follow                             |
 | w                | toggle line wrap                          |
 | r                | reload file                               |
+| Ctrl-z           | suspend (fg to resume)                    |
+| Ctrl-l           | redraw screen                             |
 | q, Ctrl-c        | quit                                      |
 
 Change controls in the `keymap[]` table in `config.h`.

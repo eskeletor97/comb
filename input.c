@@ -193,6 +193,8 @@ static void print_keys(FILE *out)
 		{ A_FOLLOW,	"toggle follow" },
 		{ A_RELOAD,	"reload file" },
 		{ A_WRAP,	"toggle line wrap" },
+		{ A_STOP,	"suspend (Ctrl-Z); fg to resume" },
+		{ A_REPAINT,	"redraw screen" },
 		{ A_QUIT,	"quit" },
 	};
 	for (size_t i = 0; i < sizeof acts / sizeof acts[0]; i++) {
@@ -205,10 +207,15 @@ static void print_keys(FILE *out)
 			const char *nm2 = key_name(keymap[k].key, nm, sizeof nm);
 			if (!strcmp(nm2, prev))
 				continue;	/* \r and \n are both Enter */
+			/* keep the accreting string in bounds: snprintf's return value is
+			 * the would-be length, so once the buffer fills, "sizeof keys -
+			 * used" underflows and snprintf writes past the end */
+			const char *sep = used ? "/" : "";
+			if (used + strlen(sep) + strlen(nm2) >= sizeof keys)
+				continue;
 			snprintf(prev, sizeof prev, "%s", nm2);
-			used += (size_t)snprintf(keys + used,
-						 sizeof keys - used,
-						 used ? "/%s" : "%s", nm2);
+			used += (size_t)snprintf(keys + used, sizeof keys - used,
+						"%s%s", sep, nm2);
 		}
 		fprintf(out, "  %-23s%s\n", keys, acts[i].desc);
 	}
@@ -392,7 +399,10 @@ void view_action(int act)
 			size_t lx = view_at(cur);
 			if (lt_is_marked(lx) != want) {
 				lt_mark(lx, want);
-				nmarked += want ? 1 : -1;
+				if (want)
+					nmarked++;
+				else
+					nmarked--;
 			}
 			if (mdir < 0) {
 				if (cur > 0)
@@ -496,6 +506,10 @@ void view_action(int act)
 			fd = -1;
 			load_all();
 			rebuild_view();
+			/* reload dropped the hit bits; re-run a highlight search or it
+			 * stays "on" but finds nothing (n/N says no matches) */
+			if (search_pat.active)
+				update_search(search_pat.text);
 			cur = nv ? nv - 1 : 0;
 			ensure_visible();
 			snprintf(msg, sizeof msg, "reloaded");

@@ -97,19 +97,20 @@ static int prog_shown;
 static int prog_spin;
 static uint64_t prog_due;	/* stdin redraw deadline */
 
-/* compact byte count: 37.3GiB / 743MiB / 9.5KiB */
+/* compact byte count: 37.3GiB / 743MiB / 9.5KiB. Callers pass room for the
+ * widest rendering (a size_t that big is "17179869184.0GiB" plus NUL). */
 void human_bytes(char *o, size_t v)
 {
 	if (v >> 30)
-		snprintf(o, 16, "%.1fGiB", v / 1073741824.0);
+		snprintf(o, HUMAN_BYTES_BUF, "%.1fGiB", v / 1073741824.0);
 	else if (v >> 20)
-		snprintf(o, 16, "%.1fMiB", v / 1048576.0);
+		snprintf(o, HUMAN_BYTES_BUF, "%.1fMiB", v / 1048576.0);
 	else if (v >= 10 << 10)
-		snprintf(o, 16, "%.0fKiB", v / 1024.0);
+		snprintf(o, HUMAN_BYTES_BUF, "%.0fKiB", v / 1024.0);
 	else if (v >> 10)
-		snprintf(o, 16, "%.1fKiB", v / 1024.0);
+		snprintf(o, HUMAN_BYTES_BUF, "%.1fKiB", v / 1024.0);
 	else
-		snprintf(o, 16, "%zuB", v);
+		snprintf(o, HUMAN_BYTES_BUF, "%zuB", v);
 }
 
 /* decimal with , groups: 272298969 -> 272,298,969 (no locale: comb
@@ -149,7 +150,7 @@ static void prog_file(size_t done)
 	if (done < prog_mark || done - prog_mark < PROG_STEP_BYTES)
 		return;
 	prog_mark = done;
-	char cur[16], tot[16], rt[16];
+	char cur[HUMAN_BYTES_BUF], tot[HUMAN_BYTES_BUF], rt[HUMAN_BYTES_BUF];
 	human_bytes(cur, done);
 	human_bytes(tot, fmap_len);
 	human_bytes(rt, (size_t)(done / prog_secs()));
@@ -189,7 +190,7 @@ static void prog_stdin(void)
 	if (now < prog_due || prog_fed < PROG_MIN_FEED)
 		return;
 	prog_due = now + 100;
-	char ln[32], hb[16], rt[16];
+	char ln[32], hb[HUMAN_BYTES_BUF], rt[HUMAN_BYTES_BUF];
 	group_digits(ln, nlines);
 	human_bytes(hb, prog_fed);
 	human_bytes(rt, (size_t)(prog_fed / prog_secs()));
@@ -242,6 +243,24 @@ static int line_has_crlfesc(const char *s, size_t n)
 	return memchr(s, '\t', n) || memchr(s, '\r', n) || memchr(s, 0x1b, n);
 }
 #endif
+
+/* What lt_text() must do before a line can be drawn; stored in lidx[].dirty.
+ * A plain CRLF line is the common case and needs no copy at all -- the
+ * display form is the same bytes with the CR counted out of the length. */
+enum {
+	L_CLEAN = 0,	/* raw bytes already are the display form */
+	L_TRIMCR,	/* only a trailing CR: trim it, still zero-copy */
+	L_SANITIZE	/* tab/ESC inside: sanitise once on first touch */
+};
+
+/* One pass decides all three states; the CR test runs first so a CRLF file
+ * costs a single SIMD scan per line instead of a probe plus a copy. */
+static unsigned char classify_line(const char *s, size_t n)
+{
+	if (n > 0 && (unsigned char)s[n - 1] == '\r' && !line_has_crlfesc(s, n - 1))
+		return L_TRIMCR;
+	return line_has_crlfesc(s, n) ? L_SANITIZE : L_CLEAN;
+}
 
 /* strip ANSI sequences and CRs, expand tabs; returns arena-allocated
  * string. Worst case is tab expansion (+3 bytes each). */
@@ -330,7 +349,7 @@ static void push_raw(const char *raw, size_t len)
 	LineIdx *X = &lidx[nlines];
 	X->raw = raw;
 	X->len = (uint32_t)len;
-	X->dirty = (unsigned char)line_has_crlfesc(raw, len);
+	X->dirty = classify_line(raw, len);
 	X->slot = 0xFF;	/* assigned by assign_slots() in file order */
 	if (len > wc_max)
 		wc_max = len;	/* conservative display-width bound */
@@ -366,16 +385,26 @@ void set_hit(size_t i, int on)
 /* --- lazy per-line access ------------------------------------------- */
 
 /* Fetch the displayed (sanitised) text of line i. Clean lines return the
- * raw bytes (zero-copy); dirty lines are sanitised into the arena (stable
- * until reset_lines). */
+ * raw bytes (zero-copy).
+ *
+ * Materialising a dirty line is write-once: the sanitised copy replaces the
+ * raw bytes in the index and the line turns clean, so a redraw or the next
+ * scan pass reuses it. Sanitising on every call instead used to allocate a
+ * fresh arena copy per line per pass -- a full-file scan then a repaint grew
+ * the arena by another copy of the file each time, without bound. The arena
+ * copy stays valid until reset_lines() rewinds, so the pointer is stable. */
 const char *lt_text(size_t i, size_t *len)
 {
 	LineIdx *X = &lidx[i];
-	if (X->dirty) {
+	if (X->dirty == L_TRIMCR) {
+		X->len--;
+		X->dirty = L_CLEAN;
+	} else if (X->dirty == L_SANITIZE) {
 		size_t cl;
 		char *clean = sanitize(X->raw, X->len, &cl);
-		*len = cl;
-		return clean;
+		X->raw = clean;
+		X->len = (uint32_t)cl;
+		X->dirty = L_CLEAN;
 	}
 	*len = X->len;
 	return X->raw;
@@ -690,7 +719,7 @@ static void fill_chunk(load_chunk *c)
 		size_t n = (size_t)(nl - p);
 		L[i].raw = p;
 		L[i].len = (uint32_t)n;
-		L[i].dirty = (unsigned char)line_has_crlfesc(p, n);
+		L[i].dirty = classify_line(p, n);
 		L[i].slot = 0xFF;
 		if (n > maxc)
 			maxc = n;
@@ -999,6 +1028,10 @@ void load_all(void)
 		fd = open(path, O_RDONLY);
 		if (fd < 0)
 			die_sys("cannot open %s", path);
+		struct stat st;
+		/* opens fine, reads EISDIR, and the pane would just say "(empty)" */
+		if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode))
+			die("%s is a directory", path);
 	}
 	try_map();
 	lseek(fd, (off_t)fmap_len, SEEK_SET);

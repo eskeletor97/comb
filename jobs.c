@@ -4,8 +4,11 @@
 #define _GNU_SOURCE
 #include "comb.h"
 
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+
+static void mark_new_hits(size_t from, size_t to);
 
 /* jobs-private bookkeeping: the pending-pattern details nobody else reads */
 static int js_extend;		/* search extends a literal prefix */
@@ -246,6 +249,7 @@ void job_finish(int commit)
 				memcpy(view + nv, job_arr, job_n * sizeof(*view));
 			}
 			nv += job_n;
+			mark_new_hits(job_lo, job_end);
 		} else {
 			job_restore_edit();
 		}
@@ -257,7 +261,9 @@ void job_finish(int commit)
 				memset(&filter_pat, 0,
 				       sizeof filter_pat);
 				filter_inv = 0;
-				view = NULL;	/* huge unfiltered logs use the identity view */
+				/* huge unfiltered logs use the identity view */
+				free(view);
+				view = NULL;
 				vcap = 0;
 				nv = nlines;
 			} else {
@@ -459,19 +465,45 @@ void update_filter(const char *q)
 	job_active = 1;
 }
 
+/* Highlight-search hits for lines that appeared after the last search pass.
+ * set_hit() otherwise only runs at scan commit, so lines appended by follow
+ * stayed dark and n/N hopped over them; this is also what covers the tail a
+ * scan picked up mid-flight (its results never reached past job_end).
+ * Only the incremental range is touched -- a from==0 rebuild (rotation or
+ * reload) re-runs the search as a batched job instead, so a huge file is not
+ * swept synchronously here. */
+static void mark_new_hits(size_t from, size_t to)
+{
+	if (from == 0 || !search_pat.active)
+		return;
+	if (to > nlines)
+		to = nlines;
+	regmatch_t sm;
+	for (size_t i = from; i < to; i++) {
+		size_t len;
+		const char *s = lt_text(i, &len);
+		set_hit(i, search_match(s, len, &sm));
+	}
+}
+
 void extend_view(size_t from)
 {
 	/* no filter: the view is the identity range over every line, so it
 	 * is O(1) -- no scan, no array. */
 	if (!filter_pat.active) {
 		nv = nlines;
-		view = NULL;
-		vcap = 0;
+		if (view) {	/* identity view needs no array: don't leak it */
+			free(view);
+			view = NULL;
+			vcap = 0;
+		}
+		mark_new_hits(from, nlines);
 		view_epoch++;
 		return;
 	}
 	scan_collect(from, nlines, pos_ident, query_match, filter_inv,
 		     &view, &nv, &vcap);
+	mark_new_hits(from, nlines);
 	view_epoch++;
 }
 
@@ -558,6 +590,11 @@ int debounce_elapsed(void)
 
 int debounce_ms_left(void)
 {
-	uint64_t left = debounce_due - now_ms();
-	return left > 0 ? (int)left : 0;
+	uint64_t now = now_ms();
+	/* clamp before subtracting: an expired deadline must not wrap to a
+	 * huge (or, cast to int, negative) poll timeout */
+	if (debounce_due <= now)
+		return 0;
+	uint64_t left = debounce_due - now;
+	return left > (uint64_t)INT_MAX ? INT_MAX : (int)left;
 }
