@@ -77,6 +77,7 @@ static void arena_reset(void)
 static char *pend;
 static size_t plen;
 static int flushed_partial;	/* last pushed line had no trailing newline */
+static int skip_to_nl;		/* a line exceeded MAX_LINE_LEN: drop up to the next '\n' */
 /* transient per-line tag spans, filled by the parallel fill so the
  * progress bar reflects the color pass too; freed after assign_slots. */
 static int *load_span;
@@ -342,15 +343,20 @@ static void line_cap_grow(size_t need)
 }
 
 /* Append one line to the index: where its raw bytes live and how long.
- * Nothing else is computed here -- width/tag/severity are lazy. */
-static void push_raw(const char *raw, size_t len)
+ * Nothing else is computed here -- width/tag/severity are lazy. A line
+ * longer than MAX_LINE_LEN is cut there and flagged, so one pathological
+ * line can't pin unbounded memory or CPU. */
+static void push_raw(const char *raw, size_t len, int trunc)
 {
+	if (!trunc && len > MAX_LINE_LEN)	/* backstop: callers normally pre-cap */
+		{ len = MAX_LINE_LEN; trunc = 1; }
 	line_cap_grow(nlines + 1);
 	LineIdx *X = &lidx[nlines];
 	X->raw = raw;
 	X->len = (uint32_t)len;
 	X->dirty = classify_line(raw, len);
 	X->slot = 0xFF;	/* assigned by assign_slots() in file order */
+	X->trunc = trunc ? 1 : 0;
 	if (len > wc_max)
 		wc_max = len;	/* conservative display-width bound */
 	nlines++;
@@ -421,8 +427,14 @@ void lt_fill(Line *L, size_t i)
 	L->len = len;
 	L->marked = (unsigned char)lt_is_marked(i);
 	L->srchit = (unsigned char)hit_at(i);
+	L->trunc = lidx[i].trunc;
 	L->sev = NULL;
 	L->wcols = str_cols(s, len);
+	if (L->trunc) {
+		size_t mc = str_cols(LINE_TRUNC_TAIL, sizeof(LINE_TRUNC_TAIL) - 1);
+		if (L->wcols + mc > wc_max)
+			wc_max = L->wcols + mc;
+	}
 	if (L->wcols > wc_max)
 		wc_max = L->wcols;
 	detect_tag(L);
@@ -545,6 +557,22 @@ static void feed(const char *data, size_t n)
 	memcpy(pend + plen, data, n);
 	plen += n;
 	prog_fed += n;
+
+	/* A line passed MAX_LINE_LEN and is being discarded: drop bytes until the
+	 * newline that closes it, so an endless run (e.g. /dev/zero) can't hold a
+	 * growing partial line in memory or rescan it quadratically. */
+	if (skip_to_nl) {
+		const char *nl = memchr(pend, '\n', plen);
+		if (!nl) {
+			plen = 0;
+			return;
+		}
+		size_t k = (size_t)(nl - pend);
+		memmove(pend, pend + k + 1, plen - (k + 1));
+		plen -= k + 1;
+		skip_to_nl = 0;
+	}
+
 	size_t start = 0;
 	/* If a final partial line was flushed as a line, a leading '\n' merely
 	 * terminates it; don't emit a spurious empty line for it. */
@@ -557,12 +585,25 @@ static void feed(const char *data, size_t n)
 			break;
 		size_t k = (size_t)(nl - pend);
 		size_t len = k - start;
-		char *raw = arena_alloc(len + 1);
-		memcpy(raw, pend + start, len);
-		raw[len] = 0;
-		push_raw(raw, len);
+		int trunc = len > MAX_LINE_LEN;
+		size_t save = trunc ? MAX_LINE_LEN : len;
+		char *raw = arena_alloc(save + 1);
+		memcpy(raw, pend + start, save);
+		raw[save] = 0;
+		push_raw(raw, save, trunc);
 		commit_line_slot(nlines - 1);
 		start = k + 1;
+	}
+	/* A trailing partial line with no '\n' yet that already exceeds the cap:
+	 * index its prefix now and drop the rest as it arrives (see skip_to_nl). */
+	if (!skip_to_nl && plen - start > MAX_LINE_LEN) {
+		char *raw = arena_alloc(MAX_LINE_LEN + 1);
+		memcpy(raw, pend + start, MAX_LINE_LEN);
+		raw[MAX_LINE_LEN] = 0;
+		push_raw(raw, MAX_LINE_LEN, 1);
+		commit_line_slot(nlines - 1);
+		skip_to_nl = 1;
+		start = plen;
 	}
 	memmove(pend, pend + start, plen - start);
 	plen -= start;
@@ -574,10 +615,19 @@ void flush_pending(void)
 {
 	if (plen == 0)
 		return;
-	char *raw = arena_alloc(plen + 1);
-	memcpy(raw, pend, plen);
-	raw[plen] = 0;
-	push_raw(raw, plen);
+	if (skip_to_nl) {
+		/* the over-long line already emitted its truncated prefix; the bytes
+		 * still buffered are overflow to be dropped, not a real line */
+		plen = 0;
+		skip_to_nl = 0;
+		return;
+	}
+	int trunc = plen > MAX_LINE_LEN;
+	size_t save = trunc ? MAX_LINE_LEN : plen;
+	char *raw = arena_alloc(save + 1);
+	memcpy(raw, pend, save);
+	raw[save] = 0;
+	push_raw(raw, save, trunc);
 	commit_line_slot(nlines - 1);
 	plen = 0;
 	flushed_partial = 1;
@@ -717,12 +767,15 @@ static void fill_chunk(load_chunk *c)
 		if (!nl)
 			break;
 		size_t n = (size_t)(nl - p);
+		int trunc = n > MAX_LINE_LEN;
+		size_t save = trunc ? MAX_LINE_LEN : n;
 		L[i].raw = p;
-		L[i].len = (uint32_t)n;
-		L[i].dirty = classify_line(p, n);
+		L[i].len = (uint32_t)save;
+		L[i].dirty = classify_line(p, save);
 		L[i].slot = 0xFF;
-		if (n > maxc)
-			maxc = n;
+		L[i].trunc = trunc ? 1 : 0;
+		if (save > maxc)
+			maxc = save;
 		if (load_span) {
 			int so, eo;
 			if (n > 2147483647 || !tag_span(p, n, &so, &eo))
@@ -838,7 +891,8 @@ static void drain_map(void)
 			break;
 		const char *s = fmap + fmap_pos + start;
 		size_t len = (size_t)(nl - s);
-		push_raw(s, len);
+		int trunc = len > MAX_LINE_LEN;
+		push_raw(s, trunc ? MAX_LINE_LEN : len, trunc);
 		start = (size_t)(nl - (fmap + fmap_pos)) + 1;
 		prog_file(fmap_pos + start);
 	}
@@ -987,6 +1041,7 @@ void reset_lines(void)
 	nsvc_seen = 0;	/* tag pointers referenced the freed buffers */
 	wc_max = 0;
 	prog_mark = 0;
+	skip_to_nl = 0;
 }
 
 static void read_available(int src)
@@ -1032,6 +1087,14 @@ void load_all(void)
 		/* opens fine, reads EISDIR, and the pane would just say "(empty)" */
 		if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode))
 			die("%s is a directory", path);
+		/* A char device (e.g. /dev/urandom), FIFO or socket never reaches EOF, so
+		 * the eager one-shot read below would block forever and buffer the whole
+		 * stream. comb's filter/search model holds every line, so an unbounded
+		 * source can't be shown; refuse it (as less does) instead of hanging.
+		 * Pipe it in via stdin instead -- that path streams and follows live. */
+		if (fstat(fd, &st) == 0 && !S_ISREG(st.st_mode))
+			die("%s is not a regular file; pipe it in instead (e.g. cat %s | comb)",
+			    path, path);
 	}
 	try_map();
 	lseek(fd, (off_t)fmap_len, SEEK_SET);

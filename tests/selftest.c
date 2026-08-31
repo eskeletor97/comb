@@ -228,7 +228,7 @@ static Line mkline(const char *s)
  * of any test-only loader shim */
 static void tpush(const char *s)
 {
-	push_raw(s, strlen(s));
+	push_raw(s, strlen(s), 0);
 	commit_line_slot(nlines - 1);
 }
 

@@ -6,6 +6,14 @@
  * runtime (-t/--threads), defaulting to nproc-2 clamped to [1, MAX_THREADS] */
 #define MAX_THREADS 64
 
+#define MAX_LINE_LEN 4096
+
+/* suffix painted (dim) after a truncated line; U+2026 is one cell wide so
+ * it folds into the wrap/scroll width accounting like any other glyph.
+ * LINE_TRUNC_COLS must match str_cols(LINE_TRUNC_TAIL) */
+#define LINE_TRUNC_TAIL  "\xe2\x80\xa6"
+#define LINE_TRUNC_COLS  1
+
 /* show the filter/search job spinner only after a scan has run this long;
  * fast scans finish inside a batch or two and shouldn't flash it */
 #define JOB_PROG_MS 1000

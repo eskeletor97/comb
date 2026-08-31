@@ -16,6 +16,17 @@ highlighting, service-tag coloring, an incremental filter, line marking and
 clipboard copy. When stdin is a pipe it is read automatically; a live file is
 followed as it grows, surviving truncation and rotation.
 .PP
+FILE must be a regular file (or stdin). Character devices, FIFOs and sockets
+are refused: comb's filter/search model holds every line in memory, so an
+unbounded stream (such as
+.BR /dev/urandom )
+would never finish loading and would buffer without bound. Pipe such a
+tool's output in via stdin instead. A single line longer than
+.B MAX_LINE_LEN
+(config.h; 4096 bytes) is truncated and marked with a dim
+.B …
+tail.
+.PP
 Filters match literal text by default with smart case (a pattern containing
 no uppercase letters matches case-insensitively). A leading
 .B ^

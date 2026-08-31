@@ -28,6 +28,7 @@ typedef struct {
 	int slot;		/* svc_palette index, -1 if no tag */
 	unsigned char marked;
 	unsigned char srchit;	/* highlight-search hit, for n/N + scrollbar */
+	unsigned char trunc;	/* line was cut at MAX_LINE_LEN; draw the tail marker */
 	size_t wcols;		/* display width cache, 0 = uncomputed */
 	const char *sev;	/* severity SGR cache, NULL = unscanned */
 } Line;
@@ -42,10 +43,11 @@ typedef struct {
  * next reset_lines(). */
 typedef struct {
 	const char *raw;
-	uint32_t len;		/* byte length, excluding the '\n' */
+	uint32_t len;		/* byte length, excluding the '\n'; <= MAX_LINE_LEN */
 	unsigned char dirty;	/* L_CLEAN/L_TRIMCR/L_SANITIZE (see load.c);
 				 * lt_text() materialises the line and clears it */
 	unsigned char slot;	/* service palette slot, 0xFF = no tag */
+	unsigned char trunc;	/* line exceeded MAX_LINE_LEN: only raw[0..len) kept */
 } LineIdx;
 
 /* parsed literal pattern, shared shape for the filter's and search's

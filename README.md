@@ -57,6 +57,12 @@ Pipe is followed live.
 Plain text only: no systemd journal, no binary or compressed logs.
 For those, pipe: `journalctl -o short-precise | comb`, `zcat error.log.gz | comb`.
 
+FILE must be a regular file (or stdin). char devices, FIFOs and sockets are
+refused -- comb's filter/search model holds every line in memory, so an
+unbounded stream (e.g. `/dev/urandom`) would never finish loading and would
+buffer without bound. Pipe such a source in instead; a single line longer
+than `MAX_LINE_LEN` (config.h, 4096) is truncated with a dim `…` tail.
+
 ## Keys
 
 | key              | action                                    |

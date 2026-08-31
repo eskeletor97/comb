@@ -138,6 +138,8 @@ size_t line_cols(size_t i)
 {
 	Line lz;
 	lt_fill(&lz, i);
+	if (lz.trunc)
+		return lz.wcols + str_cols(LINE_TRUNC_TAIL, sizeof(LINE_TRUNC_TAIL) - 1);
 	return lz.wcols;
 }
 
@@ -431,6 +433,41 @@ static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 		b += cl;
 		dc += (size_t)gw;
 		sc += (size_t)gw;
+	}
+	/* The truncation marker is a display tail, not log content: it is not
+	 * matched, searched, colored or copied, but it is drawn through the same
+	 * wrap/scroll accounting above, so the rows here agree with line_rows(). */
+	if (L->trunc) {
+		const char *t = LINE_TRUNC_TAIL;
+		size_t tn = sizeof(LINE_TRUNC_TAIL) - 1, q = 0;
+		while (q < tn) {
+			size_t cl;
+			int gw = glyph_width(u8_decode(t + q, tn - q, &cl));
+			if ((wrap ? sc + (size_t)gw > (size_t)cols
+				 : dc + (size_t)gw > (size_t)hscroll + (size_t)cols)) {
+				if (!wrap)
+					break;
+				if (row + 1 >= vmax)
+					break;
+				for (size_t k = sc; k < (size_t)cols; k++)
+					fputc(' ', stdout);
+				row++;
+				printf("\x1b[%zu;1H", row + 1);
+				BASE();
+				sc = 0;
+				continue;
+			}
+			if (!wrap && dc < (size_t)hscroll) {
+				q += cl;
+				dc += (size_t)gw;
+				continue;
+			}
+			fputs("\x1b[2m", stdout);	/* dim the tail so it reads as decoration */
+			fwrite(t + q, 1, cl, stdout);
+			q += cl;
+			dc += (size_t)gw;
+			sc += (size_t)gw;
+		}
 	}
 	BASE();
 #undef BASE
