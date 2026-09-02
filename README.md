@@ -69,6 +69,11 @@ style (`^G`, `^H`, ...), so a log can't ring the bell, move the cursor,
 shift the character set or otherwise drive the terminal. Valid UTF-8 is left
 untouched.
 
+Below `MIN_COLS` x `MIN_ROWS` (30x6, config.h) the view is unreadable, so
+comb paints a `too small` notice in the pane and waits for the window to
+enlarge; the status bar and quit/help still work while it does. At 6 rows
+you get a 4-line pane plus the status and input bars.
+
 ## Keys
 
 | key              | action                                    |

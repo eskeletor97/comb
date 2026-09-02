@@ -231,6 +231,7 @@ size_t pos_view(size_t p);
 /* --- jobs.c ---------------------------------------------------------- */
 int have_status_bar(void);
 int have_input_bar(void);
+int terminal_too_small(void);
 size_t pane_rows(void);
 void ensure_visible(void);
 void job_discard(void);

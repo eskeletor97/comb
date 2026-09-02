@@ -33,6 +33,16 @@ stripped, and any remaining C0/DEL control byte is rewritten
 .RB \(^G \(^H " ...) so a log cannot ring the bell, move the cursor or
 shift the character set. Valid UTF-8 is left untouched.
 .PP
+Below
+.B MIN_COLS
+x
+.B MIN_ROWS
+(30x6, config.h) the view is unreadable, so comb paints a
+.B "too small"
+notice in the pane and waits for the window to enlarge; the status bar and
+quit/help still work while it does. At 6 rows you get a 4-line pane plus the
+status and input bars.
+.PP
 Filters match literal text by default with smart case (a pattern containing
 no uppercase letters matches case-insensitively). A leading
 .B ^

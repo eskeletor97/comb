@@ -3,6 +3,12 @@
 /* max bytes of a filter/search query*/
 #define MAX_QUERY 256
 
+/* below this the UI stops trying: a smaller window still works (position,
+ * keys) but the pane is unreadable, so render() paints a clear notice
+ * until the window is big enough. 6 rows = 4 line pane + status + input. */
+#define MIN_COLS 30
+#define MIN_ROWS 6
+
 /* upper bound on threads, probably doesn't scale well above this */
 #define MAX_THREADS 64
 

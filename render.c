@@ -850,11 +850,56 @@ static void draw_help(size_t vis)
 	}
 }
 
+/* paint one pane row: clip to the column width, pad to the edge, invert
+ * the banner. Shared by the too-small notice below. */
+static void paint_pane_row(size_t row, const char *s, int inverse)
+{
+	printf("\x1b[%zu;1H", row + 1);
+	if (inverse)
+		fputs("\x1b[1;7m", stdout);
+	size_t cells = 0, off = 0, slen = strlen(s);
+	while (off < slen && cells < (size_t)cols) {
+		size_t cl;
+		unsigned cp = u8_decode(s + off, slen - off, &cl);
+		int gw = glyph_width(cp);
+		if (cells + (size_t)gw > (size_t)cols)
+			break;
+		fwrite(s + off, 1, cl, stdout);
+		cells += (size_t)gw;
+		off += cl;
+	}
+	fputs("\x1b[0m", stdout);
+	for (size_t k = cells; k < (size_t)cols; k++)
+		fputc(' ', stdout);
+}
+
+/* fill the pane with a clear notice once the window drops below the
+ * readable floor (terminal_too_small): the cram mode still works, but it
+ * is unreadable, so say so -- and what we need -- instead of drawing
+ * noise. The status/input bars still render (position + quit/help), and
+ * the pane recovers the moment the window is big enough. */
+static void draw_small_notice(size_t vis)
+{
+	char sz[16], min[16];
+	snprintf(sz, sizeof sz, "  %dx%d", cols, rows);
+	snprintf(min, sizeof min, "  min %dx%d", MIN_COLS, MIN_ROWS);
+	static const char head[] = " too small";
+	const char *lines[] = { head, sz, min };
+	for (size_t r = 0; r < vis; r++) {
+		if (r < 3)
+			paint_pane_row(r, lines[r], r == 0);
+		else
+			paint_pane_row(r, "", 0);
+	}
+}
+
 void render(void)
 {
 	size_t vis = pane_rows();
 	fputs("\x1b[H", stdout);
-	if (help_open) {
+	if (terminal_too_small()) {
+		draw_small_notice(vis);
+	} else if (help_open) {
 		draw_help(vis);
 	} else {
 		size_t r = 0, i = top;

@@ -49,6 +49,11 @@ int have_input_bar(void)
 	return rows >= 3;
 }
 
+int terminal_too_small(void)
+{
+	return cols < MIN_COLS || rows < MIN_ROWS;
+}
+
 size_t pane_rows(void)
 {
 	int n = rows - have_status_bar() - have_input_bar();
