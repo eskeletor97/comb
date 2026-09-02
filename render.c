@@ -490,18 +490,86 @@ static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 	return row - r0 + 1;
 }
 
+/* the right-aligned key hint is built for the current context instead of
+ * one fixed string, so the bar only shows keys that are actually live now:
+ * follow flips to unfollow, c copy appears once lines are marked, the
+ * filter/search prompt lists submit/bail, the help page lists scroll and
+ * close. Chips are ordered so a too-tight row drops from the FRONT, losing
+ * the least: the tail keeps the context-conditional keys (the action this
+ * state makes live) and finally the escape keys (help/quit). All chips are
+ * ASCII: bytes == cells. */
+static size_t context_chips(const char **out, size_t cap)
+{
+	size_t k = 0;
+#define CHIP(s) do { if (k < cap) out[k++] = (s); } while (0)
+
+	/* filter / search prompt: submit or bail, plus the live toggles */
+	if (editing) {
+		if (!editing_search)
+			CHIP("Ctrl-v excl");
+		CHIP("Ctrl-r regex");
+		CHIP("Enter submit");
+		CHIP("Esc quit");
+		return k;
+	}
+
+	/* in-pane help page: scroll or close (q closes; a second q quits) */
+	if (help_open) {
+		CHIP("PgUp/PgDn scroll");
+		CHIP("Esc close");
+		CHIP("q close");
+		return k;
+	}
+
+	/* normal viewing. Generic navigation sits at the front (dropped first);
+	 * context-conditional keys -- the action this state makes live -- sit at
+	 * the back so a tight row keeps what is relevant now, after help/quit. */
+	if (!wrap)
+		CHIP("h/l scroll");	/* horizontal scroll only when not wrapping */
+	CHIP("/ filter");
+	CHIP("\\ search");
+	CHIP(follow ? "f unfollow" : "f follow");
+	if (filter_pat.active)
+		CHIP("? clear");	/* an active filter clears with ? */
+	if (nmarked)
+		CHIP("c copy");		/* copy appears once lines are marked */
+	CHIP("Ctrl-h help");
+	CHIP("q quit");
+	return k;
+#undef CHIP
+}
+
+/* join chips[start..nc) into buf with two-space separators; returns the
+ * painted width. The buffer is sized well past the longest hint, so the
+ * truncation guard is only a safety net, not a fit decision. */
+static size_t join_chips(char *buf, size_t n, const char *const *chips,
+			 size_t start, size_t nc)
+{
+	size_t len = 0;
+	buf[0] = 0;
+	for (size_t i = start; i < nc; i++) {
+		size_t cl = strlen(chips[i]);
+		size_t sep = len ? 2 : 0;
+		if (len + sep + cl + 1 > n)
+			return len;	/* truncated; caller drops a chip anyway */
+		if (sep) {
+			buf[len++] = ' ';
+			buf[len++] = ' ';
+		}
+		memcpy(buf + len, chips[i], cl);
+		len += cl;
+		buf[len] = 0;
+	}
+	return len;
+}
+
 /* top bar: one inverse strip -- source, position and state on the left,
- * key reference right-aligned. A hint that can't fit is hidden whole,
- * never shrunk into noise. */
+ * key reference right-aligned. A hint that can't fit sheds its least
+ * valuable chips, but is never shrunk into noise. */
 static void draw_status_bar(void)
 {
 	if (!have_status_bar())
 		return;
-	static const char *const hints[] = {
-		"h/l scroll  / filter  \\ search  c copy  f follow  Ctrl-h help  q quit",
-		"/ filter  \\ search  c copy  f follow  Ctrl-h help  q quit",
-		"Ctrl-h help  q quit",
-	};
 	const char *src = use_stdin ? "(stdin)" : path;
 	char left[512];
 
@@ -564,13 +632,19 @@ static void draw_status_bar(void)
 		left[blen] = 0;
 		lw = (int)w;
 	}
-	/* longest reference that fits whole; none if the row is too tight */
+	/* the longest context hint that fits whole: drop the least valuable
+	 * chips (from the front) until it does; none if the row is too tight */
 	const char *hint = NULL;
 	int hw = 0;
-	for (size_t k = 0; k < sizeof hints / sizeof hints[0]; k++) {
-		int len = (int)strlen(hints[k]);
+	char hintbuf[512];
+	const char *chips[16];
+	size_t nc = context_chips(chips, sizeof chips / sizeof chips[0]);
+	for (size_t drop = 0; drop <= nc; drop++) {
+		int len = drop == nc ? 0 :
+			  (int)join_chips(hintbuf, sizeof hintbuf,
+					  chips, drop, nc);
 		if (lw + len + 2 <= cols) {
-			hint = hints[k];
+			hint = drop == nc ? NULL : hintbuf;
 			hw = len;	/* only set when actually shown */
 			break;
 		}
