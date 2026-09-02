@@ -497,28 +497,82 @@ static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
  * filter/search prompt lists submit/bail, the help page lists scroll and
  * close. Chips are ordered so a too-tight row drops from the FRONT, losing
  * the least: the tail keeps the context-conditional keys (the action this
- * state makes live) and finally the escape keys (help/quit). All chips are
+ * state makes live) and finally the escape keys (help/quit). Chips are
+ * written into buf as NUL-separated strings, with out[] pointing at each
+ * one; the key names come from chip_keys() so they stay derived from
+ * keymap[] instead of being pinned as literals here. All chip text is
  * ASCII: bytes == cells. */
-static size_t context_chips(const char **out, size_t cap)
+
+/* append a literal chip (prompt-only toggles that are not keymap actions:
+ * Ctrl-V/Ctrl-R mode flips, Enter submit). Returns the next byte offset. */
+static size_t add_chip_lit(char *buf, size_t bufn, size_t off,
+			   const char **out, size_t *k, size_t cap, const char *s)
 {
-	size_t k = 0;
-#define CHIP(s) do { if (k < cap) out[k++] = (s); } while (0)
+	size_t sl = strlen(s);
+	if (*k >= cap || off + sl + 1 > bufn)
+		return off;
+	out[*k] = buf + off;
+	(*k)++;
+	memcpy(buf + off, s, sl);
+	off += sl;
+	buf[off] = 0;
+	return off + 1;
+}
+
+/* append a chip built from keymap bindings plus a context label: the
+ * primary key(s) for a set of actions, slash-joined, then the label.
+ * Returns the next byte offset. */
+static size_t add_chip(char *buf, size_t bufn, size_t off,
+		       const char **out, size_t *k, size_t cap,
+		       const int *acts, size_t na, const char *label)
+{
+	char keys[32];
+	size_t kl, ll;
+	if (*k >= cap || (kl = chip_keys(keys, sizeof keys, acts, na)) == 0)
+		return off;
+	ll = strlen(label);
+	if (off + kl + 1 + ll + 1 > bufn)
+		return off;
+	out[*k] = buf + off;
+	(*k)++;
+	memcpy(buf + off, keys, kl);
+	off += kl;
+	buf[off++] = ' ';
+	memcpy(buf + off, label, ll);
+	off += ll;
+	buf[off] = 0;
+	return off + 1;
+}
+
+static size_t context_chips(char *buf, size_t bufn, const char **out, size_t cap)
+{
+	static const int scroll[]      = { A_LEFT, A_RIGHT };	/* horizontal */
+	static const int page_scroll[] = { A_PGUP, A_PGDOWN };	/* help page */
+	static const int flt[]     = { A_FILTER };
+	static const int srh[]     = { A_SEARCH };
+	static const int fol[]     = { A_FOLLOW };
+	static const int clr[]     = { A_CLEAR_FILTER };
+	static const int cpy[]     = { A_COPY };
+	static const int help[]    = { A_HELP };
+	static const int quit[]    = { A_QUIT };
+	static const int cancel[]  = { A_CANCEL };
+	size_t k = 0, off = 0;
 
 	/* filter / search prompt: submit or bail, plus the live toggles */
 	if (editing) {
 		if (!editing_search)
-			CHIP("Ctrl-v excl");
-		CHIP("Ctrl-r regex");
-		CHIP("Enter submit");
-		CHIP("Esc quit");
+			off = add_chip_lit(buf, bufn, off, out, &k, cap, "Ctrl-v excl");
+		off = add_chip_lit(buf, bufn, off, out, &k, cap, "Ctrl-r regex");
+		off = add_chip_lit(buf, bufn, off, out, &k, cap, "Enter submit");
+		off = add_chip(buf, bufn, off, out, &k, cap, cancel, 1, "quit");
 		return k;
 	}
 
 	/* in-pane help page: scroll or close (q closes; a second q quits) */
 	if (help_open) {
-		CHIP("PgUp/PgDn scroll");
-		CHIP("Esc close");
-		CHIP("q close");
+		off = add_chip(buf, bufn, off, out, &k, cap, page_scroll, 2, "scroll");
+		off = add_chip(buf, bufn, off, out, &k, cap, cancel, 1, "close");
+		off = add_chip(buf, bufn, off, out, &k, cap, quit, 1, "close");
 		return k;
 	}
 
@@ -526,18 +580,18 @@ static size_t context_chips(const char **out, size_t cap)
 	 * context-conditional keys -- the action this state makes live -- sit at
 	 * the back so a tight row keeps what is relevant now, after help/quit. */
 	if (!wrap)
-		CHIP("h/l scroll");	/* horizontal scroll only when not wrapping */
-	CHIP("/ filter");
-	CHIP("\\ search");
-	CHIP(follow ? "f unfollow" : "f follow");
+		off = add_chip(buf, bufn, off, out, &k, cap, scroll, 2, "scroll");
+	off = add_chip(buf, bufn, off, out, &k, cap, flt, 1, "filter");
+	off = add_chip(buf, bufn, off, out, &k, cap, srh, 1, "search");
+	off = add_chip(buf, bufn, off, out, &k, cap, fol, 1,
+		       follow ? "unfollow" : "follow");
 	if (filter_pat.active)
-		CHIP("? clear");	/* an active filter clears with ? */
+		off = add_chip(buf, bufn, off, out, &k, cap, clr, 1, "clear");
 	if (nmarked)
-		CHIP("c copy");		/* copy appears once lines are marked */
-	CHIP("Ctrl-h help");
-	CHIP("q quit");
+		off = add_chip(buf, bufn, off, out, &k, cap, cpy, 1, "copy");
+	off = add_chip(buf, bufn, off, out, &k, cap, help, 1, "help");
+	off = add_chip(buf, bufn, off, out, &k, cap, quit, 1, "quit");
 	return k;
-#undef CHIP
 }
 
 /* join chips[start..nc) into buf with two-space separators; returns the
@@ -675,8 +729,10 @@ static void draw_status_bar(void)
 	const char *hint = NULL;
 	int hw = 0;
 	char hintbuf[512];
+	char chipbuf[512];
 	const char *chips[16];
-	size_t nc = context_chips(chips, sizeof chips / sizeof chips[0]);
+	size_t nc = context_chips(chipbuf, sizeof chipbuf, chips,
+				  sizeof chips / sizeof chips[0]);
 	for (size_t drop = 0; drop <= nc; drop++) {
 		int len = drop == nc ? 0 :
 			  (int)join_chips(hintbuf, sizeof hintbuf,
@@ -877,7 +933,7 @@ static void draw_help(size_t vis)
 	}
 }
 
-/* diagnostic page (Ctrl-o) */
+/* diagnostic page */
 static void draw_debug(size_t vis)
 {
 	char lines[32][160];

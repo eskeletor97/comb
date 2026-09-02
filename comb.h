@@ -273,5 +273,6 @@ void view_action(int act);
 size_t help_count(void);
 const char *help_line(size_t i);
 int help_section(size_t i);	/* nonzero if help_line(i) is a section header */
+size_t chip_keys(char *buf, size_t n, const int *acts, size_t na);
 
 #endif /* COMB_H */

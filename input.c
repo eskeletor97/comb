@@ -165,6 +165,34 @@ static const char *key_name(int key, char *buf, size_t n)
 	return buf;
 }
 
+/* compact chip label for a set of actions: the first keymap binding of
+ * each (in keymap order), slash-joined. render.c's context chips use this
+ * so the live key hints stay derived from keymap[] instead of being pinned
+ * as literals. Returns bytes written into buf (truncated to n). */
+size_t chip_keys(char *buf, size_t n, const int *acts, size_t na)
+{
+	size_t len = 0;
+	buf[0] = 0;
+	for (size_t i = 0; i < na; i++) {
+		for (size_t k = 0; k < sizeof keymap / sizeof keymap[0]; k++) {
+			if (keymap[k].act != acts[i])
+				continue;
+			char nm[16];
+			const char *s = key_name(keymap[k].key, nm, sizeof nm);
+			size_t sl = strlen(s), sep = len ? 1 : 0;
+			if (len + sep + sl + 1 > n)
+				return len;	/* truncated; caller drops the chip */
+			if (sep)
+				buf[len++] = '/';
+			memcpy(buf + len, s, sl);
+			len += sl;
+			buf[len] = 0;
+			break;	/* first binding is the primary key */
+		}
+	}
+	return len;
+}
+
 /* action -> description table, shared by --help and the in-pane help page */
 static const struct { int act; const char *desc; } acts[] = {
 	{ A_DOWN,	"next line" },
