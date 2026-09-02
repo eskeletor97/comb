@@ -94,6 +94,8 @@ static size_t load_span_n;
 #define PROG_STEP_BYTES ((size_t)32 << 20)
 #define PROG_MIN_FEED  ((size_t)1 << 20)
 static size_t prog_mark;	/* file offset of the last bar draw */
+/* read (count) and index (fill) byte progress for the two-bar parallel load */
+static size_t prog_read, prog_idx;
 static int prog_shown;
 static int prog_spin;
 static uint64_t prog_due;	/* stdin redraw deadline */
@@ -132,13 +134,17 @@ void group_digits(char *o, size_t v)
 	*o = 0;
 }
 
-static void prog_paint(const char *text)
+static void prog_paint_row(int row, const char *text)
 {
-	fputs("\x1b[1;1H\x1b[2K", stdout);
+	char c[16];
+	snprintf(c, sizeof c, "\x1b[%d;1H\x1b[2K", row);
+	fputs(c, stdout);
 	fputs(text, stdout);
 	fflush(stdout);
 	prog_shown = 1;
 }
+
+static void prog_paint(const char *text) { prog_paint_row(1, text); }
 
 static double prog_secs(void)
 {
@@ -185,6 +191,57 @@ static void prog_file(size_t done)
 	prog_paint(buf);
 }
 
+/* build a "[###-----]" bar of width bw for val/tot; returns 0 if too narrow
+ * (o left empty), else fills o and returns 1. */
+static int prog_bar(char *o, int bw, uint64_t val, uint64_t tot)
+{
+	if (bw <= 0) {
+		o[0] = 0;
+		return 0;
+	}
+	int fill = (int)(val * bw / (tot ? tot : 1));
+	for (int i = 0; i < bw; i++)
+		o[i + 1] = i < fill ? '#' : '-';
+	o[0] = '[';
+	o[bw + 1] = ']';
+	o[bw + 2] = 0;
+	return 1;
+}
+
+/* two-phase parallel load: row 1 is the file read, row 2 the index build, so
+ * a big cold read doesn't stall at a single ambiguous percentage. */
+static void prog_paint_both(void)
+{
+	char cur[HUMAN_BYTES_BUF], tot[HUMAN_BYTES_BUF], rt[HUMAN_BYTES_BUF];
+	human_bytes(cur, prog_read);
+	human_bytes(tot, fmap_len);
+	human_bytes(rt, (size_t)(prog_read / prog_secs()));
+	int bw = cols >= 50 ? 22 : cols >= 36 ? 10 : 0;
+	char bar[26];
+	int has = prog_bar(bar, bw, prog_read, fmap_len);
+	const char *name = use_stdin ? "(stdin)"
+		: strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
+	char buf[192];
+	size_t room = cols > 66 ? cols - 66 : 0;
+	if (room >= 4)
+		snprintf(buf, sizeof buf,
+			 "reading %.*s%s%s %d%% %s/%s %s/s",
+			 (int)(room > 40 ? 40 : room), name,
+			 has ? " " : "", bar, (int)(prog_read * 100 / fmap_len),
+			 cur, tot, rt);
+	else
+		snprintf(buf, sizeof buf, "reading %d%% %s/%s %s/s",
+			 (int)(prog_read * 100 / fmap_len), cur, tot, rt);
+	prog_paint_row(1, buf);
+
+	char ib[26];
+	prog_bar(ib, bw, prog_idx, fmap_len);
+	snprintf(buf, sizeof buf, "indexing%s%s %d%%",
+		 has ? " " : "", ib, (int)(prog_idx * 100 / fmap_len));
+	if (rows >= 2)
+		prog_paint_row(2, buf);
+}
+
 static void prog_stdin(void)
 {
 	uint64_t now = now_ms();
@@ -205,7 +262,7 @@ void prog_hide(void)
 {
 	if (!prog_shown)
 		return;
-	fputs("\x1b[1;1H\x1b[2K", stdout);
+	fputs("\x1b[1;1H\x1b[2K\x1b[2;1H\x1b[2K", stdout);
 	fflush(stdout);
 	prog_shown = 0;
 }
@@ -749,7 +806,9 @@ static void *load_tramp(void *p)
 	return NULL;
 }
 
-static void load_spawn(load_ctx *ctx, int with_prog)
+enum { LPH_NONE = 0, LPH_READ, LPH_INDEX };
+
+static void load_spawn(load_ctx *ctx, int prog_phase)
 {
 	size_t nt = ctx->nt;
 	pthread_t th[LOAD_MAX_THREADS];
@@ -759,11 +818,30 @@ static void load_spawn(load_ctx *ctx, int with_prog)
 		arg[k] = (load_arg){ ctx, (int)k };
 		made[k] = pthread_create(&th[k], NULL, load_tramp, &arg[k]) == 0;
 	}
-	if (with_prog) {
+	if (prog_phase != LPH_NONE) {
+		size_t last = 0;
 		while (__sync_fetch_and_add(&load_done, 0) < nt) {
-			prog_file(ctx->base + load_work_done());
+			size_t work;
+			if (prog_phase == LPH_READ) {
+				prog_read = load_work_done();
+				work = prog_read;
+			} else {
+				prog_read = fmap_len;	/* read finished */
+				prog_idx = load_work_done();
+				work = prog_idx;
+			}
+			if (work >= last && work - last >= PROG_STEP_BYTES) {
+				last = work;
+				prog_paint_both();
+			}
 			struct timespec ts = { 0, 2 * 1000000 };
 			nanosleep(&ts, NULL);
+		}
+		/* One conclusive frame: the loop polls a step behind the last chunk's
+		 * final position, so re-read once the workers have all signalled done. */
+		if (prog_phase == LPH_INDEX) {
+			prog_idx = load_work_done();
+			prog_paint_both();
 		}
 	}
 	for (size_t k = 0; k < nt; k++) {
@@ -804,6 +882,7 @@ static void fill_chunk(load_chunk *c)
 	const char *p = c->lo, *e = c->hi;
 	LineIdx *L = lidx + c->base;
 	size_t i = 0, maxc = 0;
+	size_t next = (size_t)(p - fmap) + PROG_STEP_BYTES;
 	for (;;) {
 		const char *nl = memchr(p, '\n', (size_t)(e - p));
 		if (!nl)
@@ -827,11 +906,19 @@ static void fill_chunk(load_chunk *c)
 		}
 		i++;
 		p = nl + 1;
+		if ((size_t)(p - fmap) >= next) {
+			__atomic_store_n(&load_chunk_prog[c->idx],
+					 (size_t)(p - fmap), __ATOMIC_RELAXED);
+			next += PROG_STEP_BYTES;
+		}
 	}
 	/* any trailing bytes after the last '\n' are left for the feed path
 	 * below, so a file that grows across the mmap/read seam merges the
 	 * partial line instead of splitting it */
 	c->peak = maxc;
+	__atomic_store_n(&load_chunk_prog[c->idx], (size_t)(c->hi - fmap),
+			 __ATOMIC_RELAXED);
+	__sync_fetch_and_add(&load_done, 1);
 }
 
 static void drain_map_par(void)
@@ -868,7 +955,9 @@ static void drain_map_par(void)
 	for (size_t k = 0; k < nt; k++)
 		load_chunk_prog[k] = bnds[k];
 	load_done = 0;
-	load_spawn(&cc, 1);	/* count pass: this is where cold pages fault in */
+	prog_read = 0;
+	prog_idx = 0;
+	load_spawn(&cc, LPH_READ);	/* count pass: this is where cold pages fault in */
 
 	size_t total_lines = 0;
 	for (size_t k = 0; k < nt; k++) {
@@ -884,7 +973,10 @@ static void drain_map_par(void)
 	load_span_n = total_lines;
 
 	load_ctx fc = { chunks, nt, total, fill_chunk };
-	load_spawn(&fc, 0);	/* fill pass: page-cached fast path, no live progress */
+	for (size_t k = 0; k < nt; k++)
+		load_chunk_prog[k] = bnds[k];
+	load_done = 0;
+	load_spawn(&fc, LPH_INDEX);	/* fill pass: page-cached, index bar advances here */
 
 	wc_max = 0;
 	for (size_t k = 0; k < nt; k++)
@@ -901,7 +993,6 @@ static void drain_map_par(void)
 		fmap_pos = tail;
 		feed(fmap + tail, fmap_len - tail);
 	}
-	prog_file(fmap_len);
 }
 
 /* scan newly visible mapping range into the line index; a trailing partial
