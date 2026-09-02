@@ -567,6 +567,7 @@ void view_action(int act)
 		if (filter_pat.active) {
 			edit[0] = 0;
 			update_filter("");
+			snprintf(msg, sizeof msg, "filter cleared");
 		}
 		break;
 	case A_SEARCH:
@@ -629,6 +630,7 @@ void view_action(int act)
 		} else if (filter_pat.active) {
 			edit[0] = 0;
 			update_filter("");
+			snprintf(msg, sizeof msg, "filter cleared");
 		}
 		break;
 	case A_WRAP:

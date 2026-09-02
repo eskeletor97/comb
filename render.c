@@ -588,12 +588,15 @@ static void draw_status_bar(void)
 	if (nmarked)
 		snprintf(mk, sizeof mk,
 			 budget >= 16 ? "  %zu marked" : " *%zu", nmarked);
-	size_t sl = strlen(src), ql = filter_pat.active ? strlen(filter_pat.text) : 0;
+	size_t sl = strlen(src);
+	size_t ql = filter_pat.active ? strlen(filter_pat.text) : 0;
+	size_t sq = search_pat.active ? strlen(search_pat.text) : 0;
 	for (;;) {
-		snprintf(left, sizeof left, " %.*s  %s%s%s%s%s%s%.*s%s",
+		snprintf(left, sizeof left, " %.*s  %s%s%s%s%s%s%.*s%s%s%.*s",
 			 (int)sl, src, where, mk, flw, rmk, imk,
 			 filter_pat.active ? "  /" : "", (int)ql, filter_pat.text,
-			 (nv == 0 && filter_pat.active) ? "  (no matches)" : "");
+			 (nv == 0 && filter_pat.active) ? "  (no matches)" : "",
+			 search_pat.active ? "  \\" : "", (int)sq, search_pat.text);
 		/* fit by terminal cells, not bytes: a UTF-8 path/query overflows
 		 * the row even when strlen() looks short */
 		if ((int)str_cols(left, strlen(left)) <= budget)
@@ -606,6 +609,10 @@ static void draw_status_bar(void)
 			ql -= ql / 4 + 1;
 			while (ql && ((unsigned char)filter_pat.text[ql] & 0xC0) == 0x80)
 				ql--;
+		} else if (sq > 4) {
+			sq -= sq / 4 + 1;
+			while (sq && ((unsigned char)search_pat.text[sq] & 0xC0) == 0x80)
+				sq--;
 		} else if (*flw) {
 			flw = "";
 		} else if (*rmk) {
