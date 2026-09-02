@@ -82,6 +82,7 @@ enum {
 	A_MARK, A_UNMARK, A_COPY,
 	A_FOLLOW, A_RELOAD, A_WRAP, A_STOP,
 	A_SEARCH, A_SNEXT, A_SPREV, A_CLEAR_SEARCH,
+	A_HELP,
 };
 
 static const struct { int key; int act; } keymap[] = {
@@ -135,4 +136,5 @@ static const struct { int key; int act; } keymap[] = {
 	{ 'w',	      A_WRAP },
 	{ 'r',	      A_RELOAD },
 	{ CTL('l'),  A_REPAINT },
+	{ CTL('h'),  A_HELP },
 };

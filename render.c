@@ -498,9 +498,9 @@ static void draw_status_bar(void)
 	if (!have_status_bar())
 		return;
 	static const char *const hints[] = {
-		"/ filter  ? clear  spc/x mark  c copy  f follow  w wrap  r reload  q quit",
-		"/ filter  ? clear  spc/x mark  c copy  f follow  r reload  q quit",
-		"/ filter  spc mark  c copy  q quit",
+		"h/l scroll  / filter  \\ search  c copy  f follow  Ctrl-h help  q quit",
+		"/ filter  \\ search  c copy  f follow  Ctrl-h help  q quit",
+		"Ctrl-h help  q quit",
 	};
 	const char *src = use_stdin ? "(stdin)" : path;
 	char left[512];
@@ -731,68 +731,108 @@ static void draw_input_bar(void)
 	fputs("\x1b[?25l", stdout);
 }
 
+/* the help page fills the pane: a scrollable reference generated from
+ * input.c's keymap[]/acts[]. Lines are clipped to the pane width; the
+ * title row is inverse so it reads as a header. */
+static void draw_help(size_t vis)
+{
+	size_t n = help_count();
+	/* the page may have shrunk (resize): keep the window inside it */
+	if (help_top > (n > vis ? n - vis : 0))
+		help_top = n > vis ? n - vis : 0;
+	size_t r = 0;
+	for (size_t i = help_top; i < n && r < vis; i++, r++) {
+		printf("\x1b[%zu;1H", r + 1);
+		const char *s = help_line(i);
+		if (i == 0)
+			fputs("\x1b[1;7m", stdout);
+		size_t cells = 0, off = 0, slen = strlen(s);
+		while (off < slen && cells < (size_t)cols) {
+			size_t cl;
+			unsigned cp = u8_decode(s + off, slen - off, &cl);
+			int gw = glyph_width(cp);
+			if (cells + (size_t)gw > (size_t)cols)
+				break;
+			fwrite(s + off, 1, cl, stdout);
+			cells += (size_t)gw;
+			off += cl;
+		}
+		fputs("\x1b[0m", stdout);
+		for (size_t k = cells; k < (size_t)cols; k++)
+			fputc(' ', stdout);
+	}
+	if (r < vis) {
+		printf("\x1b[%zu;1H", r + 1);
+		fputs("\x1b[J", stdout);
+	}
+}
+
 void render(void)
 {
 	size_t vis = pane_rows();
 	fputs("\x1b[H", stdout);
-	size_t r = 0, i = top;
-	for (; i < nv && r < vis; i++)
-		r += draw_line(view_at(i), i == cur, r, vis);
-	if (r < vis) {
-		printf("\x1b[%zu;1H", r + 1);
-		if (nv == 0 && !filter_pat.active)
-			fputs("(empty)", stdout);
-		fputs("\x1b[J", stdout);
-	}
-	/* scrollbar: right-edge rail over the full line count; '|' is the
-	 * window thumb (always visible), '-' dashes the track, '#' marks
-	 * track rows holding search hits outside the window.
-	 *
-	 * The hit marks depend only on view[]/nv/vis, never on top, so they
-	 * are cached per view_epoch: rebuilding per frame would rescan every
-	 * view entry on each keystroke of a huge filtered view. */
-	static unsigned char *rail;
-	static size_t rail_cap, rail_nv;
-	static int rail_vis;
-	static uint64_t rail_gen;
-	if (cols > 1 && (search_pat.active || nv > vis) && nv > 0) {
-		size_t drew = i - top;
-		size_t tlo = nv > vis ? top * vis / nv : 0;
-		size_t thi = nv > vis ? (top + drew) * vis / nv : vis;
-		if (thi <= tlo)
-			thi = tlo + 1;
-		if (search_pat.active &&
-		    (rail_gen != view_epoch || rail_nv != nv ||
-		     rail_vis != (int)vis)) {
-			if (rail_cap < vis) {
-				rail_cap = vis;
-				rail = xrealloc(rail, rail_cap);
-			}
-			for (size_t sr = 0; sr < vis; sr++) {
-				size_t lo = sr * nv / vis;
-				size_t hi2 = (sr + 1) * nv / vis;
-				if (hi2 <= lo)
-					hi2 = lo + 1;
-				unsigned char hit = 0;
-				for (size_t k = lo; k < hi2 && k < nv; k++)
-					if (hit_at(view_at(k))) {
-						hit = 1;
-						break;
-					}
-				rail[sr] = hit;
-			}
-			rail_gen = view_epoch;
-			rail_nv = nv;
-			rail_vis = (int)vis;
+	if (help_open) {
+		draw_help(vis);
+	} else {
+		size_t r = 0, i = top;
+		for (; i < nv && r < vis; i++)
+			r += draw_line(view_at(i), i == cur, r, vis);
+		if (r < vis) {
+			printf("\x1b[%zu;1H", r + 1);
+			if (nv == 0 && !filter_pat.active)
+				fputs("(empty)", stdout);
+			fputs("\x1b[J", stdout);
 		}
-		fputs("\x1b[0m", stdout);
-		for (size_t sr = 0; sr < vis; sr++) {
-			char c = sr >= tlo && sr < thi ? '|' : '-';
-			printf("\x1b[%zu;%zuH", sr + 1, (size_t)cols);
-			if (search_pat.active && rail[sr])
-				fputs("\x1b[7m", stdout);
-			fputc(c, stdout);
+		/* scrollbar: right-edge rail over the full line count; '|' is the
+		 * window thumb (always visible), '-' dashes the track, '#' marks
+		 * track rows holding search hits outside the window.
+		 *
+		 * The hit marks depend only on view[]/nv/vis, never on top, so they
+		 * are cached per view_epoch: rebuilding per frame would rescan every
+		 * view entry on each keystroke of a huge filtered view. */
+		static unsigned char *rail;
+		static size_t rail_cap, rail_nv;
+		static int rail_vis;
+		static uint64_t rail_gen;
+		if (cols > 1 && (search_pat.active || nv > vis) && nv > 0) {
+			size_t drew = i - top;
+			size_t tlo = nv > vis ? top * vis / nv : 0;
+			size_t thi = nv > vis ? (top + drew) * vis / nv : vis;
+			if (thi <= tlo)
+				thi = tlo + 1;
+			if (search_pat.active &&
+			    (rail_gen != view_epoch || rail_nv != nv ||
+			     rail_vis != (int)vis)) {
+				if (rail_cap < vis) {
+					rail_cap = vis;
+					rail = xrealloc(rail, rail_cap);
+				}
+				for (size_t sr = 0; sr < vis; sr++) {
+					size_t lo = sr * nv / vis;
+					size_t hi2 = (sr + 1) * nv / vis;
+					if (hi2 <= lo)
+						hi2 = lo + 1;
+					unsigned char hit = 0;
+					for (size_t k = lo; k < hi2 && k < nv; k++)
+						if (hit_at(view_at(k))) {
+							hit = 1;
+							break;
+						}
+					rail[sr] = hit;
+				}
+				rail_gen = view_epoch;
+				rail_nv = nv;
+				rail_vis = (int)vis;
+			}
 			fputs("\x1b[0m", stdout);
+			for (size_t sr = 0; sr < vis; sr++) {
+				char c = sr >= tlo && sr < thi ? '|' : '-';
+				printf("\x1b[%zu;%zuH", sr + 1, (size_t)cols);
+				if (search_pat.active && rail[sr])
+					fputs("\x1b[7m", stdout);
+				fputc(c, stdout);
+				fputs("\x1b[0m", stdout);
+			}
 		}
 	}
 	draw_status_bar();

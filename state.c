@@ -60,6 +60,8 @@ int running = 1;
 int dirty = 1;
 
 size_t cur, top;
+int help_open;
+size_t help_top;
 size_t filter_anchor;	/* line selected when filtering began */
 size_t filter_row;	/* its screen row, restored on clear */
 int hscroll;

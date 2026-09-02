@@ -558,6 +558,26 @@ def _check_literal_metachars_match(binary):
     if 'other line' in scr:
         return 'literal filter did not narrow: unmatched line still visible'
 
+
+def _check_help_page(binary):
+    # Ctrl-h opens the in-pane help (top of the page); Ctrl-h stays
+    # backspace inside a prompt, so help is a view-mode toggle.
+    scr = '\n'.join(run([binary, SAMPLE], keys=b'\x08').screen())
+    if 'comb help' not in scr or 'next line' not in scr:
+        return f'help page top not shown: {scr!r}'
+    # it must list every action (it is the full reference the status bar
+    # gives up on), and the page needs a way back off of it
+    scr = '\n'.join(run([binary, SAMPLE], keys=b'\x08G').screen())
+    if 'toggle this help page' not in scr or 'q/Ctrl-c' not in scr:
+        return f'help page bottom not shown: {scr!r}'
+    if 'Ctrl-h / q / Esc closes this page' not in scr:
+        return 'help close hint missing'
+    # closing restores the log view (status counter reappears)
+    if not any(re.search(r'\d+/\d+', r) for r in
+               run([binary, SAMPLE], keys=b'\x08q').screen()):
+        return 'log view not restored after closing help'
+    return None
+
 CHECKS = [
     ('empty stdin shows placeholder', _check_empty_stdin),
     ('final line without newline kept', _check_no_trailing_newline),
@@ -578,6 +598,7 @@ CHECKS = [
     ('marked empty lines copy cleanly',          _check_mark_empty_lines),
     ('regex toggle shows (R) badge',  _check_regex_toggle_badge),
     ('literal filter matches metachars', _check_literal_metachars_match),
+    ('in-pane help page',               _check_help_page),
     ('filter prompt accepts UTF-8 queries',      _check_filter_accepts_utf8),
     ('Ctrl-V inverted filter',                   _check_filter_invert),
     ('hscroll caps at widest line',              _check_hscroll_caps_at_content),

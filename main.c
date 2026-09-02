@@ -199,7 +199,11 @@ int main(int argc, char **argv)
 			struct pollfd kp = { .fd = kfd, .events = POLLIN };
 			do {
 				step_job();
-				if (!job_active || key_pending() || got_winch)
+				/* A UI change (help opened, prompt committed, cursor moved,
+				 * job finished) set dirty; break to repaint it now, or a
+				 * state change made while a scan runs stalls until the whole
+				 * scan drains (the help page never appears). */
+				if (!job_active || key_pending() || got_winch || dirty)
 					break;
 			} while (poll(&kp, 1, 0) == 0);
 		}

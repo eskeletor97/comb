@@ -145,6 +145,8 @@ extern size_t filter_row;	/* its screen row, restored on clear */
 extern int hscroll;
 extern int rows, cols;
 extern int wrap;
+extern int help_open;
+extern size_t help_top;	/* scrolling the in-pane help page */
 extern int follow;
 extern int nocolor;
 extern const char *mark_bg;
@@ -265,5 +267,7 @@ int read_key(void);
 void usage(FILE *out);
 void edit_key(int key);
 void view_action(int act);
+size_t help_count(void);
+const char *help_line(size_t i);
 
 #endif /* COMB_H */

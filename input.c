@@ -165,37 +165,40 @@ static const char *key_name(int key, char *buf, size_t n)
 	return buf;
 }
 
+/* action -> description table, shared by --help and the in-pane help page */
+static const struct { int act; const char *desc; } acts[] = {
+	{ A_DOWN,	"next line" },
+	{ A_UP,		"previous line" },
+	{ A_PGDOWN,	"page down" },
+	{ A_PGUP,	"page up" },
+	{ A_TOP,	"go to top" },
+	{ A_BOT,	"go to bottom" },
+	{ A_LEFT,	"scroll left" },
+	{ A_RIGHT,	"scroll right" },
+	{ A_HSTART,	"scroll to left edge" },
+	{ A_HEND,	"scroll to right edge" },
+	{ A_FILTER,	"filter (incremental, smart case literal)" },
+	{ A_SEARCH,	"highlight-only search (no filtering)" },
+	{ A_SNEXT,	"next search match" },
+	{ A_SPREV,	"previous search match" },
+	{ A_CLEAR_SEARCH, "clear the highlight search" },
+	{ A_CLEAR_FILTER, "clear filter" },
+	{ A_CANCEL,	"cancel editing; clear marks, else filter" },
+	{ A_MARK,	"mark line and sweep" },
+	{ A_UNMARK,	"unmark line and sweep" },
+	{ A_COPY,	"copy marked lines (clears marks), else current" },
+	{ A_FOLLOW,	"toggle follow" },
+	{ A_RELOAD,	"reload file" },
+	{ A_WRAP,	"toggle line wrap" },
+	{ A_STOP,	"suspend (Ctrl-Z); fg to resume" },
+	{ A_REPAINT,	"redraw screen" },
+	{ A_HELP,	"toggle this help page" },
+	{ A_QUIT,	"quit" },
+};
+
 /* keys section of --help, generated from keymap[] so the two never drift */
 static void print_keys(FILE *out)
 {
-	static const struct { int act; const char *desc; } acts[] = {
-		{ A_DOWN,	"next line" },
-		{ A_UP,		"previous line" },
-		{ A_PGDOWN,	"page down" },
-		{ A_PGUP,	"page up" },
-		{ A_TOP,	"go to top" },
-		{ A_BOT,	"go to bottom" },
-		{ A_LEFT,	"scroll left" },
-		{ A_RIGHT,	"scroll right" },
-		{ A_HSTART,	"scroll to left edge" },
-		{ A_HEND,	"scroll to right edge" },
-		{ A_FILTER,	"filter (incremental, smart case literal)" },
-		{ A_SEARCH,	"highlight-only search (no filtering)" },
-		{ A_SNEXT,	"next search match" },
-		{ A_SPREV,	"previous search match" },
-		{ A_CLEAR_SEARCH, "clear the highlight search" },
-		{ A_CLEAR_FILTER, "clear filter" },
-		{ A_CANCEL,	"cancel editing; clear marks, else filter" },
-		{ A_MARK,	"mark line and sweep" },
-		{ A_UNMARK,	"unmark line and sweep" },
-		{ A_COPY,	"copy marked lines (clears marks), else current" },
-		{ A_FOLLOW,	"toggle follow" },
-		{ A_RELOAD,	"reload file" },
-		{ A_WRAP,	"toggle line wrap" },
-		{ A_STOP,	"suspend (Ctrl-Z); fg to resume" },
-		{ A_REPAINT,	"redraw screen" },
-		{ A_QUIT,	"quit" },
-	};
 	for (size_t i = 0; i < sizeof acts / sizeof acts[0]; i++) {
 		char keys[64], nm[16], prev[16];
 		size_t used = 0;
@@ -221,7 +224,104 @@ static void print_keys(FILE *out)
 	fputs("\n  Sweep direction follows the last up/down move.\n"
 	      "  In a prompt, Ctrl-R toggles literal/regex mode; Ctrl-V (filter\n"
 	      "  only) excludes matching lines. (R)/(!) show in the status bar.\n"
-	      "  The right-edge scrollbar marks rows containing search hits.\n", out);
+	      "  The right-edge scrollbar marks rows containing search hits.\n"
+	      "  Ctrl-h shows this reference inside the program.\n", out);
+}
+
+/* In-pane help page, built once from keymap[]/acts[] so the panel, --help
+ * and the status hint stay in sync. Lines are NUL-terminated copies packed
+ * into one growing arena; help_line() hands them to render.c. */
+static char *help_block;
+static size_t help_blen, help_bcap;
+static size_t *help_off;	/* byte offset of each line into help_block */
+static size_t help_n, help_ncap;
+static int help_built;
+
+static void help_add(const char *s)
+{
+	size_t sl = strlen(s);
+	if (help_n == help_ncap) {
+		help_ncap = help_ncap ? help_ncap * 2 : 16;
+		help_off = xrealloc(help_off, help_ncap * sizeof(*help_off));
+	}
+	if (help_blen + sl + 1 > help_bcap) {
+		help_bcap = help_bcap ? help_bcap * 2 : 512;
+		while (help_blen + sl + 1 > help_bcap)
+			help_bcap *= 2;
+		help_block = xrealloc(help_block, help_bcap);
+	}
+	/* store the byte offset, not a pointer: help_block can grow (and
+	 * move) on a later help_add, which would strand a stored pointer */
+	help_off[help_n++] = help_blen;
+	memcpy(help_block + help_blen, s, sl);
+	help_block[help_blen + sl] = 0;
+	help_blen += sl + 1;
+}
+
+static void build_help(void)
+{
+	if (help_built)
+		return;
+	help_built = 1;
+
+	help_add("comb help");
+	help_add("");
+	help_add("movement");
+	help_add("");
+	const char *sec = NULL;
+	for (size_t i = 0; i < sizeof acts / sizeof acts[0]; i++) {
+		const char *want = NULL;
+		switch (acts[i].act) {
+		case A_FILTER: want = "filter & search"; break;
+		case A_MARK:   want = "mark & copy";     break;
+		case A_FOLLOW: want = "pane";            break;
+		case A_STOP:   want = "misc";            break;
+		}
+		if (want && sec != want) {
+			sec = want;
+			help_add(sec);
+			help_add("");
+		}
+		char keys[64], nm[16], prev[16];
+		size_t used = 0;
+		keys[0] = prev[0] = 0;
+		for (size_t k = 0; k < sizeof keymap / sizeof keymap[0]; k++) {
+			if (keymap[k].act != acts[i].act)
+				continue;
+			const char *nm2 = key_name(keymap[k].key, nm, sizeof nm);
+			if (!strcmp(nm2, prev))
+				continue;
+			const char *sep = used ? "/" : "";
+			if (used + strlen(sep) + strlen(nm2) >= sizeof keys)
+				continue;
+			snprintf(prev, sizeof prev, "%s", nm2);
+			used += (size_t)snprintf(keys + used, sizeof keys - used,
+						"%s%s", sep, nm2);
+		}
+		char line[128];
+		snprintf(line, sizeof line, "  %-23s %s", keys, acts[i].desc);
+		help_add(line);
+	}
+	help_add("");
+	help_add("In a prompt, Ctrl-R toggles literal/regex mode; Ctrl-V (filter");
+	help_add("only) excludes matching lines. (R)/(!) show in the status bar.");
+	help_add("The right-edge scrollbar marks rows containing search hits.");
+	help_add("Sweep direction follows the last up/down move.");
+	help_add("Ctrl-h / q / Esc closes this page.");
+}
+
+size_t help_count(void)
+{
+	if (!help_built)
+		build_help();
+	return help_n;
+}
+
+const char *help_line(size_t i)
+{
+	if (!help_built)
+		build_help();
+	return i < help_n ? help_block + help_off[i] : "";
 }
 
 void usage(FILE *out)
@@ -336,6 +436,43 @@ void edit_key(int key)
 
 void view_action(int act)
 {
+	/* the help page is a modal overlay: only scroll/close keys act while it
+	 * is up. q and Esc close it first (a second q quits), Ctrl-h toggles. */
+	if (help_open) {
+		size_t vis = pane_rows();
+		switch (act) {
+		case A_HELP: case A_CANCEL: case A_QUIT:
+			help_open = 0;
+			break;
+		case A_UP:
+			if (help_top)
+				help_top--;
+			break;
+		case A_DOWN:
+			if (help_top + vis < help_count())
+				help_top++;
+			break;
+		case A_PGUP:
+			help_top = help_top > vis ? help_top - vis : 0;
+			break;
+		case A_PGDOWN: {
+			size_t max = help_count() > vis ? help_count() - vis : 0;
+			help_top = help_top + vis > max ? max : help_top + vis;
+			break;
+		}
+		case A_TOP:
+			help_top = 0;
+			break;
+		case A_BOT: {
+			size_t max = help_count() > vis ? help_count() - vis : 0;
+			help_top = max;
+			break;
+		}
+		default:
+			break;
+		}
+		return;
+	}
 	switch (act) {
 	case A_QUIT:
 		running = 0;
@@ -524,6 +661,10 @@ void view_action(int act)
 		tty_enter();
 		tcflush(kfd, TCIFLUSH);	/* keys typed while suspended */
 		dirty = 1;
+		break;
+	case A_HELP:
+		help_open = 1;
+		help_top = 0;
 		break;
 	case A_REPAINT:
 	default:
