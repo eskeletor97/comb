@@ -882,7 +882,7 @@ static void draw_help(size_t vis)
  * guessing. Deliberately not in the help reference or the status hints. */
 static void draw_debug(size_t vis)
 {
-	char lines[24][160];
+	char lines[32][160];
 	size_t n = 0;
 #define D(...) do { \
 		if (n < sizeof lines / sizeof lines[0]) \
@@ -890,8 +890,24 @@ static void draw_debug(size_t vis)
 	} while (0)
 #define DBLANK() do { if (n < sizeof lines / sizeof lines[0]) lines[n++][0] = 0; } while (0)
 
+	char hb[HUMAN_BYTES_BUF];
 	const char *term = getenv("TERM");
 	const char *ct = getenv("COLORTERM");
+	int from_ct = ct && (strstr(ct, "truecolor") || strstr(ct, "24bit"));
+	int from_tm = !from_ct && term &&
+		(strstr(term, "ghostty") || strstr(term, "kitty") ||
+		 strstr(term, "direct") || strstr(term, "truecolor"));
+	const char *via = "";
+	if (!nocolor && truecolor) {
+		if (from_ct)
+			via = " (COLORTERM)";
+		else if (from_tm)
+			via = " (TERM)";
+		else
+			via = " (forced)";
+	} else if (!nocolor && (from_ct || from_tm)) {
+		via = " (forced ansi)";
+	}
 
 	D("comb diagnostics");
 	DBLANK();
@@ -899,15 +915,18 @@ static void draw_debug(size_t vis)
 	  terminal_too_small() ? "  (too small)" : "");
 	D("TERM       %.40s", term ? term : "(unset)");
 	D("COLORTERM  %.40s", ct ? ct : "(unset)");
-	D("colour     %s", nocolor ? "off (--no-color)"
+	D("colour     %s%s", nocolor ? "off (--no-color)"
 		      : truecolor ? "truecolor (RGB)"
-		      : "ansi / 256-colour (fallback)");
+		      : "ansi / 256-colour (fallback)", via);
 	DBLANK();
 	D("source     %.60s", use_stdin ? "(stdin)" : path);
+	human_bytes(hb, fmap_len + prog_fed);
+	D("loaded     %s", hb);
 	D("lines      %zu", nlines);
 	D("view       %zu%s", nv, filter_pat.active ? " (filtered)" : "");
 	D("filter     %.80s", filter_pat.active ? filter_pat.text : "(none)");
 	D("search     %.80s", search_pat.active ? search_pat.text : "(none)");
+	D("marks      %zu", nmarked);
 	DBLANK();
 	D("cur        %zu", cur);
 	D("top        %zu", top);
@@ -916,6 +935,11 @@ static void draw_debug(size_t vis)
 	D("hscroll    %d", hscroll);
 	D("layout     pane %zu, status %s, input %s", pane_rows(),
 	  have_status_bar() ? "on" : "off", have_input_bar() ? "on" : "off");
+	DBLANK();
+	D("threads    %d%s", effective_threads(), max_threads ? " (set)" : "");
+	D("regex      %s", re_mode ? "on (ERE)" : "off (literal)");
+	D("invert     %s", filter_inv ? "on (grep -v)" : "off");
+	D("scan       %s", job_active ? "running" : "idle");
 #undef D
 #undef DBLANK
 
