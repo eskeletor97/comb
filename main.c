@@ -24,10 +24,41 @@ static int parse_threads(const char *s, int *out)
 	return 1;
 }
 
+/* --color=MODE: 0 auto (detect), 1 force truecolor, 2 force ANSI/256.
+ * Defaults to auto; the argv form survives doas/sudo, which strip the
+ * COLORTERM/TERM pair auto-detection would otherwise rely on. */
+static int parse_color_mode(const char *s, int *mode)
+{
+	if (!strcmp(s, "auto"))
+		*mode = 0;
+	else if (!strcmp(s, "truecolor"))
+		*mode = 1;
+	else if (!strcmp(s, "ansi"))
+		*mode = 2;
+	else
+		return 0;
+	return 1;
+}
+
+/* Truecolor/direct-color detection. COLORTERM is the usual advertisement
+ * (truecolor/24bit), but some terminals only name themselves via TERM
+ * (ghostty: xterm-ghostty, kitty: xterm-kitty, xterm-direct). When absent
+ * comb keeps the ANSI palette as the fallback. */
+static int term_truecolor(void)
+{
+	const char *ct = getenv("COLORTERM");
+	if (ct && (strstr(ct, "truecolor") || strstr(ct, "24bit")))
+		return 1;
+	const char *tm = getenv("TERM");
+	return tm && (strstr(tm, "ghostty") || strstr(tm, "kitty") ||
+		      strstr(tm, "direct") || strstr(tm, "truecolor"));
+}
+
 int main(int argc, char **argv)
 {
 	const char *init_re = NULL;
 	const char *file = NULL;
+	int color_mode = 0;	/* 0 auto, 1 truecolor, 2 ansi */
 
 	int endopts = 0;
 	for (int i = 1; i < argc; i++) {
@@ -42,6 +73,11 @@ int main(int argc, char **argv)
 		} else if (!endopts &&
 			   (!strcmp(argv[i], "--no-color") || !strcmp(argv[i], "-C"))) {
 			nocolor = 1;
+		} else if (!endopts && !strncmp(argv[i], "--color=", 8)) {
+			if (!parse_color_mode(argv[i] + 8, &color_mode)) {
+				usage(stderr);
+				return 1;
+			}
 		} else if (!endopts &&
 			   (!strcmp(argv[i], "-t") || !strcmp(argv[i], "--threads"))) {
 			if (i + 1 >= argc || !parse_threads(argv[++i], &max_threads)) {
@@ -85,7 +121,8 @@ int main(int argc, char **argv)
 
 	if (getenv("NO_COLOR"))
 		nocolor = 1;
-	mark_bg = nocolor ? "\x1b[7m" : MARK_BG;
+	truecolor = color_mode == 1 ? 1 : color_mode == 2 ? 0 : term_truecolor();
+	mark_bg = nocolor ? "\x1b[7m" : colof(&MARK_BG);
 
 	if (use_stdin)
 		fcntl(STDIN_FILENO, F_SETFL,

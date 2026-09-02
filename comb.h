@@ -147,8 +147,10 @@ extern int rows, cols;
 extern int wrap;
 extern int help_open;
 extern size_t help_top;	/* scrolling the in-pane help page */
+extern int debug_open;
 extern int follow;
 extern int nocolor;
+extern int truecolor;
 extern const char *mark_bg;
 extern int running, dirty;
 extern char msg[160];

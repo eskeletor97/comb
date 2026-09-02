@@ -349,6 +349,9 @@ void usage(FILE *out)
 "options:\n"
 "  -e REGEX               start with REGEX as the filter\n"
 "  --no-color, -C         disable syntax coloring (also honors NO_COLOR)\n"
+"  --color=MODE           colour depth: auto (default), truecolor, or ansi\n"
+"                         (auto reads COLORTERM/TERM; useful when doas/sudo\n"
+"                          strip them from the environment.)\n"
 "  -t, --threads N        worker threads for load/filter/search\n"
 "                         (default: nproc - 2, min 1, max %d)\n"
 "  -h, --help             show this help\n"
@@ -452,6 +455,16 @@ void view_action(int act)
 {
 	/* the help page is a modal overlay: only scroll/close keys act while it
 	 * is up. q and Esc close it first (a second q quits), Ctrl-h toggles. */
+	if (debug_open) {
+		switch (act) {
+		case A_DEBUG: case A_HELP: case A_CANCEL: case A_QUIT:
+			debug_open = 0;
+			break;
+		default:
+			break;
+		}
+		return;
+	}
 	if (help_open) {
 		size_t vis = pane_rows();
 		switch (act) {
@@ -680,7 +693,12 @@ void view_action(int act)
 		break;
 	case A_HELP:
 		help_open = 1;
+		debug_open = 0;
 		help_top = 0;
+		break;
+	case A_DEBUG:
+		debug_open = 1;
+		help_open = 0;
 		break;
 	case A_REPAINT:
 	default:

@@ -8,6 +8,8 @@ comb \- view, filter and copy log files in a terminal
 .RB [ \-t
 .IR N ]
 .RB [ \-\-no\-color ]
+.RB [ \-\-color =
+.IR MODE ]
 .RI [ FILE ]
 .SH DESCRIPTION
 .B comb
@@ -86,6 +88,20 @@ the file is already paged or sits on fast storage.
 disable syntax coloring; also honors the
 .B NO_COLOR
 environment variable. Cursor and marks remain inverse video.
+.TP
+.BI \-\-color = MODE
+force the colour depth instead of detecting it:
+.B auto
+(the default), 
+.B truecolor
+, or 
+.B ansi
+. Auto reads
+.B COLORTERM
+and
+.B TERM
+; the explicit form matters when a
+privilege elevator (doas/sudo) strips those variables from the environment.
 .TP
 .BR \-h ", " \-\-help
 show help and exit
@@ -185,6 +201,17 @@ quit
 .B NO_COLOR
 disable syntax coloring when set
 .TP
+.B COLORTERM
+when set to 
+.B truecolor
+ or 
+.B 24bit
+, comb renders with
+.B truecolor
+ unless overridden; 
+.B TERM
+ names (ghostty, kitty, direct) are a fallback hint
+.TP 
 .B WAYLAND_DISPLAY ", " DISPLAY
 gate the clipboard helper search: wl\-copy is only tried when
 .B WAYLAND_DISPLAY

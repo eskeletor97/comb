@@ -207,7 +207,7 @@ static void test_add_span(void)
 	int n = 0;
 
 	add_span(sp, &n, 5, 9, DIM);
-	add_span(sp, &n, 0, 3, QUOTE_COLOR);	/* out-of-order insert sorts */
+	add_span(sp, &n, 0, 3, colof(&QUOTE_COLOR));	/* out-of-order insert sorts */
 	CHECK(n == 2 && sp[0].so == 0 && sp[1].so == 5);
 
 	add_span(sp, &n, 1, 2, DIM);	/* inside earlier span: rejected */
@@ -266,18 +266,18 @@ static void test_collect_spans(void)
 	/* quoted values, apostrophes stay plain */
 	L = mkline("don't panic and 'quoted' end");
 	n = collect_spans(&L, sp);
-	const Span *v = find_attr(sp, n, QUOTE_COLOR);
+	const Span *v = find_attr(sp, n, colof(&QUOTE_COLOR));
 	CHECK(v && v->so == 16 && v->se == 24);
 
 	L = mkline("say \"double quoted\" ok");
 	n = collect_spans(&L, sp);
-	v = find_attr(sp, n, QUOTE_COLOR);
+	v = find_attr(sp, n, colof(&QUOTE_COLOR));
 	CHECK(v && v->so == 4 && v->se == 19);
 
 	/* nested parens form one span */
 	L = mkline("pre (nest (ed)) post");
 	n = collect_spans(&L, sp);
-	const Span *p = find_attr(sp, n, PAREN_COLOR);
+	const Span *p = find_attr(sp, n, colof(&PAREN_COLOR));
 	CHECK(p && p->so == 4 && p->se == 15 && L.s[p->se - 1] == ')');
 
 	/* <info> token hue after the service tag (slot from the real lookup) */

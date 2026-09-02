@@ -4,6 +4,7 @@
 #include "comb.h"
 
 #include <ctype.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
@@ -176,7 +177,7 @@ static const char *severity(const char *s, size_t n)
 		while ((p = case_find(p, (size_t)(s + n - p), sev_palette[i].w)) != NULL) {
 			if (p == s || (!isalnum((unsigned char)p[-1]) &&
 					      p[-1] != '-' && p[-1] != '/'))
-				return sev_palette[i].a;
+				return colof(&sev_palette[i].a);
 			p += strlen(sev_palette[i].w);
 		}
 	}
@@ -222,7 +223,7 @@ static const char *token_attr(const char *s, size_t n)
 	for (size_t i = 0; i < sizeof token_palette / sizeof token_palette[0]; i++)
 		if (strlen(token_palette[i].w) == n &&
 		    !strncasecmp(s, token_palette[i].w, n))
-			return token_palette[i].a;
+			return colof(&token_palette[i].a);
 	return NULL;
 }
 
@@ -238,7 +239,7 @@ static int collect_spans(const Line *L, Span *sp)
 		add_span(sp, &n, 0, L->tag_so, DIM);
 	if (L->slot >= 0)
 		add_span(sp, &n, L->tag_so, L->tag_eo,
-			 svc_palette[L->slot]);
+			 colof(&svc_palette[L->slot]));
 
 	size_t i = L->tag_eo >= 0 ? (size_t)L->tag_eo : 0;
 	/* <level> verbosity token somewhere shortly after the tag */
@@ -295,7 +296,7 @@ static int collect_spans(const Line *L, Span *sp)
 		if (qc == '\'' && j + 1 < L->len &&
 		    isalnum((unsigned char)s[j + 1]))
 			continue;
-		add_span(sp, &n, (int)k, (int)j + 1, QUOTE_COLOR);
+		add_span(sp, &n, (int)k, (int)j + 1, colof(&QUOTE_COLOR));
 		q++;
 		k = j;
 	}
@@ -318,7 +319,7 @@ static int collect_spans(const Line *L, Span *sp)
 		budget -= (int)(j - k);
 		if (depth != 0 || j >= L->len)
 			continue;
-		add_span(sp, &n, (int)k, (int)(j + 1), PAREN_COLOR);
+		add_span(sp, &n, (int)k, (int)(j + 1), colof(&PAREN_COLOR));
 		q++;
 		k = j;
 	}
@@ -366,7 +367,7 @@ static size_t draw_line(size_t idx, int iscur, size_t r0, size_t vmax)
 #define BASE() do { \
 		fputs("\x1b[0m", stdout); \
 		if (iscur) \
-			fputs(nocolor ? "\x1b[7m" : "\x1b[100m", stdout); \
+			fputs(nocolor ? "\x1b[7m" : colof(&CUR_BG), stdout); \
 		else if (L->marked) \
 			fputs(mark_bg, stdout); \
 		if (*col) \
@@ -566,6 +567,36 @@ static size_t join_chips(char *buf, size_t n, const char *const *chips,
 /* top bar: one inverse strip -- source, position and state on the left,
  * key reference right-aligned. A hint that can't fit sheds its least
  * valuable chips, but is never shrunk into noise. */
+/* The status/input/help bars are painted as an explicit dark strip with
+ * light text rather than reverse video, so the bar colour does not depend
+ * on the terminal's theme (Konsole renders reverse-video as a light gray).
+ * nocolor keeps a plain inverse bar for the README's inverse-video promise. */
+static void bar_style(void)
+{
+	fputs("\x1b[0m\x1b[1m", stdout);
+	if (nocolor) {
+		fputs("\x1b[7m", stdout);
+	} else {
+		fputs(colof(&BAR_BG), stdout);
+		fputs(colof(&BAR_FG), stdout);
+	}
+}
+
+/* prompt label inside the bar: regex mode tints its fg, an inverted
+ * filter underlines it. */
+static void label_style(int accent, int underline)
+{
+	fputs("\x1b[0m\x1b[1m", stdout);
+	if (nocolor) {
+		fputs("\x1b[7m", stdout);
+	} else {
+		fputs(colof(&BAR_BG), stdout);
+		fputs(colof(accent ? &PROMPT_ACCENT : &BAR_FG), stdout);
+	}
+	if (underline)
+		fputs("\x1b[4m", stdout);
+}
+
 static void draw_status_bar(void)
 {
 	if (!have_status_bar())
@@ -657,8 +688,8 @@ static void draw_status_bar(void)
 		}
 	}
 
-	printf("\x1b[%d;1H\x1b[1;7m",
-	       have_input_bar() ? rows - 1 : rows);
+	printf("\x1b[%d;1H", have_input_bar() ? rows - 1 : rows);
+	bar_style();
 	fputs(left, stdout);
 	for (int i = 0; i < cols - lw - hw - 1; i++)
 		fputc(' ', stdout);
@@ -693,7 +724,9 @@ static int chips(int curcol)
 	gap = mw && sw ? 2 : 0;	/* msg may have just been dropped */
 	int w = mw + gap + sw + 2;
 	int start = cols - w + 1;
-	printf("\x1b[%d;%dH\x1b[1;7m ", rows, start);
+	printf("\x1b[%d;%dH", rows, start);
+	bar_style();
+	fputc(' ', stdout);
 	if (mw)
 		printf("%s", msg);
 	if (gap)
@@ -781,22 +814,16 @@ static void draw_input_bar(void)
 	if (editing) {
 		struct edwin w;
 		edit_window(&w);
-		fputs("\x1b[1;7m ", stdout);
-		/* label: bold-inverse by default, so it reads as part of the bar
-		 * exactly like the edit text; regex tints it sky, an inverted
-		 * filter flips it out of the bar (status bar carries (R)/(!)) */
+		bar_style();
+		fputc(' ', stdout);
+		/* label: regex tints its fg, an inverted filter underlines it
+		 * (status bar carries (R)/(!)) */
 		const char *lab = prompt_label();
 		int inv = !editing_search && filter_inv;
-		/* label always sits in the bar's bold-inverse; regex tints the
-		 * text sky (set as bg, shown as fg by the inverse), and an
-		 * inverted filter underlines it -- no flipping to a black gap */
-		fputs("\x1b[0m\x1b[1m\x1b[7m", stdout);
-		if (!nocolor && re_mode)
-			fputs(PROMPT_ACCENT, stdout);
-		if (inv)
-			fputs("\x1b[4m", stdout);
+		label_style(!nocolor && re_mode, inv);
 		fputs(lab, stdout);
-		fputs("\x1b[0m\x1b[1;7m", stdout);
+		/* edit text back on the plain bar */
+		bar_style();
 		fputc(' ', stdout);
 		fwrite(edit + w.off, 1, w.eend - w.off, stdout);
 		fputs(" \x1b[0m", stdout);
@@ -826,7 +853,7 @@ static void draw_help(size_t vis)
 		printf("\x1b[%zu;1H", r + 1);
 		const char *s = help_line(i);
 		if (i == 0)
-			fputs("\x1b[1;7m", stdout);	/* title banner */
+			bar_style();	/* title banner */
 		else if (help_section(i))
 			fputs("\x1b[1m", stdout);	/* bold section header */
 		size_t cells = 0, off = 0, slen = strlen(s);
@@ -846,6 +873,73 @@ static void draw_help(size_t vis)
 	}
 	if (r < vis) {
 		printf("\x1b[%zu;1H", r + 1);
+		fputs("\x1b[J", stdout);
+	}
+}
+
+/* hidden diagnostic page (Ctrl-o): what comb sees -- terminal caps, colour
+ * mode and current view state -- so a rendering report can be made without
+ * guessing. Deliberately not in the help reference or the status hints. */
+static void draw_debug(size_t vis)
+{
+	char lines[24][160];
+	size_t n = 0;
+#define D(...) do { \
+		if (n < sizeof lines / sizeof lines[0]) \
+			snprintf(lines[n++], sizeof lines[0], __VA_ARGS__); \
+	} while (0)
+#define DBLANK() do { if (n < sizeof lines / sizeof lines[0]) lines[n++][0] = 0; } while (0)
+
+	const char *term = getenv("TERM");
+	const char *ct = getenv("COLORTERM");
+
+	D("comb diagnostics");
+	DBLANK();
+	D("terminal   %dx%d%s", cols, rows,
+	  terminal_too_small() ? "  (too small)" : "");
+	D("TERM       %.40s", term ? term : "(unset)");
+	D("COLORTERM  %.40s", ct ? ct : "(unset)");
+	D("colour     %s", nocolor ? "off (--no-color)"
+		      : truecolor ? "truecolor (RGB)"
+		      : "ansi / 256-colour (fallback)");
+	DBLANK();
+	D("source     %.60s", use_stdin ? "(stdin)" : path);
+	D("lines      %zu", nlines);
+	D("view       %zu%s", nv, filter_pat.active ? " (filtered)" : "");
+	D("filter     %.80s", filter_pat.active ? filter_pat.text : "(none)");
+	D("search     %.80s", search_pat.active ? search_pat.text : "(none)");
+	DBLANK();
+	D("cur        %zu", cur);
+	D("top        %zu", top);
+	D("wrap       %s", wrap ? "on" : "off");
+	D("follow     %s", follow ? "on" : "off");
+	D("hscroll    %d", hscroll);
+	D("layout     pane %zu, status %s, input %s", pane_rows(),
+	  have_status_bar() ? "on" : "off", have_input_bar() ? "on" : "off");
+#undef D
+#undef DBLANK
+
+	for (size_t i = 0; i < n && i < vis; i++) {
+		printf("\x1b[%zu;1H", i + 1);
+		if (i == 0)
+			bar_style();
+		size_t cells = 0, off = 0, slen = strlen(lines[i]);
+		while (off < slen && cells < (size_t)cols) {
+			size_t cl;
+			unsigned cp = u8_decode(lines[i] + off, slen - off, &cl);
+			int gw = glyph_width(cp);
+			if (cells + (size_t)gw > (size_t)cols)
+				break;
+			fwrite(lines[i] + off, 1, cl, stdout);
+			cells += (size_t)gw;
+			off += cl;
+		}
+		fputs("\x1b[0m", stdout);
+		for (size_t k = cells; k < (size_t)cols; k++)
+			fputc(' ', stdout);
+	}
+	if (n < vis) {
+		printf("\x1b[%zu;1H", n + 1);
 		fputs("\x1b[J", stdout);
 	}
 }
@@ -901,6 +995,8 @@ void render(void)
 	fputs("\x1b[H", stdout);
 	if (terminal_too_small()) {
 		draw_small_notice(vis);
+	} else if (debug_open) {
+		draw_debug(vis);
 	} else if (help_open) {
 		draw_help(vis);
 	} else {
