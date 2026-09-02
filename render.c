@@ -624,6 +624,12 @@ static int chips(int curcol)
 	return w;
 }
 
+/* prompt label: f: (filter) / s: (search) */
+static const char *prompt_label(void)
+{
+	return editing_search ? "s:" : "f:";
+}
+
 /* visible edit-buffer window [off,eend), prefix width and cursor column:
  * must hold the cursor and fit maxw cells, clipping both sides. The
  * cursor pins toward the right edge while scrolling left. */
@@ -635,8 +641,8 @@ struct edwin {
 static void edit_window(struct edwin *w)
 {
 	size_t elen = strlen(edit);
-	w->pfx = 2 + (re_mode ? 1 : 0) +
-		 (!editing_search && filter_inv ? 1 : 0);
+	/* leading space + label + separating space before the query */
+	w->pfx = 1 + (int)strlen(prompt_label()) + 1;
 	int maxw = cols - (w->pfx + 2) > 1 ? cols - (w->pfx + 2) : 1;
 	w->off = 0;
 	while (w->off < elen &&
@@ -695,11 +701,22 @@ static void draw_input_bar(void)
 		struct edwin w;
 		edit_window(&w);
 		fputs("\x1b[1;7m ", stdout);
-		fputc(editing_search ? '\\' : '/', stdout);
-		if (re_mode)
-			fputc('r', stdout);
-		if (!editing_search && filter_inv)
-			fputc('!', stdout);
+		/* label: bold-inverse by default, so it reads as part of the bar
+		 * exactly like the edit text; regex tints it sky, an inverted
+		 * filter flips it out of the bar (status bar carries (R)/(!)) */
+		const char *lab = prompt_label();
+		int inv = !editing_search && filter_inv;
+		/* label always sits in the bar's bold-inverse; regex tints the
+		 * text sky (set as bg, shown as fg by the inverse), and an
+		 * inverted filter underlines it -- no flipping to a black gap */
+		fputs("\x1b[0m\x1b[1m\x1b[7m", stdout);
+		if (!nocolor && re_mode)
+			fputs(PROMPT_ACCENT, stdout);
+		if (inv)
+			fputs("\x1b[4m", stdout);
+		fputs(lab, stdout);
+		fputs("\x1b[0m\x1b[1;7m", stdout);
+		fputc(' ', stdout);
 		fwrite(edit + w.off, 1, w.eend - w.off, stdout);
 		fputs(" \x1b[0m", stdout);
 		/* cursor sits on the char right of it, or on our trailing

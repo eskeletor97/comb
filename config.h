@@ -1,9 +1,9 @@
 /* comb config */
 
+/* max bytes of a filter/search query*/
 #define MAX_QUERY 256
 
-/* upper bound on the parse/filter/load worker threads; the actual count is
- * runtime (-t/--threads), defaulting to nproc-2 clamped to [1, MAX_THREADS] */
+/* upper bound on threads, probably doesn't scale well above this */
 #define MAX_THREADS 64
 
 #define MAX_LINE_LEN 4096
@@ -26,6 +26,7 @@
 #define TTY_LEAVE "\x1b[0m\x1b[?25h\x1b[?1049l"
 
 #define MARK_BG		"\x1b[48;5;238m"	/* marked-line background */
+#define PROMPT_ACCENT	"\x1b[48;5;173m"	/* regex-mode accent; coral, set as bg so inverse shows it as fg */
 #define QUOTE_COLOR "\x1b[38;5;223m"
 #define PAREN_COLOR	"\x1b[38;5;115m"	/* (...) context */
 #define DIM		"\x1b[2m"

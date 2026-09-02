@@ -55,7 +55,6 @@ size_t pane_rows(void)
 	return (size_t)(n > 0 ? n : 1);
 }
 
-
 void ensure_visible(void)
 {
 	size_t vis = pane_rows();
@@ -336,7 +335,7 @@ const char *job_spin_text(void)
 	if (!job_active || now_ms() - job_t0 < JOB_PROG_MS)
 		return NULL;
 	static const char frames[] = "|/-\\";
-	snprintf(buf, sizeof buf, "%c %s %d%%  esc bails",
+	snprintf(buf, sizeof buf, "%c %s %d%%  esc to cancel",
 		 frames[job_spin++ & 3],
 		 job_kind == K_SEARCH ? "searching" : "filtering",
 		 (int)((job_pos - job_lo) * 100 /

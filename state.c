@@ -20,7 +20,7 @@ size_t view_at(size_t k)
 	return view ? view[k] : k;
 }
 
-char path[4096];
+char path[PATH_MAX];
 int use_stdin;
 int fd = -1;	/* log file */
 int kfd = 0;	/* keyboard: stdin, or /dev/tty when stdin isn't a tty */

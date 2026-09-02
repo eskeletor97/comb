@@ -9,7 +9,6 @@
 
 static int mdir = -1;	/* space/x sweep direction: -1 up, 1 down */
 
-
 int key_action(int key)
 {
 	for (size_t i = 0; i < sizeof keymap / sizeof keymap[0]; i++)
@@ -237,7 +236,7 @@ void usage(FILE *out)
 "  -e REGEX               start with REGEX as the filter\n"
 "  --no-color, -C         disable syntax coloring (also honors NO_COLOR)\n"
 "  -t, --threads N        worker threads for load/filter/search\n"
-"                         (default: online CPUs - 2, min 1, max %d)\n"
+"                         (default: nproc - 2, min 1, max %d)\n"
 "  -h, --help             show this help\n"
 "\n"
 "keys:\n", MAX_THREADS);

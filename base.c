@@ -75,7 +75,6 @@ static void raw_on(void)
 	tio_saved = 1;
 }
 
-/* undo raw mode + alternate screen; safe from die() at any point */
 void restore_terminal(void)
 {
 	if (!tio_saved)

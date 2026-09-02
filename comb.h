@@ -6,6 +6,7 @@
 
 #include "config.h"
 
+#include <limits.h>
 #include <regex.h>
 #include <signal.h>
 #include <stdio.h>
@@ -93,7 +94,7 @@ extern size_t nv, vcap;
  * filtered view materialises view[] of matching line indices. */
 size_t view_at(size_t k);
 
-extern char path[4096];
+extern char path[PATH_MAX];
 extern int use_stdin;
 extern int fd;		/* log file */
 extern int kfd;		/* keyboard: stdin, or /dev/tty when stdin isn't a tty */
@@ -159,8 +160,7 @@ extern volatile sig_atomic_t got_winch;
  * from it */
 extern uint64_t view_epoch;
 
-/* Worker threads for filter/search scans and parallel file loading. 0 means
- * "auto": effective_threads() falls back to nproc-2 clamped to [1,MAX]. */
+/* Worker threads; 0 means "auto": effective_threads() falls back to nproc-2 clamped to [1,MAX]. */
 extern int max_threads;
 int effective_threads(void);
 

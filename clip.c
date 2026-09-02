@@ -33,7 +33,7 @@ static int has_prog(const char *prog)
 	const char *p = getenv("PATH");
 	if (!p)
 		return 0;
-	char full[4096];
+	char full[PATH_MAX];
 	while (*p) {
 		const char *e = strchr(p, ':');
 		size_t n = e ? (size_t)(e - p) : strlen(p);
@@ -110,7 +110,7 @@ static void copy_text(const char *s, size_t len)
 	size_t need = 4 * ((len + 2) / 3) + 1;
 	char *b = xrealloc(NULL, need);
 	b64enc(s, len, b);
-	/* OSC 52, so copy works over ssh too */
+	/* OSC 52*/
 	printf("\x1b]52;c;%s\a", b);
 	fflush(stdout);
 	free(b);
