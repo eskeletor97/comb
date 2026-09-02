@@ -877,9 +877,7 @@ static void draw_help(size_t vis)
 	}
 }
 
-/* hidden diagnostic page (Ctrl-o): what comb sees -- terminal caps, colour
- * mode and current view state -- so a rendering report can be made without
- * guessing. Deliberately not in the help reference or the status hints. */
+/* diagnostic page (Ctrl-o) */
 static void draw_debug(size_t vis)
 {
 	char lines[32][160];
@@ -991,11 +989,7 @@ static void paint_pane_row(size_t row, const char *s, int inverse)
 		fputc(' ', stdout);
 }
 
-/* fill the pane with a clear notice once the window drops below the
- * readable floor (terminal_too_small): the cram mode still works, but it
- * is unreadable, so say so -- and what we need -- instead of drawing
- * noise. The status/input bars still render (position + quit/help), and
- * the pane recovers the moment the window is big enough. */
+/* draw this if terminal is below minimum size*/
 static void draw_small_notice(size_t vis)
 {
 	char sz[16], min[16];

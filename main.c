@@ -24,9 +24,6 @@ static int parse_threads(const char *s, int *out)
 	return 1;
 }
 
-/* --color=MODE: 0 auto (detect), 1 force truecolor, 2 force ANSI/256.
- * Defaults to auto; the argv form survives doas/sudo, which strip the
- * COLORTERM/TERM pair auto-detection would otherwise rely on. */
 static int parse_color_mode(const char *s, int *mode)
 {
 	if (!strcmp(s, "auto"))
@@ -40,10 +37,6 @@ static int parse_color_mode(const char *s, int *mode)
 	return 1;
 }
 
-/* Truecolor/direct-color detection. COLORTERM is the usual advertisement
- * (truecolor/24bit), but some terminals only name themselves via TERM
- * (ghostty: xterm-ghostty, kitty: xterm-kitty, xterm-direct). When absent
- * comb keeps the ANSI palette as the fallback. */
 static int term_truecolor(void)
 {
 	const char *ct = getenv("COLORTERM");
@@ -147,18 +140,16 @@ int main(int argc, char **argv)
 	load_all();
 	prog_hide();
 	{
-		/* flex a little: how much landed and how fast */
+		/* flex a little: how much landed */
 		char g[32], hb[HUMAN_BYTES_BUF];
 		group_digits(g, nlines);
 		human_bytes(hb, fmap_len + prog_fed);
 		double secs = (now_ms() - prog_t0) / 1000.0;
-		if (secs >= 1.0) {
-			char ps[HUMAN_BYTES_BUF];
-			human_bytes(ps, (size_t)((fmap_len + prog_fed) / secs));
+		if (secs >= 1.0)
 			snprintf(msg, sizeof msg,
-				 "loaded %s lines (%s) in %.1fs (%s/s)",
-				 g, hb, secs, ps);
-		} else
+				 "loaded %s lines (%s) in %.1fs",
+				 g, hb, secs);
+		else
 			snprintf(msg, sizeof msg,
 				 "loaded %s lines (%s) in %.0fms",
 				 g, hb, secs * 1000);

@@ -99,6 +99,11 @@ static size_t prog_read, prog_idx;
 static int prog_shown;
 static int prog_spin;
 static uint64_t prog_due;	/* stdin redraw deadline */
+/* read throughput, frozen once the read phase ends: during the index build
+ * prog_read stays at fmap_len while prog_secs keeps growing, which would
+ *otherwise make the "reading" row's rate decay as a fake "index speed". */
+static double prog_rrate;
+static int prog_rdone;
 
 /* compact byte count: 37.3GiB / 743MiB / 9.5KiB. Callers pass room for the
  * widest rendering (a size_t that big is "17179869184.0GiB" plus NUL). */
@@ -150,6 +155,19 @@ static double prog_secs(void)
 {
 	double s = (now_ms() - prog_t0) / 1000.0;
 	return s < 0.001 ? 0.001 : s;
+}
+
+/* read throughput. A live average until the read phase completes; then it is
+ * snapshotted once and frozen, because prog_read sits at fmap_len while
+ * prog_secs keeps growing through the index build. */
+static double prog_read_rate(void)
+{
+	if (!prog_rdone) {
+		prog_rrate = prog_read / prog_secs();
+		if (prog_read >= fmap_len)
+			prog_rdone = 1;
+	}
+	return prog_rrate;
 }
 
 static void prog_file(size_t done)
@@ -215,15 +233,30 @@ static void prog_paint_both(void)
 	char cur[HUMAN_BYTES_BUF], tot[HUMAN_BYTES_BUF], rt[HUMAN_BYTES_BUF];
 	human_bytes(cur, prog_read);
 	human_bytes(tot, fmap_len);
-	human_bytes(rt, (size_t)(prog_read / prog_secs()));
+	human_bytes(rt, (size_t)prog_read_rate());
 	int bw = cols >= 50 ? 22 : cols >= 36 ? 10 : 0;
 	char bar[26];
 	int has = prog_bar(bar, bw, prog_read, fmap_len);
 	const char *name = use_stdin ? "(stdin)"
 		: strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
-	char buf[192];
+	/* Row 1 prints "reading <name> " before the bar; pad row 2's label by
+	 * the same displayed name width so the index bar lands under the read
+	 * bar. Only pad when row 1 renders the bar (wide enough for name+bar);
+	 * otherwise both rows fall back to bare percentages and stay consistent,
+	 * instead of a lone bar sitting under a name-less percentage. */
 	size_t room = cols > 66 ? cols - 66 : 0;
-	if (room >= 4)
+	int named = room >= 4;
+	char pad[48];
+	{
+		size_t nlen = named ? (room > 40 ? 40 : room) : 0;
+		size_t dname = strlen(name) < nlen ? strlen(name) : nlen;
+		size_t i = 0;
+		while (i < sizeof pad - 1 && i < dname)
+			pad[i++] = ' ';
+		pad[i] = 0;
+	}
+	char buf[192];
+	if (named)
 		snprintf(buf, sizeof buf,
 			 "reading %.*s%s%s %d%% %s/%s %s/s",
 			 (int)(room > 40 ? 40 : room), name,
@@ -236,8 +269,12 @@ static void prog_paint_both(void)
 
 	char ib[26];
 	prog_bar(ib, bw, prog_idx, fmap_len);
-	snprintf(buf, sizeof buf, "indexing%s%s %d%%",
-		 has ? " " : "", ib, (int)(prog_idx * 100 / fmap_len));
+	if (named)
+		snprintf(buf, sizeof buf, "indexing%s%s%s %d%%",
+			 pad, has ? " " : "", ib, (int)(prog_idx * 100 / fmap_len));
+	else
+		snprintf(buf, sizeof buf, "indexing %d%%",
+			 (int)(prog_idx * 100 / fmap_len));
 	if (rows >= 2)
 		prog_paint_row(2, buf);
 }
@@ -1164,6 +1201,8 @@ void reset_lines(void)
 	memset(svc_seen, 0, sizeof svc_seen);
 	wc_max = 0;
 	prog_mark = 0;
+	prog_rdone = 0;
+	prog_rrate = 0;
 	skip_to_nl = 0;
 }
 
