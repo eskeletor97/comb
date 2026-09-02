@@ -745,7 +745,9 @@ static void draw_help(size_t vis)
 		printf("\x1b[%zu;1H", r + 1);
 		const char *s = help_line(i);
 		if (i == 0)
-			fputs("\x1b[1;7m", stdout);
+			fputs("\x1b[1;7m", stdout);	/* title banner */
+		else if (help_section(i))
+			fputs("\x1b[1m", stdout);	/* bold section header */
 		size_t cells = 0, off = 0, slen = strlen(s);
 		while (off < slen && cells < (size_t)cols) {
 			size_t cl;

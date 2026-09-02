@@ -269,5 +269,6 @@ void edit_key(int key);
 void view_action(int act);
 size_t help_count(void);
 const char *help_line(size_t i);
+int help_section(size_t i);	/* nonzero if help_line(i) is a section header */
 
 #endif /* COMB_H */

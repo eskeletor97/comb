@@ -234,15 +234,17 @@ static void print_keys(FILE *out)
 static char *help_block;
 static size_t help_blen, help_bcap;
 static size_t *help_off;	/* byte offset of each line into help_block */
+static int *help_sec;		/* nonzero if line is a section header */
 static size_t help_n, help_ncap;
 static int help_built;
 
-static void help_add(const char *s)
+static void help_add_pre(const char *s, int is_sec)
 {
 	size_t sl = strlen(s);
 	if (help_n == help_ncap) {
 		help_ncap = help_ncap ? help_ncap * 2 : 16;
 		help_off = xrealloc(help_off, help_ncap * sizeof(*help_off));
+		help_sec = xrealloc(help_sec, help_ncap * sizeof(*help_sec));
 	}
 	if (help_blen + sl + 1 > help_bcap) {
 		help_bcap = help_bcap ? help_bcap * 2 : 512;
@@ -252,11 +254,15 @@ static void help_add(const char *s)
 	}
 	/* store the byte offset, not a pointer: help_block can grow (and
 	 * move) on a later help_add, which would strand a stored pointer */
-	help_off[help_n++] = help_blen;
+	help_off[help_n] = help_blen;
+	help_sec[help_n++] = is_sec;
 	memcpy(help_block + help_blen, s, sl);
 	help_block[help_blen + sl] = 0;
 	help_blen += sl + 1;
 }
+
+static void help_add(const char *s) { help_add_pre(s, 0); }
+static void help_add_sec(const char *s) { help_add_pre(s, 1); }
 
 static void build_help(void)
 {
@@ -266,7 +272,7 @@ static void build_help(void)
 
 	help_add("comb help");
 	help_add("");
-	help_add("movement");
+	help_add_sec("movement");
 	help_add("");
 	const char *sec = NULL;
 	for (size_t i = 0; i < sizeof acts / sizeof acts[0]; i++) {
@@ -279,7 +285,8 @@ static void build_help(void)
 		}
 		if (want && sec != want) {
 			sec = want;
-			help_add(sec);
+			help_add("");
+			help_add_sec(sec);
 			help_add("");
 		}
 		char keys[64], nm[16], prev[16];
@@ -322,6 +329,13 @@ const char *help_line(size_t i)
 	if (!help_built)
 		build_help();
 	return i < help_n ? help_block + help_off[i] : "";
+}
+
+int help_section(size_t i)
+{
+	if (!help_built)
+		build_help();
+	return i < help_n ? help_sec[i] : 0;
 }
 
 void usage(FILE *out)
