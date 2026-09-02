@@ -23,7 +23,7 @@ unbounded stream (such as
 would never finish loading and would buffer without bound. Pipe such a
 tool's output in via stdin instead. A single line longer than
 .B MAX_LINE_LEN
-(config.h; 4096 bytes) is truncated and marked with a dim
+(config.h; default 4096 bytes) is truncated and marked with a dim
 .B …
 tail.
 .PP
@@ -97,7 +97,7 @@ read from stdin; implied when stdin is not a tty
 treat all following arguments as positional, not options
 .SH KEYS
 The key bindings below are factory defaults compiled into the binary;
-there is currently no remapping configuration. The filter prompt accepts
+there is currently no runtime remapping configuration. The filter prompt accepts
 editing keys; Up/Down/PgUp/PgDn stay live there so
 results can be scrolled while typing (terminal wheel scroll arrives as these
 keys too).
