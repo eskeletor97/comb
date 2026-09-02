@@ -896,6 +896,8 @@ static void draw_small_notice(size_t vis)
 void render(void)
 {
 	size_t vis = pane_rows();
+	/* Hide the cursor for the whole frame */
+	fputs("\x1b[?25l", stdout);
 	fputs("\x1b[H", stdout);
 	if (terminal_too_small()) {
 		draw_small_notice(vis);
