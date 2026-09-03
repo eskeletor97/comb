@@ -7,7 +7,6 @@ comb \- view, filter and copy log files in a terminal
 .IR REGEX ]
 .RB [ \-t
 .IR N ]
-.RB [ \-\-no\-color ]
 .RB [ \-\-color =
 .IR MODE ]
 .RI [ FILE ]
@@ -84,24 +83,11 @@ thread saturates the read, so
 avoids the loader's extra pass; the two-pass parallel load only pays off when
 the file is already paged or sits on fast storage.
 .TP
-.BR \-\-no\-color ", " \-C
-disable syntax coloring; also honors the
-.B NO_COLOR
-environment variable. Cursor and marks remain inverse video.
-.TP
-.BI \-\-color = MODE
-force the colour depth instead of detecting it:
-.B auto
-(the default), 
-.B truecolor
-, or 
-.B ansi
-. Auto reads
-.B COLORTERM
-and
-.B TERM
-; the explicit form matters when a
-privilege elevator (doas/sudo) strips those variables from the environment.
+.BI \-\-color= MODE
+colour mode: \fBauto\fR (default), \fBnone\fR, \fBlinux\fR, \fBansi\fR or
+\fBtruecolor\fR. \fBnone\fR disables highlighting (also honors
+\fBNO_COLOR\fR); \fBlinux\fR uses the fbcon 8/16-colour base set
+(\fBTERM=linux\fR). Auto reads \fBCOLORTERM\fR and \fBTERM\fR.
 .TP
 .BR \-h ", " \-\-help
 show help and exit
@@ -210,7 +196,9 @@ when set to
 .B truecolor
  unless overridden; 
 .B TERM
- names (ghostty, kitty, direct) are a fallback hint
+ names (ghostty, kitty, direct, truecolor) are a fallback hint, and
+.B TERM=linux
+ switches comb to the base 8/16-colour palette
 .TP 
 .B WAYLAND_DISPLAY ", " DISPLAY
 gate the clipboard helper search: wl\-copy is only tried when

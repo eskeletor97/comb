@@ -56,6 +56,7 @@ int follow = 1;
 int wrap;
 int nocolor;
 int truecolor;
+int linuxcolor;
 const char *mark_bg = MARK_BG.ansi;
 int running = 1;
 int dirty = 1;

@@ -276,9 +276,9 @@ def _no_hl_sgr(out):
     return not re.search(rb'\x1b\[(1;9[15]|2;|38;5;\d+)m', out)
 
 def _check_no_color_flag(binary):
-    out = run([binary, '--no-color', SAMPLE], keys='Gq').output
+    out = run([binary, '--color=none', SAMPLE], keys='Gq').output
     if not _no_hl_sgr(out):
-        return '--no-color still emits highlighting SGRs'
+        return '--color=none still emits highlighting SGRs'
 
 def _check_no_color_env(binary):
     out = run([binary, SAMPLE], keys='Gq', env_color=False).output
@@ -365,7 +365,7 @@ def _check_invert_cursor_continuity(binary):
     # filter to needles (20), move up 3 to line 169 (pane row 16), reopen
     # the prompt and invert: line 169 is a needle and vanishes; nearest
     # line in file order is 170, which must appear on the same pane row
-    res = run([binary, '--no-color', name],
+    res = run([binary, '--color=none', name],
               keys=b'/needle\rkkk/\x16\x1bq')
     os.unlink(name)
     scr = res.screen()
@@ -380,7 +380,7 @@ def _check_highlight_search(binary):
     lines = [f'line {i}' + (' needle' if i % 10 == 9 else '') + '\n'
              for i in range(200)]
     name = _tmplog(lines)
-    res = run([binary, '--no-color', name], keys=b'g\\needle\x1bq')
+    res = run([binary, '--color=none', name], keys=b'g\\needle\x1bq')
     scr = res.screen()
     text = '\n'.join(scr)
     if '/200' not in text:
@@ -404,16 +404,16 @@ def _check_search_next_prev(binary):
     name = _tmplog(lines)
     # from the top, n jumps to line 9 (10/200); nn lands on 19; N steps
     # back; from the top, N wraps around to the last match
-    res = run([binary, '--no-color', name], keys=b'g\\needle\x1bnq')
+    res = run([binary, '--color=none', name], keys=b'g\\needle\x1bnq')
     scr = '\n'.join(res.screen())
     if '10/200' not in scr:
         return f'n did not jump to next match: {scr!r}'
-    res2 = run([binary, '--no-color', name],
+    res2 = run([binary, '--color=none', name],
                keys=b'g\\needle\x1bnnNq')
     scr2 = '\n'.join(res2.screen())
     if '10/200' not in scr2:
         return f'N did not step back a match: {scr2!r}'
-    res3 = run([binary, '--no-color', name], keys=b'g\\needle\x1bNq')
+    res3 = run([binary, '--color=none', name], keys=b'g\\needle\x1bNq')
     os.unlink(name)
     if '200/200' not in '\n'.join(res3.screen()):
         return 'N from top did not wrap around to last match'
@@ -435,10 +435,10 @@ def _check_search_next_prev_filtered(binary):
     try:
         # n from the top must land on slot 2 (counter 3/3), never the
         # non-match at slot 1 (counter 2/3).
-        res = run([binary, '--no-color', name], keys=b'g/foo\n\\NEAR\nnq')
+        res = run([binary, '--color=none', name], keys=b'g/foo\n\\NEAR\nnq')
         if '3/3' not in '\n'.join(res.screen()):
             return f"n landed on non-match, expected 3/3: {res.screen()!r}"
-        resn = run([binary, '--no-color', name], keys=b'g/foo\n\\NEAR\nnNq')
+        resn = run([binary, '--color=none', name], keys=b'g/foo\n\\NEAR\nnNq')
         if '1/3' not in '\n'.join(resn.screen()):
             return f"N did not step back to slot 0: {resn.screen()!r}"
     finally:
@@ -515,7 +515,7 @@ def _check_filter_extend_past_eol_anchor(binary):
     # so matches can RESUME on lines the old view never held. The
     # superset-narrowing fast path must not be trusted here.
     text = 'line ending err\nhello err$or world\nanother err$or here\n'
-    res = run([binary, '--no-color', '-'], keys=b'g/err$\r/o\rq',
+    res = run([binary, '--color=none', '-'], keys=b'g/err$\r/o\rq',
               stdin_text=text)
     scr = '\n'.join(res.screen())
     if 'hello err$or world' not in scr or 'another err$or here' not in scr:
@@ -585,7 +585,7 @@ CHECKS = [
     ('-e narrows view',               _check_filter_narrows),
     ('input ANSI sanitized',          _check_ansi_sanitized),
     ('copy emits OSC 52',             _check_copy_osc52),
-    ('--no-color strips highlighting', _check_no_color_flag),
+    ('--color=none strips highlighting', _check_no_color_flag),
     ('NO_COLOR env strips highlighting', _check_no_color_env),
     ('wrap splits long lines only in wrap mode', _check_wrap_long_line),
     ('follow picks up appended lines',           _check_follow_append),

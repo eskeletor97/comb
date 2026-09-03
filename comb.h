@@ -151,6 +151,7 @@ extern int debug_open;
 extern int follow;
 extern int nocolor;
 extern int truecolor;
+extern int linuxcolor;
 extern const char *mark_bg;
 extern int running, dirty;
 extern char msg[160];

@@ -621,10 +621,10 @@ static size_t join_chips(char *buf, size_t n, const char *const *chips,
 /* top bar: one inverse strip -- source, position and state on the left,
  * key reference right-aligned. A hint that can't fit sheds its least
  * valuable chips, but is never shrunk into noise. */
-/* The status/input/help bars are painted as an explicit dark strip with
- * light text rather than reverse video, so the bar colour does not depend
- * on the terminal's theme (Konsole renders reverse-video as a light gray).
- * nocolor keeps a plain inverse bar for the README's inverse-video promise. */
+/* The status/input/help bars are painted as an explicit light strip with
+ * dark text (black on white) rather than reverse video, so the bar colour
+ * does not depend on the terminal's theme (Konsole renders reverse-video
+ * as a light gray). nocolor keeps a plain inverse bar. */
 static void bar_style(void)
 {
 	fputs("\x1b[0m\x1b[1m", stdout);
@@ -959,6 +959,8 @@ static void draw_debug(size_t vis)
 			via = " (TERM)";
 		else
 			via = " (forced)";
+	} else if (!nocolor && linuxcolor) {
+		via = term && !strcmp(term, "linux") ? " (TERM=linux)" : " (forced)";
 	} else if (!nocolor && (from_ct || from_tm)) {
 		via = " (forced ansi)";
 	}
@@ -969,8 +971,9 @@ static void draw_debug(size_t vis)
 	  terminal_too_small() ? "  (too small)" : "");
 	D("TERM       %.40s", term ? term : "(unset)");
 	D("COLORTERM  %.40s", ct ? ct : "(unset)");
-	D("colour     %s%s", nocolor ? "off (--no-color)"
+	D("colour     %s%s", nocolor ? "off (--color=none)"
 		      : truecolor ? "truecolor (RGB)"
+		      : linuxcolor ? "linux fbcon (base colours)"
 		      : "ansi / 256-colour (fallback)", via);
 	DBLANK();
 	D("source     %.60s", use_stdin ? "(stdin)" : path);

@@ -33,7 +33,7 @@ This also installs the manual page (`man comb`).
 
 ## Usage
 
-    comb [-e REGEX] [-t N] [--no-color] [--color=MODE] [FILE]
+    comb [-e REGEX] [-t N] [--color=MODE] [FILE]
     dmesg | comb
 
 Reads FILE or piped/redirected stdin; the explicit `comb -` still works. Plain

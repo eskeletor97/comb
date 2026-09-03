@@ -24,14 +24,20 @@ static int parse_threads(const char *s, int *out)
 	return 1;
 }
 
+enum { CM_AUTO, CM_NONE, CM_LINUX, CM_ANSI, CM_TRUECOLOR };
+
 static int parse_color_mode(const char *s, int *mode)
 {
 	if (!strcmp(s, "auto"))
-		*mode = 0;
-	else if (!strcmp(s, "truecolor"))
-		*mode = 1;
+		*mode = CM_AUTO;
+	else if (!strcmp(s, "none") || !strcmp(s, "off"))
+		*mode = CM_NONE;
+	else if (!strcmp(s, "linux"))
+		*mode = CM_LINUX;
 	else if (!strcmp(s, "ansi"))
-		*mode = 2;
+		*mode = CM_ANSI;
+	else if (!strcmp(s, "truecolor"))
+		*mode = CM_TRUECOLOR;
 	else
 		return 0;
 	return 1;
@@ -47,11 +53,19 @@ static int term_truecolor(void)
 		      strstr(tm, "direct") || strstr(tm, "truecolor"));
 }
 
+/* the Linux framebuffer console supports only the 8/16-colour set, so it
+ * needs the base palette instead of 256-colour SGRs */
+static int term_is_linux(void)
+{
+	const char *tm = getenv("TERM");
+	return tm && (!strcmp(tm, "linux") || !strncmp(tm, "linux-", 6));
+}
+
 int main(int argc, char **argv)
 {
 	const char *init_re = NULL;
 	const char *file = NULL;
-	int color_mode = 0;	/* 0 auto, 1 truecolor, 2 ansi */
+	int color_mode = CM_AUTO;
 
 	int endopts = 0;
 	for (int i = 1; i < argc; i++) {
@@ -63,9 +77,6 @@ int main(int argc, char **argv)
 			   (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help"))) {
 			usage(stdout);
 			return 0;
-		} else if (!endopts &&
-			   (!strcmp(argv[i], "--no-color") || !strcmp(argv[i], "-C"))) {
-			nocolor = 1;
 		} else if (!endopts && !strncmp(argv[i], "--color=", 8)) {
 			if (!parse_color_mode(argv[i] + 8, &color_mode)) {
 				usage(stderr);
@@ -112,9 +123,29 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (getenv("NO_COLOR"))
-		nocolor = 1;
-	truecolor = color_mode == 1 ? 1 : color_mode == 2 ? 0 : term_truecolor();
+	/* nocolor folds into --color (--color=none) or the NO_COLOR convention;
+	 * once off, the depth flags are forced to 0 so nothing colour is emitted. */
+	nocolor = color_mode == CM_NONE || getenv("NO_COLOR") != NULL;
+	int want_tc, want_lx;
+	if (nocolor) {
+		want_tc = want_lx = 0;
+	} else if (color_mode == CM_TRUECOLOR) {
+		want_tc = 1; want_lx = 0;
+	} else if (color_mode == CM_LINUX) {
+		want_tc = 0; want_lx = 1;
+	} else if (color_mode == CM_ANSI) {
+		want_tc = 0; want_lx = 0;
+	} else {	/* CM_AUTO */
+		if (term_truecolor()) {
+			want_tc = 1; want_lx = 0;
+		} else if (term_is_linux()) {
+			want_tc = 0; want_lx = 1;
+		} else {
+			want_tc = 0; want_lx = 0;
+		}
+	}
+	truecolor = want_tc;
+	linuxcolor = want_lx;
 	mark_bg = nocolor ? "\x1b[7m" : colof(&MARK_BG);
 
 	if (use_stdin)
