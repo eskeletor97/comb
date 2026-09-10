@@ -86,7 +86,7 @@ static size_t load_span_n;
 
 /* --- load progress: the only UI painted before the first render.
  * Big files take tens of seconds to scan; without this comb looks
- * hung. Regular files know their size, so they draw a percent bar and
+ * frozen. Regular files know their size, so they draw a percent bar and
  * tick per PROG_STEP_BYTES scanned; stdin has no total and spins on a
  * timer instead. Both are silent on small loads, so ordinary files
  * never flicker, and prog_hide erases everything before the first

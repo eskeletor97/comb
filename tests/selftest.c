@@ -11,14 +11,14 @@
  */
 #pragma GCC diagnostic ignored "-Wunused-function"
 #pragma GCC diagnostic ignored "-Wunused-variable"
-#include "../base.c"
-#include "../state.c"
-#include "../load.c"
-#include "../match.c"
-#include "../jobs.c"
-#include "../render.c"
-#include "../clip.c"
-#include "../input.c"
+#include "../src/base.c"
+#include "../src/state.c"
+#include "../src/load.c"
+#include "../src/match.c"
+#include "../src/jobs.c"
+#include "../src/render.c"
+#include "../src/clip.c"
+#include "../src/input.c"
 
 static int fails;
 

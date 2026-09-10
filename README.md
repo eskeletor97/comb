@@ -4,12 +4,7 @@
 
 A small, fast terminal log viewer in plain C; libc only.
 
-Comb loads a log file (or piped stdin) into a scrollable, colorized pane with
-severity highlighting, per-service colors, an incremental filter, highlight
-search, line marking and clipboard copy. It follows live files, survives
-truncation and rotation, and strips terminal control sequences.
-
-![comb screenshot](screenshot.png)
+![comb screenshot](docs/screenshot.png)
 
 ## Features
 
@@ -27,6 +22,7 @@ truncation and rotation, and strips terminal control sequences.
 - `w` toggles soft line wrap (h/l/$ horizontal scrolling applies when wrap is off)
 - mark lines with Space (x unmarks), copy them all with c/y via OSC 52 (works
   over ssh); falls back to xclip / wl-copy / pbcopy / termux-clipboard-set
+- survives file truncation and rotation
 
 ## Build & install
 
@@ -38,11 +34,10 @@ This also installs the manual page (`man comb`).
 ## Usage
 
     comb [-e REGEX] [-t N] [--color=MODE] [FILE]
-    dmesg | comb
 
-Reads FILE or piped/redirected stdin; the explicit `comb -` still works. Plain
-text only. For systemd journal or compressed logs, pipe them:
-`journalctl -o short-precise | comb`, `zcat error.log.gz | comb`.
+Reads FILE or piped/redirected stdin. Plain text only.
+For systemd journal or compressed logs, pipe them:
+`journalctl -o short-precise | comb`, `zcat error.log.gz | comb`
 
 ## Documentation
 

@@ -6,20 +6,22 @@ THREADS ?= -pthread
 
 PREFIX ?= /usr/local
 
+SRC := src
 MODS := base state load match jobs render clip input
+OBJS := $(addprefix $(SRC)/,$(addsuffix .o,$(MODS))) $(SRC)/main.o
 
-comb: $(addsuffix .o,$(MODS)) main.o config.h
-	$(CC) $(CFLAGS) $(THREADS) -o $@ $(addsuffix .o,$(MODS)) main.o
+comb: $(OBJS) $(SRC)/config.h
+	$(CC) $(CFLAGS) $(THREADS) -o $@ $(OBJS)
 
-%.o: %.c comb.h config.h
+$(SRC)/%.o: $(SRC)/%.c $(SRC)/comb.h $(SRC)/config.h
 	$(CC) $(CFLAGS) $(THREADS) -c $< -o $@
 
-TEST_SRCS := base.c state.c load.c match.c jobs.c render.c clip.c input.c
+TEST_SRCS := $(addprefix $(SRC)/,base.c state.c load.c match.c jobs.c render.c clip.c input.c)
 
-tests/selftest: tests/selftest.c $(TEST_SRCS) comb.h config.h
+tests/selftest: tests/selftest.c $(TEST_SRCS) $(SRC)/comb.h $(SRC)/config.h
 	$(CC) $(CFLAGS) $(THREADS) -o $@ tests/selftest.c
 
-tests/loadbench: tests/loadbench.c $(TEST_SRCS) comb.h config.h
+tests/loadbench: tests/loadbench.c $(TEST_SRCS) $(SRC)/comb.h $(SRC)/config.h
 	$(CC) $(CFLAGS) $(THREADS) -o $@ tests/loadbench.c
 
 check: comb tests/selftest
@@ -35,6 +37,6 @@ uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/comb.1
 
 clean:
-	rm -f comb *.o tests/selftest tests/loadbench
+	rm -f comb $(OBJS) tests/selftest tests/loadbench
 
 .PHONY: check clean install uninstall

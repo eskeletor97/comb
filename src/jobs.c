@@ -10,7 +10,6 @@
 
 static void mark_new_hits(size_t from, size_t to);
 
-/* jobs-private bookkeeping: the pending-pattern details nobody else reads */
 static int js_extend;		/* search extends a literal prefix */
 static int jf_clearing, jf_was_filtered;	/* commit-time cursor anchoring */
 static size_t jf_was, jf_was_row;
