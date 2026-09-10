@@ -1,5 +1,7 @@
 # comb
 
+[![CI](https://github.com/eskeletor97/comb/actions/workflows/ci.yml/badge.svg)](https://github.com/eskeletor97/comb/actions/workflows/ci.yml)
+
 A small, fast terminal log viewer in plain C; libc only.
 
 Comb loads a log file (or piped stdin) into a scrollable, colorized pane with
