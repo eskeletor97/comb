@@ -1,7 +1,7 @@
 /* comb config */
 
-/* reported by -V/--version */
-#define COMB_VERSION "0.1"
+/* reported by -V/--version; CalVer, bumped at release time */
+#define COMB_VERSION "20260910"
 
 /* max bytes of a filter/search query*/
 #define MAX_QUERY 256
