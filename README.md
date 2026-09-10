@@ -9,6 +9,8 @@ severity highlighting, per-service colors, an incremental filter, highlight
 search, line marking and clipboard copy. It follows live files, survives
 truncation and rotation, and strips terminal control sequences.
 
+![comb screenshot](screenshot.png)
+
 ## Features
 
 - severity highlighting (FATAL/PANIC/CRIT magenta, ERROR red, WARN yellow,
