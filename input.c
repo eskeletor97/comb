@@ -385,6 +385,7 @@ void usage(FILE *out)
 "  -t, --threads N        worker threads for load/filter/search\n"
 "                         (default: nproc - 2, min 1, max %d)\n"
 "  -h, --help             show this help\n"
+"  -V, --version          show version and exit\n"
 "\n"
 "keys:\n", MAX_THREADS);
 	print_keys(out);

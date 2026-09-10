@@ -1,5 +1,8 @@
 /* comb config */
 
+/* reported by -V/--version */
+#define COMB_VERSION "0.1"
+
 /* max bytes of a filter/search query*/
 #define MAX_QUERY 256
 

@@ -77,6 +77,10 @@ int main(int argc, char **argv)
 			   (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help"))) {
 			usage(stdout);
 			return 0;
+		} else if (!endopts &&
+			   (!strcmp(argv[i], "-V") || !strcmp(argv[i], "--version"))) {
+			printf("comb %s\n", COMB_VERSION);
+			return 0;
 		} else if (!endopts && !strncmp(argv[i], "--color=", 8)) {
 			if (!parse_color_mode(argv[i] + 8, &color_mode)) {
 				usage(stderr);
