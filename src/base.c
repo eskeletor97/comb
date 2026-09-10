@@ -90,7 +90,7 @@ void on_sigexit(int sig)
 {
 	if (tio_saved) {
 		tcsetattr(kfd, TCSANOW, &saved_tio);
-		write(STDOUT_FILENO, TTY_LEAVE, sizeof TTY_LEAVE - 1);
+		(void)!write(STDOUT_FILENO, TTY_LEAVE, sizeof TTY_LEAVE - 1);
 	}
 	_exit(128 + sig);
 }

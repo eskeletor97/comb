@@ -167,7 +167,7 @@ static void keys_feed(const char *s)
 	key_w = p[1];
 	peeked = -1;
 	if (*s)
-		write(key_w, s, strlen(s));
+		(void)!write(key_w, s, strlen(s));
 }
 
 static void test_read_key(void)
