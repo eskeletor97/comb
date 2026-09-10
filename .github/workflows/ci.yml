@@ -13,7 +13,7 @@ jobs:
       matrix:
         cc: [gcc, clang]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build
         run: make CC=${{ matrix.cc }}
       - name: Test
@@ -22,7 +22,7 @@ jobs:
   sanitize:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build selftest with ASan/UBSan
         run: >
           make tests/selftest
