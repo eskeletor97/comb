@@ -369,16 +369,16 @@ int help_section(size_t i)
 void usage(FILE *out)
 {
 	fprintf(	out,
-"usage: comb [-e REGEX] [--color=MODE] [FILE]\n"
+"usage: comb [-e REGEX] [-t N] [--color=MODE] [FILE]\n"
 "\n"
 "View, filter and copy log files. Reads FILE, or stdin when piped.\n"
 "Filters match literal text by default (smart case).\n"
 "\n"
 "options:\n"
 "  -e REGEX               start with REGEX as the filter\n"
-"  --color=MODE           colour mode: auto (default), none, linux, ansi, or\n"
+"  --color=MODE           color mode: auto (default), none, linux, ansi, or\n"
 "                         truecolor. none disables syntax coloring (also\n"
-"                         honors NO_COLOR); linux uses the 8/16-colour base\n"
+"                         honors NO_COLOR); linux uses the 8/16-color base\n"
 "                         set for the framebuffer console (TERM=linux). auto\n"
 "                         reads COLORTERM/TERM; useful when doas/sudo strip\n"
 "                         them from the environment.\n"

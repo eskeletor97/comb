@@ -53,8 +53,8 @@ static int term_truecolor(void)
 		      strstr(tm, "direct") || strstr(tm, "truecolor"));
 }
 
-/* the Linux framebuffer console supports only the 8/16-colour set, so it
- * needs the base palette instead of 256-colour SGRs */
+/* the Linux framebuffer console supports only the 8/16-color set, so it
+ * needs the base palette instead of 256-color SGRs */
 static int term_is_linux(void)
 {
 	const char *tm = getenv("TERM");
@@ -124,7 +124,7 @@ int main(int argc, char **argv)
 	}
 
 	/* nocolor folds into --color (--color=none) or the NO_COLOR convention;
-	 * once off, the depth flags are forced to 0 so nothing colour is emitted. */
+	 * once off, the depth flags are forced to 0 so nothing color is emitted. */
 	nocolor = color_mode == CM_NONE || getenv("NO_COLOR") != NULL;
 	int want_tc, want_lx;
 	if (nocolor) {

@@ -50,7 +50,7 @@ While running, `Ctrl-h` shows a compact in-program version of the key reference.
 
 ## Config
 
-Comb has no runtime configuration, but various things like keybinds or colors are easily changable via `config.h`.
+Comb has no runtime configuration, but various things like keybinds or colors are easily changeable via `config.h`.
 
 ## Tests
 

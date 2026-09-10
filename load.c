@@ -175,10 +175,10 @@ static void prog_file(size_t done)
 	if (done < prog_mark || done - prog_mark < PROG_STEP_BYTES)
 		return;
 	prog_mark = done;
-	char cur[HUMAN_BYTES_BUF], tot[HUMAN_BYTES_BUF], rt[HUMAN_BYTES_BUF];
-	human_bytes(cur, done);
-	human_bytes(tot, fmap_len);
-	human_bytes(rt, (size_t)(done / prog_secs()));
+	char hc[HUMAN_BYTES_BUF], ht[HUMAN_BYTES_BUF], hr[HUMAN_BYTES_BUF];
+	human_bytes(hc, done);
+	human_bytes(ht, fmap_len);
+	human_bytes(hr, (size_t)(done / prog_secs()));
 	char buf[192], bar[26];
 	const char *bars = "";
 	int bw = cols >= 50 ? 22 : cols >= 36 ? 10 : 0;
@@ -202,10 +202,10 @@ static void prog_file(size_t done)
 			 "loading %.*s%s%s %d%% %s/%s %s/s",
 			 (int)(room > 40 ? 40 : room), name,
 			 bars, bar, (int)(done * 100 / fmap_len),
-			 cur, tot, rt);
+			 hc, ht, hr);
 	else
 		snprintf(buf, sizeof buf, "loading %d%% %s/%s %s/s",
-			 (int)(done * 100 / fmap_len), cur, tot, rt);
+			 (int)(done * 100 / fmap_len), hc, ht, hr);
 	prog_paint(buf);
 }
 
@@ -230,10 +230,10 @@ static int prog_bar(char *o, int bw, uint64_t val, uint64_t tot)
  * a big cold read doesn't stall at a single ambiguous percentage. */
 static void prog_paint_both(void)
 {
-	char cur[HUMAN_BYTES_BUF], tot[HUMAN_BYTES_BUF], rt[HUMAN_BYTES_BUF];
-	human_bytes(cur, prog_read);
-	human_bytes(tot, fmap_len);
-	human_bytes(rt, (size_t)prog_read_rate());
+	char hc[HUMAN_BYTES_BUF], ht[HUMAN_BYTES_BUF], hr[HUMAN_BYTES_BUF];
+	human_bytes(hc, prog_read);
+	human_bytes(ht, fmap_len);
+	human_bytes(hr, (size_t)prog_read_rate());
 	int bw = cols >= 50 ? 22 : cols >= 36 ? 10 : 0;
 	char bar[26];
 	int has = prog_bar(bar, bw, prog_read, fmap_len);
@@ -261,10 +261,10 @@ static void prog_paint_both(void)
 			 "reading %.*s%s%s %d%% %s/%s %s/s",
 			 (int)(room > 40 ? 40 : room), name,
 			 has ? " " : "", bar, (int)(prog_read * 100 / fmap_len),
-			 cur, tot, rt);
+			 hc, ht, hr);
 	else
 		snprintf(buf, sizeof buf, "reading %d%% %s/%s %s/s",
-			 (int)(prog_read * 100 / fmap_len), cur, tot, rt);
+			 (int)(prog_read * 100 / fmap_len), hc, ht, hr);
 	prog_paint_row(1, buf);
 
 	char ib[26];
@@ -315,7 +315,7 @@ static int line_needs_sanitize(const char *s, size_t n)
 {
 	const __m128i space = _mm_set1_epi8(0x20);
 	const __m128i del   = _mm_set1_epi8(0x7f);
-	const __m128i high  = _mm_set1_epi8(0x80);
+	const __m128i high  = _mm_set1_epi8((char)0x80);
 	size_t i = 0;
 	for (; i + 16 <= n; i += 16) {
 		__m128i v = _mm_loadu_si128((const __m128i *)(const void *)(s + i));
@@ -1004,7 +1004,7 @@ static void drain_map_par(void)
 	line_cap_grow(total_lines);
 	nlines = total_lines;
 
-	/* colour detection runs here (parallel), ahead of the 100% bar, so the
+	/* color detection runs here (parallel), ahead of the 100% bar, so the
 	 * only post-fill work is the fast slot ordering. */
 	load_span = xrealloc(NULL, 2 * total_lines * sizeof(int));
 	load_span_n = total_lines;

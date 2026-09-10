@@ -622,7 +622,7 @@ static size_t join_chips(char *buf, size_t n, const char *const *chips,
  * key reference right-aligned. A hint that can't fit sheds its least
  * valuable chips, but is never shrunk into noise. */
 /* The status/input/help bars are painted as an explicit light strip with
- * dark text (black on white) rather than reverse video, so the bar colour
+ * dark text (black on white) rather than reverse video, so the bar color
  * does not depend on the terminal's theme (Konsole renders reverse-video
  * as a light gray). nocolor keeps a plain inverse bar. */
 static void bar_style(void)
@@ -971,10 +971,10 @@ static void draw_debug(size_t vis)
 	  terminal_too_small() ? "  (too small)" : "");
 	D("TERM       %.40s", term ? term : "(unset)");
 	D("COLORTERM  %.40s", ct ? ct : "(unset)");
-	D("colour     %s%s", nocolor ? "off (--color=none)"
+	D("color     %s%s", nocolor ? "off (--color=none)"
 		      : truecolor ? "truecolor (RGB)"
-		      : linuxcolor ? "linux fbcon (base colours)"
-		      : "ansi / 256-colour (fallback)", via);
+		      : linuxcolor ? "linux fbcon (base colors)"
+		      : "ansi / 256-color (fallback)", via);
 	DBLANK();
 	D("source     %.60s", use_stdin ? "(stdin)" : path);
 	human_bytes(hb, fmap_len + prog_fed);

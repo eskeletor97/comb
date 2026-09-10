@@ -84,9 +84,9 @@ avoids the loader's extra pass; the two-pass parallel load only pays off when
 the file is already paged or sits on fast storage.
 .TP
 .BI \-\-color= MODE
-colour mode: \fBauto\fR (default), \fBnone\fR, \fBlinux\fR, \fBansi\fR or
+color mode: \fBauto\fR (default), \fBnone\fR, \fBlinux\fR, \fBansi\fR or
 \fBtruecolor\fR. \fBnone\fR disables highlighting (also honors
-\fBNO_COLOR\fR); \fBlinux\fR uses the fbcon 8/16-colour base set
+\fBNO_COLOR\fR); \fBlinux\fR uses the fbcon 8/16-color base set
 (\fBTERM=linux\fR). Auto reads \fBCOLORTERM\fR and \fBTERM\fR.
 .TP
 .BR \-h ", " \-\-help
@@ -188,18 +188,18 @@ quit
 disable syntax coloring when set
 .TP
 .B COLORTERM
-when set to 
+when set to
 .B truecolor
- or 
+or
 .B 24bit
 , comb renders with
 .B truecolor
- unless overridden; 
+unless overridden;
 .B TERM
  names (ghostty, kitty, direct, truecolor) are a fallback hint, and
 .B TERM=linux
- switches comb to the base 8/16-colour palette
-.TP 
+ switches comb to the base 8/16-color palette
+.TP
 .B WAYLAND_DISPLAY ", " DISPLAY
 gate the clipboard helper search: wl\-copy is only tried when
 .B WAYLAND_DISPLAY

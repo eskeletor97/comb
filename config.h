@@ -31,9 +31,9 @@
 #define TTY_ENTER "\x1b[?1049h\x1b[?25l\x1b[2J"
 #define TTY_LEAVE "\x1b[0m\x1b[?25h\x1b[?1049l"
 
-/* One escape sequence per colour, per render mode. The RGB/truecolor form
- * draws the exact colour on terminals that advertise support; the ANSI/256
- * form is the theme-dependent fallback; the base form is the 8/16-colour set
+/* One escape sequence per color, per render mode. The RGB/truecolor form
+ * draws the exact color on terminals that advertise support; the ANSI/256
+ * form is the theme-dependent fallback; the base form is the 8/16-color set
  * the Linux framebuffer console (TERM=linux) can actually paint. All three
  * carry the same modifier prefix, so bold/dim weight matches. colof() picks
  * the active form once, off the runtime truecolor/linuxcolor flags. */
@@ -49,8 +49,8 @@ static inline const char *colof(const Color *c)
 	return c->ansi;
 }
 
-/* current-line background: the base form is a saturated dark colour rather
- * than bright-black, because the fbcon console maps colour 8 (bright black)
+/* current-line background: the base form is a saturated dark color rather
+ * than bright-black, because the fbcon console maps color 8 (bright black)
  * to the same black as the default background and the cursor highlight would
  * vanish. Blue (and magenta for marks) keeps it visible while staying dark
  * enough for bright text. */
@@ -59,7 +59,7 @@ static const Color CUR_BG = { "\x1b[44m", "\x1b[100m", "\x1b[48;2;56;60;72m" };
  * current-line highlight */
 static const Color MARK_BG = { "\x1b[45m", "\x1b[48;5;238m", "\x1b[48;2;68;68;68m" };
 /* status/input/help bars: an explicit light strip with black text instead of
- * reverse video, so the bar colour is terminal-independent and always reads
+ * reverse video, so the bar color is terminal-independent and always reads
  * as a label row. nocolor keeps the plain inverse bar. */
 static const Color BAR_BG = { "\x1b[107m", "\x1b[48;5;231m", "\x1b[48;2;221;221;226m" };
 static const Color BAR_FG = { "\x1b[30m", "\x1b[30m", "\x1b[38;2;0;0;0m" };
@@ -70,9 +70,9 @@ static const Color QUOTE_COLOR = { "\x1b[96m", "\x1b[38;5;223m", "\x1b[38;2;255;
 static const Color PAREN_COLOR = { "\x1b[92m", "\x1b[38;5;115m", "\x1b[38;2;135;215;175m" };
 #define DIM "\x1b[2m"
 
-/* service-tag hues; the base form is the nearest bright/base colour the fbcon
- * console can paint (no 256-colour support), the RGB form is the indexed
- * colour's exact value */
+/* service-tag hues; the base form is the nearest bright/base color the fbcon
+ * console can paint (no 256-color support), the RGB form is the indexed
+ * color's exact value */
 static const Color svc_palette[] = {
 	{ "\x1b[91m", "\x1b[38;5;215m", "\x1b[38;2;255;175;95m" },	/* peach */
 	{ "\x1b[92m", "\x1b[38;5;79m",  "\x1b[38;2;95;215;175m" },	/* seafoam */
