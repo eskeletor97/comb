@@ -4,6 +4,8 @@
 
 A small, fast terminal log viewer in plain C; libc only.
 
+When `lnav` is too much, and you'd like a bit more than `less`.
+
 ![comb screenshot](docs/screenshot.png)
 
 ## Features
@@ -37,6 +39,7 @@ This also installs the manual page (`man comb`).
 
 Reads FILE or piped/redirected stdin. Plain text only.
 For systemd journal or compressed logs, pipe them:
+
 `journalctl -o short-precise | comb`, `zcat error.log.gz | comb`
 
 ## Documentation
